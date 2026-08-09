@@ -300,51 +300,6 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const memoryResult = normalizeMemoryResult(optimizedResponse.content);
       chapterMemoryCache.set(memoryCacheKey, memoryResult);
       return { id: req.id, result: { ...memoryResult, contextReport } };
-      const prompt = `你是长篇小说的记忆编辑。请为《${String(projectTitle || "未命名小说")}》的${String(chapterTitle)}整理一份可供后续章节严格检索的结构化记忆，并从正文抽取实体和关系。\n\n## 章节正文\n${String(content)}${cardContext}${graphContext}\n\n仅返回 JSON：\n{\n  "summary": "180 字以内，交代事件推进、人物状态和未解决线索",\n  "keywords": ["人物、地点、物品或事件关键词"],\n  "characterStateChanges": ["角色名：本章后可持续的状态变化"],\n  "knowledgeChanges": ["角色名：得知、误解、隐瞒或未知的关键信息"],\n  "foreshadowingChanges": ["埋设/推进/回收：伏笔内容及当前状态"],\n  "timelineEvents": ["本章发生的可排序事件"],\n  "canonFacts": ["可验证且后续必须遵守的设定事实"],\n  "conflicts": ["冲突双方：冲突内容及当前结果"],\n  "endingHook": "章末未解决行动、发现或危机",\n  "entities": [{ "name": "实体名称", "type": "人物|物品|地点|势力|事件|设定" }],\n  "relations": [{ "source": "实体", "target": "实体", "label": "关系" }]\n}\n\n规则：实体不超过 30 个、关系不超过 60 条；只抽取正文或已有设定明确支持的事实；没有内容时返回空数组或空字符串；关键词不超过 8 个；每项使用简短、可复用的陈述。`;
-      const response = await client.chat([{ role: "user", content: `${prompt}\n\n额外字段 cardUpdates：只针对本章引用且状态发生变化的卡片返回数组。每项格式为 {"cardId":"卡片 ID","cardTitle":"卡片名称","status":"unchanged|changed|acquired|lost|revealed|updated","changes":"本章导致的具体状态变化"}；没有变化则返回 []。` }], {
-        response_format: { type: "json_object" },
-        temperature: 0.2,
-        max_tokens: 1800,
-        retryAttempts: 4,
-      });
-      try {
-        const cleanedResponse = response.content.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/u, "").trim();
-        const result = JSON.parse(cleanedResponse) as Record<string, any>;
-        return {
-          id: req.id,
-          result: {
-            summary: typeof result.summary === "string" ? result.summary : response.content,
-            keywords: stringList(result.keywords, 8),
-            characterStateChanges: stringList(result.characterStateChanges),
-            knowledgeChanges: stringList(result.knowledgeChanges),
-            foreshadowingChanges: stringList(result.foreshadowingChanges),
-            timelineEvents: stringList(result.timelineEvents),
-            canonFacts: stringList(result.canonFacts),
-            conflicts: stringList(result.conflicts),
-            endingHook: typeof result.endingHook === "string" ? result.endingHook.trim() : "",
-            entities: Array.isArray(result.entities) ? result.entities.filter((item: unknown) => item && typeof item === "object").slice(0, 30).map((item: unknown) => {
-              const entity = item as Record<string, unknown>;
-              return { name: String(entity.name || "").trim(), type: String(entity.type || "实体").trim() };
-            }).filter((item: { name: string }) => item.name) : [],
-            relations: Array.isArray(result.relations) ? result.relations.filter((item: unknown) => item && typeof item === "object").slice(0, 60).map((item: unknown) => {
-              const relation = item as Record<string, unknown>;
-              return { source: String(relation.source || "").trim(), target: String(relation.target || "").trim(), label: String(relation.label || "关联").trim() };
-            }).filter((item: { source: string; target: string }) => item.source && item.target) : [],
-            cardUpdates: Array.isArray(result.cardUpdates) ? result.cardUpdates.filter((item: unknown) => item && typeof item === "object").slice(0, 30).map((item: unknown) => {
-              const update = item as Record<string, unknown>;
-              return { cardId: typeof update.cardId === "number" || typeof update.cardId === "string" ? update.cardId : undefined, cardTitle: String(update.cardTitle || "").trim(), status: String(update.status || "updated").trim(), changes: String(update.changes || "").trim() };
-            }).filter((item: { cardTitle: string; cardId?: string | number }) => item.cardTitle || item.cardId !== undefined) : [],
-          },
-        };
-      } catch {
-        return {
-          id: req.id,
-          result: {
-            summary: response.content.slice(0, 220), keywords: [], characterStateChanges: [], knowledgeChanges: [],
-            foreshadowingChanges: [], timelineEvents: [], canonFacts: [], conflicts: [], endingHook: "", entities: [], relations: [], cardUpdates: [],
-          },
-        };
-      }
     }
     if (req.method === "text.transform") {
       const { mode, instruction, content, previousChapter, maxWords, projectTitle, chapterTitle, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
