@@ -539,6 +539,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           chapterId: String(chapterId),
           instruction: String(instruction),
           outline: prepared.outline,
+          previousChapters: prepared.previousChapters,
           knowledgeGraph: prepared.knowledgeGraph,
           cards: prepared.cards,
           skillCatalog: prepared.skills,

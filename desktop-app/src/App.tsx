@@ -321,7 +321,7 @@ const asTextList = (value: unknown, limit = 20) => Array.isArray(value)
 const memoryTextList = (value: string) => value.split(/\r?\n|、/).map(item => item.trim()).filter(Boolean).slice(0, 30);
 
 const chapterOrder = (memory: ChapterMemory) => memory.sourceChapterNumber ?? memory.chapterId;
-const recentMemoryIds = (memories: ChapterMemory[], limit = 3) => [...memories]
+const recentMemoryIds = (memories: ChapterMemory[], limit = 1) => [...memories]
   .sort((left, right) => chapterOrder(left) - chapterOrder(right))
   .slice(-limit)
   .map(memory => memory.id);
@@ -1525,6 +1525,7 @@ function App() {
     setEditingProject(updated);
     setProjects(projects.map(p => p.id === updated.id ? updated : p));
     setActiveChapter(newChapter);
+    setSelectedMemoryIds(recentMemoryIds(updated.memories, 1));
   };
 
   const handleUpdateChapterContent = (content: string) => {
@@ -2332,6 +2333,8 @@ function App() {
         agentSkills = builtinSkills;
       }
     }
+    const activeChapterIndex = editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id);
+    const continuityChapter = activeChapterIndex > 0 ? editingProject.chapters[activeChapterIndex - 1] : null;
     try {
       await invoke<string>('start_agent_runtime');
       setAgentProgress(items => items.map(item => item.id === 'starting'
@@ -2355,10 +2358,8 @@ function App() {
           cards: editingProject.cards.filter(card => selectedCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: agentSkills.map(skill => ({ name: skill.name, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
-          previousChapters: editingProject.chapters
-            .filter(chapter => chapter.id !== activeChapter.id && selectedMemoryIds.some(memoryId => editingProject.memories.find(memory => memory.id === memoryId)?.chapterId === chapter.id))
-            .slice(-3)
-            .map(chapter => ({ id: chapter.id, title: chapter.title, content: chapter.content })),
+          // 章节承接只传入紧邻上一章正文；更早章节只通过用户勾选的结构化记忆进入。
+          previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
           memories: editingProject.memories.filter(memory => selectedMemoryIds.includes(memory.id)).map(memory => ({
             id: memory.id,
             title: memory.chapterTitle,

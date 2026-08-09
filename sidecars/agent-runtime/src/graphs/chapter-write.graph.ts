@@ -71,6 +71,7 @@ export const ChapterState = Annotation.Root({
   chapterId: Annotation<string>,
   instruction: Annotation<string>,
   outline: Annotation<string | undefined>,
+  previousChapters: Annotation<Array<{ id?: string | number; title: string; content: string }> | undefined>,
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
@@ -80,6 +81,7 @@ export const ChapterState = Annotation.Root({
     reducer: (prev, next) => next,
     default: () => [],
   }),
+  continuityContext: Annotation<string | undefined>,
   draftContent: Annotation<string | undefined>,
   summary: Annotation<string | undefined>,
   contextReport: Annotation<ContextReport | undefined>,
@@ -135,10 +137,15 @@ export function createChapterGraph(config: ChapterGraphConfig) {
   const graph = new StateGraph(ChapterState)
     .addNode("intent", async (state: ChapterStateType) => {
       const selection = selectSkillsByIntent(state.instruction, state.skillCatalog);
-      emitter?.progress("intent", 8, `识别意图：${selection.intent}，自动启用 ${selection.skills.length} 个技能`);
+      const continuitySkill = state.skillCatalog.find(skill => skill.name === "chapter-continuity");
+      const useContinuity = continuitySkill && selection.intent === intentLabels.write;
+      const selectedSkills = useContinuity
+        ? [continuitySkill, ...selection.skills.filter(skill => skill.name !== continuitySkill.name)]
+        : selection.skills;
+      emitter?.progress("intent", 8, `识别意图：${selection.intent}，自动启用 ${selectedSkills.length} 个技能${useContinuity ? "（含章节承接）" : ""}`);
       return {
         recognizedIntent: selection.intent,
-        selectedSkills: selection.skills.map(skill => skill.name),
+        selectedSkills: selectedSkills.slice(0, 3).map(skill => skill.name),
       };
     })
     .addNode("retrieve", async (state: ChapterStateType) => {
@@ -188,6 +195,18 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.progress("retrieve", 25, `找到 ${context.length} 条相关记忆${contextReport ? `；${formatContextReport(contextReport)}` : ""}`);
       return { retrievedContext: context, contextReport };
     })
+    .addNode("continuity", async (state: ChapterStateType) => {
+      const previous = state.previousChapters?.[state.previousChapters.length - 1];
+      if (!previous?.content?.trim()) {
+        emitter?.progress("retrieve", 29, "没有上一章正文，按当前章节开篇创作");
+        return { continuityContext: "（没有上一章正文；本章负责建立新的场景、人物位置和冲突。）" };
+      }
+      const relatedMemory = state.retrievedContext.find(item => item.includes(previous.title));
+      const tail = compactText(previous.content, 2600);
+      const continuityContext = `上一章：${previous.title}\n上一章结尾（最高优先级）：\n${tail}${relatedMemory ? `\n\n上一章结构记忆：\n${compactText(relatedMemory, 900)}` : ""}\n\n承接清单：开头先确认人物位置和情绪，处理未完成事件与章末钩子；场景或时间跳跃必须给出因果过渡。`;
+      emitter?.progress("retrieve", 29, `已锁定${previous.title}结尾，生成阶段将优先承接`);
+      return { continuityContext };
+    })
     .addNode("draft", async (state: ChapterStateType) => {
       emitter?.progress("draft", 30, "正在组织章节设定、记忆和技能提示");
       
@@ -206,10 +225,13 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         ? `\n## 本章知识卡片\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
         : "";
       const skillsSection = state.selectedSkills.length
-        ? `\n## 意图识别\n${state.recognizedIntent || "章节创作与续写"}\n\n## 自动选用技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 2).map(skill => `### ${skill.name}\n${compactText(skill.content, 900)}`).join("\n\n")}\n`
+        ? `\n## 意图识别\n${state.recognizedIntent || "章节创作与续写"}\n\n## 自动选用技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.name}\n${compactText(skill.content, skill.name === "chapter-continuity" ? 1800 : 700)}`).join("\n\n")}\n`
         : "";
 
-      const contextPacket = [outlineSection, cardsSection, graphSection, contextSection, skillsSection].filter(Boolean).join("");
+      const continuitySection = state.continuityContext
+        ? `\n## 章节承接（最高优先级）\n${state.continuityContext}\n`
+        : "";
+      const contextPacket = [continuitySection, outlineSection, cardsSection, graphSection, contextSection, skillsSection].filter(Boolean).join("");
       const taskPrompt = `## 本章任务\n${state.instruction}\n\n请创作 2000-3000 字左右的章节正文。`;
       const draftInputBytes = byteLength(chapterWriterSystemPrompt) + byteLength(contextPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
@@ -305,7 +327,8 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     })
     .addEdge("__start__", "intent")
     .addEdge("intent", "retrieve")
-    .addEdge("retrieve", "draft")
+    .addEdge("retrieve", "continuity")
+    .addEdge("continuity", "draft")
     .addEdge("draft", "review")
     .addEdge("review", "__end__");
 

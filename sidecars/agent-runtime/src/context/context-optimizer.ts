@@ -256,7 +256,7 @@ function compactPreviousChapters(chapters: unknown, maxBytes: number): Array<{ i
     if (remaining < 180) break;
     const chapter = item as Record<string, unknown>;
     const title = compactText(chapter.title || "上一章", 100);
-    const content = compactText(chapter.content || "", Math.max(160, Math.min(1500, remaining - byteLength(title) - 30)));
+    const content = compactText(chapter.content || "", Math.max(160, Math.min(5400, remaining - byteLength(title) - 30)));
     if (!content) continue;
     packed.push({ id: typeof chapter.id === "string" || typeof chapter.id === "number" ? chapter.id : undefined, title, content });
     remaining -= byteLength(title) + byteLength(content) + 30;
@@ -280,7 +280,8 @@ function compactSkills(skills: unknown, instruction: string, maxBytes: number): 
     const name = compactText(skill.name || "技能", 90);
     const category = compactText(skill.category || "write", 40);
     const description = compactText(skill.description || "", 160);
-    const content = compactText(skill.content || "", Math.max(100, Math.min(900, remaining - byteLength(name) - byteLength(description) - 50)));
+    const contentLimit = skill.name === "chapter-continuity" ? 1800 : 700;
+    const content = compactText(skill.content || "", Math.max(100, Math.min(contentLimit, remaining - byteLength(name) - byteLength(description) - 50)));
     packed.push({ name, category, description, tags: compactList(tags, 8, 50), content });
     remaining -= byteLength(name) + byteLength(category) + byteLength(description) + byteLength(content) + 60;
   }
@@ -316,12 +317,12 @@ export function prepareChapterInput(input: {
   };
   const sourceBytes = byteLength(JSON.stringify(raw));
   const text = queryText(input.instruction, outlines, Array.isArray(input.memories) ? input.memories as Array<Record<string, unknown>> : [], cards);
-  const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * 0.26));
-  const packedCards = compactCards(cards, text, Math.floor(budgetBytes * 0.22));
-  const memories = compactMemories(input.memories, Math.floor(budgetBytes * 0.28));
-  const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * 0.14));
-  const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * 0.16));
-  const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * 0.14));
+  const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * 0.18));
+  const packedCards = compactCards(cards, text, Math.floor(budgetBytes * 0.12));
+  const memories = compactMemories(input.memories, Math.floor(budgetBytes * 0.20));
+  const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * 0.28));
+  const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * 0.10));
+  const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * 0.10));
   const memoryDocuments = Array.isArray(input.memoryDocuments)
     ? input.memoryDocuments.filter(item => item && typeof item === "object").slice(0, 4).map(item => {
       const document = item as Record<string, unknown>;
