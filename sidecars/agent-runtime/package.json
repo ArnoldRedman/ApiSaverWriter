@@ -1,0 +1,31 @@
+{
+  "name": "@apisaverwriter/agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/main.ts",
+    "start": "tsx src/main.ts",
+    "build": "tsc",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@langchain/anthropic": "^1.1.2",
+    "@langchain/core": "^1.1.10",
+    "@langchain/langgraph": "^1.0.8",
+    "@langchain/openai": "^1.1.8",
+    "@xenova/transformers": "^2.17.2",
+    "better-sqlite3": "^12.5.0",
+    "sqlite-vec": "^0.1.9",
+    "undici": "^7.29.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.6"
+  }
+}

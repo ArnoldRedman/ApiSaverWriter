@@ -1,0 +1,12 @@
+{
+  "name": "apisaverwriter",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["sidecars/agent-runtime"],
+  "scripts": {
+    "test": "npm --workspace @apisaverwriter/agent-runtime test",
+    "typecheck": "npm --workspace @apisaverwriter/agent-runtime run typecheck",
+    "dev:agent": "npm --workspace @apisaverwriter/agent-runtime run dev"
+  }
+}

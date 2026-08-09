@@ -1,0 +1,365 @@
+import { createHash } from "node:crypto";
+
+export interface ContextReport {
+  cache: "hit" | "miss";
+  sourceBytes: number;
+  packedBytes: number;
+  prunedBytes: number;
+  budgetBytes: number;
+  retrievedBytes?: number;
+  draftInputBytes?: number;
+  reviewInputBytes?: number;
+  estimatedInputTokens?: number;
+  sections: Record<string, number>;
+}
+
+export interface ContextCard {
+  id?: string | number;
+  type?: string;
+  title: string;
+  content?: string;
+  currentState?: string;
+  stateHistory?: Array<{ changes?: string; chapterTitle?: string; status?: string }>;
+}
+
+export interface ContextOutline {
+  id?: string | number;
+  kind?: string;
+  title?: string;
+  content?: string;
+}
+
+export interface ContextGraph {
+  nodes?: Array<{ id?: string; label?: string; type?: string; category?: string }>;
+  edges?: Array<{ id?: string; source?: string; target?: string; label?: string }>;
+}
+
+export interface PreparedChapterInput {
+  outline?: string;
+  cards: Array<{ type: string; title: string; content: string }>;
+  previousChapters: Array<{ id?: string | number; title: string; content: string }>;
+  memories: Array<Record<string, unknown>>;
+  memoryDocuments: Array<Record<string, unknown>>;
+  knowledgeGraph?: string;
+  skills: Array<{ name: string; category: string; description: string; tags: string[]; content: string }>;
+  report: ContextReport;
+}
+
+const truncationMarker = "\n...[已按相关性与预算裁剪]...\n";
+
+export const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
+
+function sliceToBytes(value: string, maxBytes: number): string {
+  if (maxBytes <= 0 || !value) return "";
+  if (byteLength(value) <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (byteLength(value.slice(0, middle)) <= maxBytes) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(0, low);
+}
+
+/** Preserve both the premise and the most recent state when a source is oversized. */
+export function compactText(value: unknown, maxBytes: number): string {
+  const text = String(value ?? "").trim();
+  if (!text || maxBytes <= 0) return "";
+  if (byteLength(text) <= maxBytes) return text;
+  if (maxBytes <= byteLength(truncationMarker) + 24) return sliceToBytes(text, maxBytes);
+  const available = maxBytes - byteLength(truncationMarker);
+  const head = sliceToBytes(text, Math.floor(available * 0.62));
+  const tailBudget = Math.max(0, available - byteLength(head));
+  const reversed = Array.from(text).reverse().join("");
+  const tail = Array.from(sliceToBytes(reversed, tailBudget)).reverse().join("");
+  return `${head}${truncationMarker}${tail}`;
+}
+
+function stableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, stableValue(child)]));
+  }
+  return value;
+}
+
+export function stableHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(stableValue(value))).digest("hex");
+}
+
+export class LruCache<Value> {
+  private readonly entries = new Map<string, Value>();
+
+  constructor(private readonly maxEntries = 64) {}
+
+  get(key: string): Value | undefined {
+    const value = this.entries.get(key);
+    if (value === undefined) return undefined;
+    this.entries.delete(key);
+    this.entries.set(key, value);
+    return value;
+  }
+
+  set(key: string, value: Value): void {
+    this.entries.delete(key);
+    this.entries.set(key, value);
+    while (this.entries.size > this.maxEntries) {
+      const oldestKey = this.entries.keys().next().value as string | undefined;
+      if (!oldestKey) break;
+      this.entries.delete(oldestKey);
+    }
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+}
+
+export function contextBudgetBytes(contextWindowKB?: number, capKB = 18, minimumKB = 6): number {
+  const configured = Math.max(16, Number(contextWindowKB) || 128) * 1024;
+  return Math.min(capKB * 1024, Math.max(minimumKB * 1024, Math.floor(configured * 0.16)));
+}
+
+function compactList(value: unknown, maxItems: number, itemBytes: number): string[] {
+  return Array.isArray(value)
+    ? value.map(item => compactText(item, itemBytes)).filter(Boolean).slice(0, maxItems)
+    : [];
+}
+
+function queryText(instruction: string, outlines: ContextOutline[], memories: Array<Record<string, unknown>>, cards: ContextCard[]): string {
+  return [
+    instruction,
+    ...outlines.map(outline => `${outline.kind || ""} ${outline.title || ""} ${outline.content || ""}`),
+    ...memories.flatMap(memory => [memory.title, memory.summary, ...(Array.isArray(memory.keywords) ? memory.keywords : [])]),
+    ...cards.map(card => `${card.title} ${card.currentState || ""}`),
+  ].filter(Boolean).join("\n").toLowerCase();
+}
+
+function relevanceScore(label: string, text: string): number {
+  const normalized = label.trim().toLowerCase();
+  if (!normalized) return 0;
+  if (text.includes(normalized)) return 12;
+  const chunks = normalized.match(/[\p{L}\p{N}]{2,}/gu) || [];
+  return chunks.reduce((score, chunk) => score + (text.includes(chunk) ? 3 : 0), 0);
+}
+
+function compactOutlines(outlines: ContextOutline[], activeOutlineId: unknown, text: string, maxBytes: number): string {
+  const ordered = outlines
+    .filter(outline => String(outline.content || "").trim())
+    .map(outline => ({
+      outline,
+      score: (String(outline.id ?? "") === String(activeOutlineId ?? "") ? 100 : 0)
+        + relevanceScore(`${outline.kind || ""} ${outline.title || ""}`, text)
+        + (outline.kind === "细纲" ? 8 : outline.kind === "总纲" ? 4 : 0),
+    }))
+    .sort((left, right) => right.score - left.score || String(left.outline.id ?? "").localeCompare(String(right.outline.id ?? "")));
+  let remaining = maxBytes;
+  const sections: string[] = [];
+  for (const { outline } of ordered.slice(0, 4)) {
+    if (remaining < 180) break;
+    const heading = `## ${compactText(outline.kind || outline.title || "大纲", 80)}\n`;
+    const body = compactText(outline.content, Math.max(120, remaining - byteLength(heading)));
+    const section = `${heading}${body}`;
+    sections.push(section);
+    remaining -= byteLength(section) + 2;
+  }
+  return sections.join("\n\n");
+}
+
+function compactCards(cards: ContextCard[], text: string, maxBytes: number): Array<{ type: string; title: string; content: string }> {
+  const ranked = cards
+    .filter(card => card && card.title?.trim())
+    .map(card => ({ card, score: relevanceScore(`${card.title} ${card.currentState || ""} ${card.content || ""}`, text) }))
+    .sort((left, right) => right.score - left.score || left.card.title.localeCompare(right.card.title));
+  let remaining = maxBytes;
+  const packed: Array<{ type: string; title: string; content: string }> = [];
+  for (const { card } of ranked.slice(0, 8)) {
+    if (remaining < 160) break;
+    const history = (card.stateHistory || []).slice(-2)
+      .map(item => `${compactText(item.chapterTitle || "最近章节", 70)}：${compactText(item.changes || item.status || "", 180)}`)
+      .filter(Boolean).join("；");
+    const state = compactText(card.currentState || "", 360);
+    const label = `[${compactText(card.type || "知识卡", 40)}] ${compactText(card.title, 100)}`;
+    const fixed = [label, state && `当前状态：${state}`, history && `近期变化：${history}`].filter(Boolean).join("\n");
+    const knowledge = compactText(card.content || "", Math.max(120, Math.min(900, remaining - byteLength(fixed) - 20)));
+    const content = [fixed, knowledge && `知识：${knowledge}`].filter(Boolean).join("\n");
+    packed.push({ type: compactText(card.type || "知识卡", 40), title: compactText(card.title, 100), content });
+    remaining -= byteLength(content) + 2;
+  }
+  return packed;
+}
+
+export function compactKnowledgeGraph(graph: unknown, text: string, maxBytes = 2800): string {
+  if (!graph || typeof graph !== "object") return "";
+  const source = graph as ContextGraph;
+  const nodes = (source.nodes || []).filter(node => node?.id && node.label);
+  const nodeById = new Map(nodes.map(node => [String(node.id), node]));
+  const scored = nodes.map(node => ({ node, score: relevanceScore(`${node.label || ""} ${node.category || ""}`, text) }));
+  const seeds = scored.filter(item => item.score > 0).sort((left, right) => right.score - left.score).slice(0, 10);
+  const fallback = scored.sort((left, right) => String(left.node.label).localeCompare(String(right.node.label))).slice(0, 5);
+  const selected = new Set((seeds.length ? seeds : fallback).map(item => String(item.node.id)));
+  const edges = (source.edges || []).filter(edge => edge?.source && edge?.target);
+  for (const edge of edges) {
+    if (selected.has(String(edge.source)) || selected.has(String(edge.target))) {
+      selected.add(String(edge.source));
+      selected.add(String(edge.target));
+    }
+  }
+  const selectedNodes = Array.from(selected).map(id => nodeById.get(id)).filter((node): node is NonNullable<typeof node> => Boolean(node)).slice(0, 18);
+  const selectedIds = new Set(selectedNodes.map(node => String(node.id)));
+  const selectedEdges = edges.filter(edge => selectedIds.has(String(edge.source)) && selectedIds.has(String(edge.target))).slice(0, 28);
+  const nodeLines = selectedNodes.map(node => `- ${compactText(node.label || "实体", 80)}${node.category ? `（${compactText(node.category, 40)}）` : ""}`);
+  const edgeLines = selectedEdges.map(edge => {
+    const sourceLabel = nodeById.get(String(edge.source))?.label || edge.source;
+    const targetLabel = nodeById.get(String(edge.target))?.label || edge.target;
+    return `- ${compactText(sourceLabel || "实体", 70)} -[${compactText(edge.label || "关联", 50)}]-> ${compactText(targetLabel || "实体", 70)}`;
+  });
+  return compactText([nodeLines.length ? `实体：\n${nodeLines.join("\n")}` : "", edgeLines.length ? `关系：\n${edgeLines.join("\n")}` : ""].filter(Boolean).join("\n"), maxBytes);
+}
+
+function compactMemories(memories: unknown, maxBytes: number): Array<Record<string, unknown>> {
+  const source = Array.isArray(memories) ? memories.filter(item => item && typeof item === "object") : [];
+  let remaining = maxBytes;
+  const packed: Array<Record<string, unknown>> = [];
+  for (const item of source.slice(-6).reverse()) {
+    if (remaining < 180) break;
+    const memory = item as Record<string, unknown>;
+    const value: Record<string, unknown> = {
+      id: memory.id,
+      title: compactText(memory.title || "章节记忆", 100),
+      summary: compactText(memory.summary || "", 480),
+      keywords: compactList(memory.keywords, 8, 70),
+      characterStateChanges: compactList(memory.characterStateChanges, 4, 180),
+      knowledgeChanges: compactList(memory.knowledgeChanges, 3, 180),
+      foreshadowingChanges: compactList(memory.foreshadowingChanges, 3, 180),
+      timelineEvents: compactList(memory.timelineEvents, 3, 180),
+      canonFacts: compactList(memory.canonFacts, 3, 180),
+      conflicts: compactList(memory.conflicts, 2, 180),
+      endingHook: compactText(memory.endingHook || "", 220),
+    };
+    const size = byteLength(JSON.stringify(value));
+    if (size > remaining && packed.length) break;
+    packed.push(value);
+    remaining -= size;
+  }
+  return packed.reverse();
+}
+
+function compactPreviousChapters(chapters: unknown, maxBytes: number): Array<{ id?: string | number; title: string; content: string }> {
+  const source = Array.isArray(chapters) ? chapters.filter(item => item && typeof item === "object") : [];
+  let remaining = maxBytes;
+  const packed: Array<{ id?: string | number; title: string; content: string }> = [];
+  for (const item of source.slice(-2).reverse()) {
+    if (remaining < 180) break;
+    const chapter = item as Record<string, unknown>;
+    const title = compactText(chapter.title || "上一章", 100);
+    const content = compactText(chapter.content || "", Math.max(160, Math.min(1500, remaining - byteLength(title) - 30)));
+    if (!content) continue;
+    packed.push({ id: typeof chapter.id === "string" || typeof chapter.id === "number" ? chapter.id : undefined, title, content });
+    remaining -= byteLength(title) + byteLength(content) + 30;
+  }
+  return packed.reverse();
+}
+
+function compactSkills(skills: unknown, instruction: string, maxBytes: number): Array<{ name: string; category: string; description: string; tags: string[]; content: string }> {
+  const source = Array.isArray(skills) ? skills.filter(item => item && typeof item === "object") : [];
+  const query = instruction.toLowerCase();
+  const ranked = source.map(item => {
+    const skill = item as Record<string, unknown>;
+    const tags = Array.isArray(skill.tags) ? skill.tags.filter((tag): tag is string => typeof tag === "string") : [];
+    const terms = [skill.name, skill.category, skill.description, ...tags].join(" ").toLowerCase();
+    return { skill, tags, score: relevanceScore(terms, query) };
+  }).sort((left, right) => right.score - left.score || String(left.skill.name || "").localeCompare(String(right.skill.name || "")));
+  let remaining = maxBytes;
+  const packed: Array<{ name: string; category: string; description: string; tags: string[]; content: string }> = [];
+  for (const { skill, tags } of ranked.slice(0, 12)) {
+    if (remaining < 120) break;
+    const name = compactText(skill.name || "技能", 90);
+    const category = compactText(skill.category || "write", 40);
+    const description = compactText(skill.description || "", 160);
+    const content = compactText(skill.content || "", Math.max(100, Math.min(900, remaining - byteLength(name) - byteLength(description) - 50)));
+    packed.push({ name, category, description, tags: compactList(tags, 8, 50), content });
+    remaining -= byteLength(name) + byteLength(category) + byteLength(description) + byteLength(content) + 60;
+  }
+  return packed;
+}
+
+export function prepareChapterInput(input: {
+  instruction: string;
+  outline?: unknown;
+  outlines?: unknown;
+  activeOutlineId?: unknown;
+  cards?: unknown;
+  previousChapters?: unknown;
+  memories?: unknown;
+  memoryDocuments?: unknown;
+  knowledgeGraph?: unknown;
+  skills?: unknown;
+  contextWindowKB?: number;
+}): PreparedChapterInput {
+  const budgetBytes = contextBudgetBytes(input.contextWindowKB);
+  const outlines = Array.isArray(input.outlines)
+    ? input.outlines.filter(item => item && typeof item === "object") as ContextOutline[]
+    : input.outline ? [{ kind: "作品大纲", title: "作品大纲", content: String(input.outline) }] : [];
+  const cards = Array.isArray(input.cards) ? input.cards.filter(item => item && typeof item === "object") as ContextCard[] : [];
+  const raw = {
+    outline: outlines,
+    cards,
+    previousChapters: input.previousChapters,
+    memories: input.memories,
+    memoryDocuments: input.memoryDocuments,
+    knowledgeGraph: input.knowledgeGraph,
+    skills: input.skills,
+  };
+  const sourceBytes = byteLength(JSON.stringify(raw));
+  const text = queryText(input.instruction, outlines, Array.isArray(input.memories) ? input.memories as Array<Record<string, unknown>> : [], cards);
+  const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * 0.26));
+  const packedCards = compactCards(cards, text, Math.floor(budgetBytes * 0.22));
+  const memories = compactMemories(input.memories, Math.floor(budgetBytes * 0.28));
+  const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * 0.14));
+  const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * 0.16));
+  const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * 0.14));
+  const memoryDocuments = Array.isArray(input.memoryDocuments)
+    ? input.memoryDocuments.filter(item => item && typeof item === "object").slice(0, 4).map(item => {
+      const document = item as Record<string, unknown>;
+      return { kind: compactText(document.kind || "记忆文档", 80), title: compactText(document.title || "", 100), content: compactText(document.content || "", 900) };
+    })
+    : [];
+  const sections = {
+    outline: byteLength(outline),
+    cards: byteLength(JSON.stringify(packedCards)),
+    memories: byteLength(JSON.stringify(memories)),
+    previousChapters: byteLength(JSON.stringify(previousChapters)),
+    knowledgeGraph: byteLength(knowledgeGraph),
+    skills: byteLength(JSON.stringify(skills)),
+    memoryDocuments: byteLength(JSON.stringify(memoryDocuments)),
+  };
+  const packedBytes = Object.values(sections).reduce((total, size) => total + size, 0);
+  return {
+    outline: outline || undefined,
+    cards: packedCards,
+    previousChapters,
+    memories,
+    memoryDocuments,
+    knowledgeGraph: knowledgeGraph || undefined,
+    skills,
+    report: {
+      cache: "miss",
+      sourceBytes,
+      packedBytes,
+      prunedBytes: Math.max(0, sourceBytes - packedBytes),
+      budgetBytes,
+      sections,
+    },
+  };
+}
+
+export function formatContextReport(report: ContextReport): string {
+  const cache = report.cache === "hit" ? "缓存命中" : "缓存未命中";
+  const packedKB = (report.packedBytes / 1024).toFixed(1);
+  const prunedKB = (report.prunedBytes / 1024).toFixed(1);
+  return `${cache}；上下文 ${packedKB} KB，已裁剪 ${prunedKB} KB`;
+}
