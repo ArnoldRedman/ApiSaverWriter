@@ -31,7 +31,7 @@ export interface ContextOutline {
 
 export interface ContextGraph {
   nodes?: Array<{ id?: string; label?: string; type?: string; category?: string }>;
-  edges?: Array<{ id?: string; source?: string; target?: string; label?: string }>;
+  edges?: Array<{ id?: string; source?: string; target?: string; label?: string; weight?: number }>;
 }
 
 export interface PreparedChapterInput {
@@ -41,7 +41,7 @@ export interface PreparedChapterInput {
   memories: Array<Record<string, unknown>>;
   memoryDocuments: Array<Record<string, unknown>>;
   knowledgeGraph?: string;
-  skills: Array<{ name: string; category: string; description: string; tags: string[]; content: string }>;
+  skills: Array<{ name: string; displayName?: string; category: string; description: string; tags: string[]; content: string }>;
   report: ContextReport;
 }
 
@@ -146,6 +146,18 @@ function relevanceScore(label: string, text: string): number {
   return chunks.reduce((score, chunk) => score + (text.includes(chunk) ? 3 : 0), 0);
 }
 
+function graphEdgeWeight(edge: { weight?: number; label?: string }): number {
+  const parsed = Number(edge.weight);
+  if (Number.isFinite(parsed)) return Math.max(0.1, Math.min(1, parsed));
+  if (edge.label === "本章引用") return 1;
+  if (edge.label === "状态更新") return 0.95;
+  if (edge.label === "章节主角") return 0.92;
+  if (edge.label === "状态引用") return 0.88;
+  if (edge.label === "正文提及") return 0.75;
+  if (edge.label === "章节提及") return 0.7;
+  return 0.65;
+}
+
 function compactOutlines(outlines: ContextOutline[], activeOutlineId: unknown, text: string, maxBytes: number): string {
   const ordered = outlines
     .filter(outline => String(outline.content || "").trim())
@@ -201,21 +213,27 @@ export function compactKnowledgeGraph(graph: unknown, text: string, maxBytes = 2
   const seeds = scored.filter(item => item.score > 0).sort((left, right) => right.score - left.score).slice(0, 10);
   const fallback = scored.sort((left, right) => String(left.node.label).localeCompare(String(right.node.label))).slice(0, 5);
   const selected = new Set((seeds.length ? seeds : fallback).map(item => String(item.node.id)));
-  const edges = (source.edges || []).filter(edge => edge?.source && edge?.target);
+  const edges = (source.edges || []).filter(edge => edge?.source && edge?.target)
+    .sort((left, right) => graphEdgeWeight(right) - graphEdgeWeight(left));
   for (const edge of edges) {
-    if (selected.has(String(edge.source)) || selected.has(String(edge.target))) {
-      selected.add(String(edge.source));
-      selected.add(String(edge.target));
-    }
+    const sourceId = String(edge.source);
+    const targetId = String(edge.target);
+    if (!selected.has(sourceId) && !selected.has(targetId)) continue;
+    // 留出空间给强关系；较弱的扩散关系不会挤掉当前写作的直接证据。
+    if (selected.size >= 18 && (!selected.has(sourceId) || !selected.has(targetId))) continue;
+    selected.add(sourceId);
+    selected.add(targetId);
   }
-  const selectedNodes = Array.from(selected).map(id => nodeById.get(id)).filter((node): node is NonNullable<typeof node> => Boolean(node)).slice(0, 18);
+  const selectedNodes = Array.from(selected).map(id => nodeById.get(id)).filter((node): node is NonNullable<typeof node> => Boolean(node))
+    .sort((left, right) => relevanceScore(`${right.label || ""} ${right.category || ""}`, text) - relevanceScore(`${left.label || ""} ${left.category || ""}`, text) || String(left.label).localeCompare(String(right.label)))
+    .slice(0, 18);
   const selectedIds = new Set(selectedNodes.map(node => String(node.id)));
   const selectedEdges = edges.filter(edge => selectedIds.has(String(edge.source)) && selectedIds.has(String(edge.target))).slice(0, 28);
   const nodeLines = selectedNodes.map(node => `- ${compactText(node.label || "实体", 80)}${node.category ? `（${compactText(node.category, 40)}）` : ""}`);
   const edgeLines = selectedEdges.map(edge => {
     const sourceLabel = nodeById.get(String(edge.source))?.label || edge.source;
     const targetLabel = nodeById.get(String(edge.target))?.label || edge.target;
-    return `- ${compactText(sourceLabel || "实体", 70)} -[${compactText(edge.label || "关联", 50)}]-> ${compactText(targetLabel || "实体", 70)}`;
+    return `- ${compactText(sourceLabel || "实体", 70)} -[${compactText(edge.label || "关联", 50)}；权重 ${graphEdgeWeight(edge).toFixed(2)}]-> ${compactText(targetLabel || "实体", 70)}`;
   });
   return compactText([nodeLines.length ? `实体：\n${nodeLines.join("\n")}` : "", edgeLines.length ? `关系：\n${edgeLines.join("\n")}` : ""].filter(Boolean).join("\n"), maxBytes);
 }
@@ -264,20 +282,28 @@ function compactPreviousChapters(chapters: unknown, maxBytes: number): Array<{ i
   return packed.reverse();
 }
 
-function compactSkills(skills: unknown, instruction: string, maxBytes: number): Array<{ name: string; category: string; description: string; tags: string[]; content: string }> {
+function compactSkills(skills: unknown, instruction: string, maxBytes: number): Array<{ name: string; displayName?: string; category: string; description: string; tags: string[]; content: string }> {
   const source = Array.isArray(skills) ? skills.filter(item => item && typeof item === "object") : [];
   const query = instruction.toLowerCase();
   const ranked = source.map(item => {
     const skill = item as Record<string, unknown>;
     const tags = Array.isArray(skill.tags) ? skill.tags.filter((tag): tag is string => typeof tag === "string") : [];
-    const terms = [skill.name, skill.category, skill.description, ...tags].join(" ").toLowerCase();
+    const terms = [skill.name, skill.displayName, skill.category, skill.description, ...tags].join(" ").toLowerCase();
     return { skill, tags, score: relevanceScore(terms, query) };
   }).sort((left, right) => right.score - left.score || String(left.skill.name || "").localeCompare(String(right.skill.name || "")));
   let remaining = maxBytes;
   const packed: Array<{ name: string; category: string; description: string; tags: string[]; content: string }> = [];
-  for (const { skill, tags } of ranked.slice(0, 12)) {
+  const writingRequest = /章节|正文|续写|创作|写作|下一章/u.test(instruction);
+  const priorityNames = writingRequest
+    ? ["chapter-continuity", "next-chapter-plan"]
+    : [];
+  const priority = priorityNames
+    .map(name => ranked.find(item => String(item.skill.name || "") === name))
+    .filter((item): item is (typeof ranked)[number] => Boolean(item));
+  const ordered = [...priority, ...ranked.filter(item => !priorityNames.includes(String(item.skill.name || "")))];
+  for (const { skill, tags } of ordered.slice(0, 12)) {
     if (remaining < 120) break;
-    const name = compactText(skill.name || "技能", 90);
+    const name = compactText(skill.displayName || skill.name || "技能", 90);
     const category = compactText(skill.category || "write", 40);
     const description = compactText(skill.description || "", 160);
     const contentLimit = skill.name === "chapter-continuity" ? 1800 : 700;

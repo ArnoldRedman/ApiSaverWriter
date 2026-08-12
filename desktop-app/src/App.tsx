@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import './App.css';
@@ -8,6 +8,8 @@ import { builtinSkills } from './data/builtin-skills';
 export interface Skill {
   id: number | string;
   name: string;
+  /** Stable routing key; built-in skills use displayName for Chinese UI text. */
+  displayName?: string;
   category: string;
   description: string;
   tags: string[];
@@ -109,6 +111,17 @@ interface AIDetectionChapter {
   paragraphUniformity: number;
   aiRate: number;
   humanRate: number;
+  segments: AIDetectionSegment[];
+  label: AIDetectionLabel;
+}
+
+type AIDetectionLabel = '人工' | '疑似 AI' | 'AI 特征';
+
+interface AIDetectionSegment {
+  order: number;
+  text: string;
+  confidence: number;
+  label: AIDetectionLabel;
 }
 
 interface AIDetectionReport {
@@ -118,6 +131,7 @@ interface AIDetectionReport {
   averageAIRate: number;
   level: string;
   suggestion: string;
+  provider: '本地启发式';
 }
 
 type MemoryDocumentKind = '章节快照' | '人物状态' | '角色认知' | '伏笔追踪' | '时间线' | '设定事实' | '冲突';
@@ -136,6 +150,11 @@ interface KnowledgeGraphNode {
   label: string;
   type: 'chapter' | 'card' | 'outline' | 'entity';
   category?: string;
+  content?: string;
+  sourcePath?: string;
+  status?: string;
+  sourceChapterIds?: number[];
+  updatedAt?: string;
 }
 
 interface KnowledgeGraphEdge {
@@ -143,7 +162,81 @@ interface KnowledgeGraphEdge {
   source: string;
   target: string;
   label: string;
+  weight?: number;
+  sourceChapterId?: number;
+  updatedAt?: string;
 }
+
+// 权重代表关系证据强度，不是模型猜测的“重要程度”。高权重关系会优先进入写作上下文。
+const defaultKnowledgeGraphWeight = (label: string): number => {
+  if (label === '本章引用') return 1;
+  if (label === '状态更新') return 0.95;
+  if (label === '章节主角') return 0.92;
+  if (label === '状态引用') return 0.88;
+  if (label === '正文提及') return 0.75;
+  if (label === '章节提及') return 0.7;
+  return 0.65;
+};
+
+const normalizeKnowledgeGraphWeight = (value: unknown, label: string): number => {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  const weight = Number.isFinite(parsed) ? parsed : defaultKnowledgeGraphWeight(label);
+  return Math.round(Math.max(0.1, Math.min(1, weight)) * 100) / 100;
+};
+
+const normalizeKnowledgeGraphEdges = (value: unknown): KnowledgeGraphEdge[] => Array.isArray(value)
+  ? value.filter((edge): edge is Partial<KnowledgeGraphEdge> => Boolean(edge && typeof edge === 'object'))
+    .map(edge => ({
+      id: String(edge.id || `${edge.source || 'unknown'}->${edge.target || 'unknown'}:${edge.label || '关联'}`),
+      source: String(edge.source || ''),
+      target: String(edge.target || ''),
+      label: String(edge.label || '关联'),
+      weight: normalizeKnowledgeGraphWeight(edge.weight, String(edge.label || '关联')),
+      sourceChapterId: edge.sourceChapterId,
+      updatedAt: edge.updatedAt,
+    })).filter(edge => edge.source && edge.target)
+  : [];
+
+const upsertKnowledgeGraphEdge = (edges: KnowledgeGraphEdge[], next: KnowledgeGraphEdge) => {
+  const nextWeight = normalizeKnowledgeGraphWeight(next.weight, next.label);
+  const index = edges.findIndex(edge => edge.id === next.id);
+  if (index < 0) {
+    edges.push({ ...next, weight: nextWeight });
+    return;
+  }
+  const existing = edges[index];
+  // 同一关系出现多次时，只提高已有证据强度，避免一次弱抽取覆盖明确引用。
+  edges[index] = {
+    ...existing,
+    ...next,
+    weight: Math.max(normalizeKnowledgeGraphWeight(existing.weight, existing.label), nextWeight),
+    updatedAt: next.updatedAt || existing.updatedAt,
+  };
+};
+
+const graphNodeTypeLabel = (node: KnowledgeGraphNode) => {
+  if (node.type === 'chapter') return '章节';
+  if (node.type === 'outline') return '大纲';
+  if (node.type === 'card') return node.category || '知识卡';
+  return node.category || '实体';
+};
+
+const graphNodeGroup = (node: KnowledgeGraphNode) => {
+  const type = graphNodeTypeLabel(node);
+  if (/角色|人物/u.test(type)) return '重要角色';
+  if (/地点|场景/u.test(type)) return '地点与场景';
+  if (/势力|组织/u.test(type)) return '组织与势力';
+  if (/物品|金手指/u.test(type)) return '物品与设定';
+  if (node.type === 'chapter') return '章节事件';
+  if (node.type === 'outline') return '大纲设定';
+  return '其他实体';
+};
+
+const graphNodeRelativePath = (node: KnowledgeGraphNode) => node.sourcePath || `图谱/${graphNodeGroup(node)}/${node.label}.md`;
+
+const graphNodeProfile = (node: KnowledgeGraphNode) => node.content?.trim() || `## 基础信息\n- 节点类型：${graphNodeTypeLabel(node)}\n- 当前状态：${node.status || '待补充'}\n\n## 档案\n待补充。`;
+
+const createGraphNodeProfile = (type: KnowledgeGraphNode['type'], category?: string) => `## 基础信息\n- 节点类型：${type === 'entity' ? category || '实体' : type === 'card' ? category || '知识卡' : type === 'chapter' ? '章节' : '大纲'}\n- 当前状态：待补充\n\n## 档案\n待补充。`;
 
 interface Project {
   id: number;
@@ -171,11 +264,140 @@ interface Project {
   publishRecords?: PublishRecord[];
   aiDetection?: AIDetectionReport;
   chapterTargetWords?: number;
+  styleProfileId?: string;
+  sourceDismantleBookId?: string;
+}
+
+type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten';
+
+interface DismantleChapter {
+  id: string;
+  number: number;
+  title: string;
+  sourceContent: string;
+  wordCount: number;
+  summary: string;
+  detailedOutline: string;
+  plotBeats: string[];
+  characterDynamics: string[];
+  setupPayoff: string[];
+  pacing: string;
+  rewriteContent: string;
+  status: DismantleChapterStatus;
+  sourcePath?: string;
+  outlinePath?: string;
+  rewritePath?: string;
+  updatedAt: string;
+}
+
+interface DismantleBook {
+  id: string;
+  title: string;
+  sourceFileName: string;
+  chapters: DismantleChapter[];
+  boundProjectId?: number;
+  sourceLibraryBookId?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface LibraryBookChapter {
+  id: string;
+  number: number;
+  title: string;
+  url: string;
+  content: string;
+  wordCount: number;
+  downloaded: boolean;
+  unavailableReason?: string;
+  outline?: string;
+}
+
+interface LibraryBook {
+  id: string;
+  title: string;
+  author: string;
+  source: string;
+  sourceId?: string;
+  sourceBookId?: string;
+  url: string;
+  intro: string;
+  cover?: string;
+  category?: string;
+  wordCount?: number;
+  chapters: LibraryBookChapter[];
+  downloadedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  localPath?: string;
+  fontCss?: string;
+}
+
+type RankingPlatform = 'fanqie' | 'qidian' | 'faloo';
+type RankingType = 'read' | 'new' | 'hot' | 'completed' | 'collect';
+type FanqieSection = 'male-read' | 'male-new' | 'female-read' | 'female-new';
+
+const fanqieSectionOptions: Array<{ value: FanqieSection; label: string; gender: 'male' | 'female'; list: 'read' | 'new' }> = [
+  { value: 'male-read', label: '男频阅读', gender: 'male', list: 'read' },
+  { value: 'male-new', label: '男频新书', gender: 'male', list: 'new' },
+  { value: 'female-read', label: '女频阅读', gender: 'female', list: 'read' },
+  { value: 'female-new', label: '女频新书', gender: 'female', list: 'new' },
+];
+
+interface RankingCategoryOption {
+  id: string;
+  label: string;
+  url: string;
+  gender: 'male' | 'female';
+  list: 'read' | 'new';
+}
+
+const rankingTypeOptions = (platform: RankingPlatform): Array<{ value: RankingType; label: string }> => {
+  if (platform === 'fanqie') return [{ value: 'read', label: '阅读榜' }, { value: 'new', label: '新书榜' }];
+  if (platform === 'qidian') return [{ value: 'hot', label: '月票榜' }, { value: 'new', label: '签约作者新书榜' }, { value: 'read', label: '阅读指数榜' }];
+  if (platform === 'faloo') return [{ value: 'read', label: '24小时畅销榜' }];
+  return [{ value: 'read', label: '阅读榜' }];
+};
+
+const rankingTypeLabel = (platform: RankingPlatform, type: RankingType) => rankingTypeOptions(platform).find(item => item.value === type)?.label || '榜单';
+
+interface RankingBook {
+  id: string;
+  title: string;
+  author: string;
+  intro: string;
+  cover?: string;
+  category?: string;
+  rank: number;
+  rankType: RankingType;
+  gender: 'male' | 'female' | 'all';
+  platform: 'fanqie' | 'qidian' | 'faloo';
+  sourceBookId?: string;
+  url: string;
+  wordCount?: number;
+  readCount?: number;
+  fetchedAt: string;
+  sourceName?: string;
+}
+
+interface WritingStyle {
+  id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  content: string;
+  sourceBookId?: string;
+  createdAt: string;
+  updatedAt: string;
+  sourcePath?: string;
 }
 
 interface AIToolResult {
-  mode: 'polish' | 'continue';
+  mode: 'polish' | 'de-ai' | 'continue';
   content: string;
+  projectId: number;
+  chapterId: number;
+  scope: 'chapter' | 'selection';
   source?: string;
   start?: number;
   end?: number;
@@ -191,6 +413,7 @@ interface AgentReviewResult {
 interface AgentDraftResult {
   draftContent?: string;
   summary?: string;
+  chapterPlan?: string;
   reviewResult?: AgentReviewResult;
   retrievedContext?: string[];
   recognizedIntent?: string;
@@ -220,12 +443,12 @@ interface AgentMemoryResult {
   conflicts?: string[];
   endingHook?: string;
   entities?: Array<{ name?: string; type?: string }>;
-  relations?: Array<{ source?: string; target?: string; label?: string }>;
+  relations?: Array<{ source?: string; target?: string; label?: string; weight?: number }>;
   cardUpdates?: Array<{ cardId?: number | string; cardTitle?: string; status?: string; changes?: string }>;
   contextReport?: AgentDraftResult['contextReport'];
 }
 
-type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'draft' | 'review' | 'done' | 'error';
+type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'plan' | 'draft' | 'review' | 'done' | 'error';
 type ApiMode = 'openai' | 'responses' | 'anthropic';
 type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max' | 'custom';
 type AgentProgressStatus = 'pending' | 'active' | 'complete' | 'error';
@@ -250,6 +473,7 @@ const agentStageLabel: Record<AgentStage, string> = {
   starting: '启动智能体',
   intent: '识别创作意图',
   retrieve: '检索上下文',
+  plan: '制定下一章计划',
   draft: '生成正文',
   review: '审查一致性',
   done: '草稿完成',
@@ -260,6 +484,7 @@ const agentWorkflowSteps = [
   { id: 'starting', label: '准备运行环境', description: '整理章节、卡片和已选记忆' },
   { id: 'intent', label: '识别创作意图', description: '选择适用的写作技能' },
   { id: 'retrieve', label: '检索故事记忆', description: '读取相关人物、设定和时间线' },
+  { id: 'plan', label: '制定下一章计划', description: '梳理承接、事件链、节奏、伏笔和章末钩子' },
   { id: 'draft', label: '生成章节草稿', description: '组织上下文并调用模型写作' },
   { id: 'review', label: '审查一致性', description: '检查人物、逻辑与时间线' },
 ] as const;
@@ -304,6 +529,8 @@ const agentNetworkParams = (config: AgentConfig) => ({
   proxyBypassLocal: config.proxyBypassLocal,
 });
 const defaultPublishConfig: PublishConfig = {
+  // Publishing is currently supported by the Fanqie adapter; keep the
+  // default config independent from any library/ranking book object.
   platform: 'fanqie',
   enabled: false,
   creatorURL: 'https://fanqienovel.com/main/writer',
@@ -319,6 +546,144 @@ const asTextList = (value: unknown, limit = 20) => Array.isArray(value)
   ? value.filter((item): item is string => typeof item === 'string').map(item => item.trim()).filter(Boolean).slice(0, limit)
   : [];
 const memoryTextList = (value: string) => value.split(/\r?\n|、/).map(item => item.trim()).filter(Boolean).slice(0, 30);
+
+const localResourceId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+const splitTxtIntoDismantleChapters = (text: string): Array<{ title: string; sourceContent: string }> => {
+  const cleaned = text.replace(/^\uFEFF/u, '').replace(/\r\n/gu, '\n').trim();
+  if (!cleaned) return [];
+  const heading = /^\s*(?:第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回部].*|(?:chapter|chap\.)\s*\d+.*)$/gimu;
+  const matches = Array.from(cleaned.matchAll(heading));
+  if (!matches.length) return [{ title: '第1章', sourceContent: cleaned }];
+  const chapters: Array<{ title: string; sourceContent: string }> = [];
+  const preface = cleaned.slice(0, matches[0].index).trim();
+  if (preface) chapters.push({ title: '序章', sourceContent: preface });
+  matches.forEach((match, index) => {
+    const start = match.index ?? 0;
+    const end = matches[index + 1]?.index ?? cleaned.length;
+    const sourceContent = cleaned.slice(start, end).trim();
+    const firstBreak = sourceContent.indexOf('\n');
+    const title = (firstBreak >= 0 ? sourceContent.slice(0, firstBreak) : sourceContent).trim().slice(0, 100) || `第${chapters.length + 1}章`;
+    const body = (firstBreak >= 0 ? sourceContent.slice(firstBreak + 1) : '').trim();
+    chapters.push({ title, sourceContent: body || sourceContent });
+  });
+  return chapters.filter(chapter => chapter.sourceContent.trim());
+};
+
+const readLocalTxtFile = async (file: File): Promise<string> => {
+  const bytes = await file.arrayBuffer();
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    try { return new TextDecoder('gb18030').decode(bytes); }
+    catch { return new TextDecoder().decode(bytes); }
+  }
+};
+
+const normalizeDismantleChapter = (chapter: Partial<DismantleChapter>, index: number): DismantleChapter => ({
+  id: typeof chapter.id === 'string' ? chapter.id : localResourceId('dismantle-chapter'),
+  number: Number(chapter.number) || index + 1,
+  title: typeof chapter.title === 'string' && chapter.title.trim() ? chapter.title.trim() : `第${index + 1}章`,
+  sourceContent: typeof chapter.sourceContent === 'string' ? chapter.sourceContent : '',
+  wordCount: countNovelCharacters(typeof chapter.sourceContent === 'string' ? chapter.sourceContent : ''),
+  summary: typeof chapter.summary === 'string' ? chapter.summary : '',
+  detailedOutline: typeof chapter.detailedOutline === 'string' ? chapter.detailedOutline : '',
+  plotBeats: asTextList(chapter.plotBeats, 10),
+  characterDynamics: asTextList(chapter.characterDynamics, 10),
+  setupPayoff: asTextList(chapter.setupPayoff, 10),
+  pacing: typeof chapter.pacing === 'string' ? chapter.pacing : '',
+  rewriteContent: typeof chapter.rewriteContent === 'string' ? chapter.rewriteContent : '',
+  status: chapter.status === 'analyzing' || chapter.status === 'analyzed' || chapter.status === 'rewritten' ? chapter.status : 'pending',
+  sourcePath: typeof chapter.sourcePath === 'string' ? chapter.sourcePath : undefined,
+  outlinePath: typeof chapter.outlinePath === 'string' ? chapter.outlinePath : undefined,
+  rewritePath: typeof chapter.rewritePath === 'string' ? chapter.rewritePath : undefined,
+  updatedAt: typeof chapter.updatedAt === 'string' ? chapter.updatedAt : new Date().toISOString(),
+});
+
+const normalizeDismantleBook = (book: Partial<DismantleBook>): DismantleBook => {
+  const now = new Date().toISOString();
+  return {
+    id: typeof book.id === 'string' ? book.id : localResourceId('dismantle'),
+    title: typeof book.title === 'string' && book.title.trim() ? book.title.trim() : '未命名拆书',
+    sourceFileName: typeof book.sourceFileName === 'string' ? book.sourceFileName : '',
+    chapters: Array.isArray(book.chapters) ? book.chapters.map((chapter, index) => normalizeDismantleChapter(chapter, index)) : [],
+    boundProjectId: typeof book.boundProjectId === 'number' ? book.boundProjectId : undefined,
+    sourceLibraryBookId: typeof book.sourceLibraryBookId === 'string' ? book.sourceLibraryBookId : undefined,
+    createdAt: typeof book.createdAt === 'string' ? book.createdAt : now,
+    updatedAt: typeof book.updatedAt === 'string' ? book.updatedAt : now,
+  };
+};
+
+const normalizeLibraryBookChapter = (chapter: Partial<LibraryBookChapter>, index: number): LibraryBookChapter => ({
+  id: typeof chapter.id === 'string' ? chapter.id : localResourceId('book-chapter'),
+  number: Number(chapter.number) || index + 1,
+  title: typeof chapter.title === 'string' && chapter.title.trim() ? chapter.title.trim() : `第${index + 1}章`,
+  url: typeof chapter.url === 'string' ? chapter.url : '',
+  content: typeof chapter.content === 'string' ? chapter.content : '',
+  wordCount: countNovelCharacters(typeof chapter.content === 'string' ? chapter.content : ''),
+  downloaded: chapter.downloaded === true && Boolean(chapter.content?.trim()),
+  unavailableReason: typeof chapter.unavailableReason === 'string' ? chapter.unavailableReason : undefined,
+  outline: typeof chapter.outline === 'string' ? chapter.outline : undefined,
+});
+
+const normalizeLibraryBook = (book: Partial<LibraryBook>): LibraryBook => {
+  const now = new Date().toISOString();
+  return {
+    id: typeof book.id === 'string' ? book.id : localResourceId('book'),
+    title: typeof book.title === 'string' && book.title.trim() ? book.title.trim() : '未命名书籍',
+    author: typeof book.author === 'string' ? book.author : '未知作者',
+    source: typeof book.source === 'string' ? book.source : '番茄小说',
+    sourceId: typeof book.sourceId === 'string' ? book.sourceId : undefined,
+    sourceBookId: typeof book.sourceBookId === 'string' ? book.sourceBookId : undefined,
+    url: typeof book.url === 'string' ? book.url : '',
+    intro: typeof book.intro === 'string' ? book.intro : '',
+    cover: typeof book.cover === 'string' ? book.cover : undefined,
+    category: typeof book.category === 'string' ? book.category : undefined,
+    wordCount: Number(book.wordCount) || undefined,
+    chapters: Array.isArray(book.chapters) ? book.chapters.map((chapter, index) => normalizeLibraryBookChapter(chapter, index)) : [],
+    downloadedAt: typeof book.downloadedAt === 'string' ? book.downloadedAt : undefined,
+    createdAt: typeof book.createdAt === 'string' ? book.createdAt : now,
+    updatedAt: typeof book.updatedAt === 'string' ? book.updatedAt : now,
+    localPath: typeof book.localPath === 'string' ? book.localPath : undefined,
+    fontCss: typeof book.fontCss === 'string' ? book.fontCss : undefined,
+  };
+};
+
+const normalizeRankingBook = (book: Partial<RankingBook>, index: number): RankingBook => ({
+  id: typeof book.id === 'string' ? book.id : localResourceId('ranking-book'),
+  title: typeof book.title === 'string' ? book.title : '未命名书籍',
+  author: typeof book.author === 'string' ? book.author : '未知作者',
+  intro: typeof book.intro === 'string' ? book.intro : '',
+  cover: typeof book.cover === 'string' ? book.cover : undefined,
+  category: typeof book.category === 'string' ? book.category : undefined,
+  rank: Number(book.rank) || index + 1,
+  rankType: book.rankType === 'new' || book.rankType === 'hot' || book.rankType === 'completed' || book.rankType === 'collect' ? book.rankType : 'read',
+  gender: book.gender === 'male' || book.gender === 'female' ? book.gender : 'all',
+  platform: book.platform === 'qidian' || book.platform === 'faloo' ? book.platform : 'fanqie',
+  sourceBookId: typeof book.sourceBookId === 'string' ? book.sourceBookId : undefined,
+  url: typeof book.url === 'string' ? book.url : '',
+  wordCount: Number(book.wordCount) || undefined,
+  readCount: Number(book.readCount) || undefined,
+  fetchedAt: typeof book.fetchedAt === 'string' ? book.fetchedAt : new Date().toISOString(),
+  sourceName: typeof book.sourceName === 'string' ? book.sourceName : undefined,
+});
+
+const trustedRankingCache = (book: RankingBook) => book.platform !== 'fanqie' || book.sourceName === '番茄小说网';
+
+const normalizeWritingStyle = (style: Partial<WritingStyle>): WritingStyle => {
+  const now = new Date().toISOString();
+  return {
+    id: typeof style.id === 'string' ? style.id : localResourceId('style'),
+    name: typeof style.name === 'string' && style.name.trim() ? style.name.trim() : '未命名文风',
+    description: typeof style.description === 'string' ? style.description : '',
+    tags: asTextList(style.tags, 12),
+    content: typeof style.content === 'string' ? style.content : '',
+    sourceBookId: typeof style.sourceBookId === 'string' ? style.sourceBookId : undefined,
+    createdAt: typeof style.createdAt === 'string' ? style.createdAt : now,
+    updatedAt: typeof style.updatedAt === 'string' ? style.updatedAt : now,
+    sourcePath: typeof style.sourcePath === 'string' ? style.sourcePath : undefined,
+  };
+};
 
 const chapterOrder = (memory: ChapterMemory) => memory.sourceChapterNumber ?? memory.chapterId;
 const recentMemoryIds = (memories: ChapterMemory[], limit = 1) => [...memories]
@@ -441,6 +806,34 @@ const extractLocalKeywords = (content: string) => {
   return Array.from(new Set(matches.filter(word => !ignored.has(word)))).slice(0, 8);
 };
 
+const aiDetectionLabel = (confidence: number): AIDetectionLabel => {
+  if (confidence >= 0.99) return 'AI 特征';
+  if (confidence >= 0.5) return '疑似 AI';
+  return '人工';
+};
+
+const splitAIDetectionSegments = (text: string, chapterScore: number): AIDetectionSegment[] => {
+  // Keep paragraph separators in the segment so stored offsets remain aligned
+  // with the editor content when the result is rendered as an overlay.
+  const parts = text.match(/[\s\S]*?(?:\n{2,}|$)/gu) ?? [text];
+  let order = 0;
+  return parts.filter(part => part.length > 0).map(part => {
+    const sentences = part.split(/[。！？!?\n]/u).map(item => item.trim()).filter(Boolean);
+    const lengths = sentences.map(item => item.length);
+    const average = lengths.length ? lengths.reduce((sum, length) => sum + length, 0) / lengths.length : 0;
+    const variance = lengths.length ? lengths.reduce((sum, length) => sum + (length - average) ** 2, 0) / lengths.length : 0;
+    const uniformity = lengths.length ? Math.max(0, 100 - Math.sqrt(variance) * 2) : 50;
+    const logicCount = ['但是', '不过', '然而', '因此', '所以', '首先', '其次', '最后', '总之'].reduce((sum, word) => sum + part.split(word).length - 1, 0);
+    const colloquialCount = ['咋', '啥', '呗', '嘛', '呢', '啊', '呀', '咯', '喽', '琢磨', '寻思'].reduce((sum, word) => sum + part.split(word).length - 1, 0);
+    const templateCount = ['首先', '其次', '最后', '总之', '综上所述', '值得注意的是', '需要注意的是', '通过这种方式'].reduce((sum, word) => sum + part.split(word).length - 1, 0);
+    const normalizedLength = Math.max(1, part.replace(/\s+/gu, '').length);
+    const localSignal = 0.08 + uniformity / 100 * 0.2 + Math.min(1, logicCount / Math.max(1, sentences.length)) * 0.18 + (1 - Math.min(1, colloquialCount / Math.max(1, sentences.length))) * 0.14 + chapterScore * 0.16;
+    const stronglyTemplated = sentences.length >= 4 && uniformity >= 88 && (templateCount >= 3 || logicCount >= 5);
+    const confidence = stronglyTemplated ? 0.99 : Math.max(0, Math.min(0.98, Number((localSignal + (normalizedLength < 30 ? 0.03 : 0)).toFixed(3))));
+    return { order: ++order, text: part, confidence, label: aiDetectionLabel(confidence) };
+  });
+};
+
 const analyzeAIChapter = (chapter: Chapter): AIDetectionChapter => {
   const text = chapter.content.replace(/^【第\d+章[^】]*】\s*/u, '').replace(/（本章完）\s*$/u, '').trim();
   const sentences = text.split(/[。！？\n]/u).map(item => item.trim()).filter(Boolean);
@@ -463,6 +856,7 @@ const analyzeAIChapter = (chapter: Chapter): AIDetectionChapter => {
   const logicScore = Math.min(1, logicFrequency * 10 / 100);
   const colloquialScore = Math.min(1, colloquialFrequency * 20 / 100);
   const aiRate = Math.min(100, Math.max(0, sentenceUniformity / 100 * 25 + logicScore * 25 + (1 - colloquialScore) * 25 + Math.min(1, psychologicalFrequency * 5) * 15 + paragraphUniformity / 100 * 10));
+  const segments = splitAIDetectionSegments(chapter.content, aiRate / 100);
   return {
     chapterId: chapter.id,
     chapterTitle: chapter.title,
@@ -474,6 +868,8 @@ const analyzeAIChapter = (chapter: Chapter): AIDetectionChapter => {
     paragraphUniformity: Number(paragraphUniformity.toFixed(1)),
     aiRate: Number(aiRate.toFixed(1)),
     humanRate: Number((100 - aiRate).toFixed(1)),
+    segments,
+    label: aiDetectionLabel(aiRate / 100),
   };
 };
 
@@ -482,7 +878,7 @@ const buildAIDetectionReport = (project: Project, scope: 'chapter' | 'book', cha
   const averageAIRate = chapters.length ? chapters.reduce((sum, item) => sum + item.aiRate, 0) / chapters.length : 0;
   const level = averageAIRate < 30 ? '极低' : averageAIRate < 45 ? '低' : averageAIRate < 60 ? '中等' : '高';
   const suggestion = averageAIRate < 30 ? '文本具有较强的人类写作特征。' : averageAIRate < 45 ? '文本具有人类写作特征，可保持具体动作和口语表达。' : averageAIRate < 60 ? '文本存在混合特征，建议增加句式变化和个性化细节。' : '文本具有较多模板化特征，建议使用去 AI 味技能复写后再检测。';
-  return { updatedAt: new Date().toISOString(), scope, chapters, averageAIRate: Number(averageAIRate.toFixed(1)), level, suggestion };
+  return { updatedAt: new Date().toISOString(), scope, chapters, averageAIRate: Number(averageAIRate.toFixed(1)), level, suggestion, provider: '本地启发式' };
 };
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -499,7 +895,7 @@ const countOccurrences = (content: string, query: string) => {
   return count;
 };
 
-type TabType = 'projects';
+type TabType = 'projects' | 'books' | 'dismantles' | 'rankings' | 'skills' | 'styles';
 type TagTab = '主分类' | '主题' | '角色' | '情节';
 type Channel = '男频' | '女频';
 
@@ -683,11 +1079,13 @@ function App() {
               memories: Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [],
               memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
               graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
-              graphEdges: Array.isArray(project.graphEdges) ? project.graphEdges : [],
+              graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
               publishConfig: { ...defaultPublishConfig, ...(project.publishConfig || {}) },
               publishRecords: Array.isArray(project.publishRecords) ? project.publishRecords : [],
               chapterTargetWords: Number(project.chapterTargetWords) > 0 ? Number(project.chapterTargetWords) : 3000,
               aiDetection: project.aiDetection,
+              styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
+              sourceDismantleBookId: typeof project.sourceDismantleBookId === 'string' ? project.sourceDismantleBookId : undefined,
               createdAt: project.createdAt ?? project.updatedAt ?? new Date().toISOString(),
               updatedAt: project.updatedAt ?? new Date().toISOString(),
             };
@@ -700,11 +1098,68 @@ function App() {
     // 没有本地项目时直接展示居中的新建入口。
     return [];
   });
-  const [skills, setSkills] = useState<Skill[]>([]);
+  const [libraryBooks, setLibraryBooks] = useState<LibraryBook[]>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('writer-library-books') || '[]');
+      return Array.isArray(saved) ? saved.map(book => normalizeLibraryBook(book)) : [];
+    } catch { return []; }
+  });
+  const [rankingBooks, setRankingBooks] = useState<RankingBook[]>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('writer-ranking-books') || '[]');
+      return Array.isArray(saved) ? saved.map((book, index) => normalizeRankingBook(book, index)).filter(trustedRankingCache) : [];
+    } catch { return []; }
+  });
+  const [dismantleBooks, setDismantleBooks] = useState<DismantleBook[]>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('writer-dismantle-books') || '[]');
+      return Array.isArray(saved) ? saved.map(book => normalizeDismantleBook(book)) : [];
+    } catch { return []; }
+  });
+  const [writingStyles, setWritingStyles] = useState<WritingStyle[]>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('writer-writing-styles') || '[]');
+      return Array.isArray(saved) ? saved.map(style => normalizeWritingStyle(style)) : [];
+    } catch { return []; }
+  });
+  const [activeLibraryBookId, setActiveLibraryBookId] = useState<string | null>(null);
+  const [activeLibraryChapterId, setActiveLibraryChapterId] = useState<string | null>(null);
+  const [libraryChapterDownloadRunningId, setLibraryChapterDownloadRunningId] = useState<string | null>(null);
+  const [libraryOutlineRunningId, setLibraryOutlineRunningId] = useState<string | null>(null);
+  const [activeRankingBookId, setActiveRankingBookId] = useState<string | null>(null);
+  const [rankingPlatform, setRankingPlatform] = useState<RankingPlatform>('fanqie');
+  const [rankingType, setRankingType] = useState<RankingType>('read');
+  const [fanqieSection, setFanqieSection] = useState<FanqieSection>('male-read');
+  const [fanqieCategories, setFanqieCategories] = useState<Record<FanqieSection, RankingCategoryOption[]>>({ 'male-read': [], 'male-new': [], 'female-read': [], 'female-new': [] });
+  const [fanqieCategoryId, setFanqieCategoryId] = useState('all');
+  const [fanqieCategoriesLoading, setFanqieCategoriesLoading] = useState(false);
+  const [rankingGender, setRankingGender] = useState<'male' | 'female' | 'all'>('all');
+  const [rankingLoading, setRankingLoading] = useState(false);
+  const [rankingQuery, setRankingQuery] = useState('');
+  const [rankingFontCss, setRankingFontCss] = useState('');
+  const [rankingAnalysis, setRankingAnalysis] = useState('');
+  const [rankingAnalysisRunning, setRankingAnalysisRunning] = useState(false);
+
+  const [bookSearchQuery, setBookSearchQuery] = useState('');
+  const [bookSearchLoading, setBookSearchLoading] = useState(false);
+  const [librarySearchResults, setLibrarySearchResults] = useState<LibraryBook[]>([]);
+  const [bookDownloadRunningId, setBookDownloadRunningId] = useState<string | null>(null);
+  const txtImportInputRef = useRef<HTMLInputElement | null>(null);
+  const [activeDismantleBookId, setActiveDismantleBookId] = useState<string | null>(null);
+  const [activeDismantleChapterId, setActiveDismantleChapterId] = useState<string | null>(null);
+  const [selectedDismantleChapterIds, setSelectedDismantleChapterIds] = useState<string[]>([]);
+  const [dismantleRunningIds, setDismantleRunningIds] = useState<string[]>([]);
+  const [dismantleRewriteRunning, setDismantleRewriteRunning] = useState(false);
+  const [dismantleRewriteInstruction, setDismantleRewriteInstruction] = useState('保留章节的冲突强度和推进节奏，重构为独立原创故事。');
+  const [styleDistilling, setStyleDistilling] = useState(false);
+  const [styleDraft, setStyleDraft] = useState<WritingStyle | null>(null);
+  const [imitationSource, setImitationSource] = useState<{ bookId: string; chapterId?: string } | null>(null);
+  const [skills, setSkills] = useState<Skill[]>(() => builtinSkills);
   const [skillCategoryFilter, setSkillCategoryFilter] = useState('');
   const [skillSearch, setSkillSearch] = useState('');
   const [loading, setLoading] = useState(false);
   const [deviceStorageReady, setDeviceStorageReady] = useState(false);
+  const [resourceStorageReady, setResourceStorageReady] = useState(false);
   
   // 模态框状态
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
@@ -722,7 +1177,7 @@ function App() {
   
   // 编辑器状态
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'outline' | 'knowledge-graph' | 'cards' | 'knowledge' | 'skills' | 'publish' | 'ai-detect'>('chapters');
+  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'publish' | 'ai-detect'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
@@ -730,8 +1185,16 @@ function App() {
   const [activeMemoryDocumentId, setActiveMemoryDocumentId] = useState<string>(memoryDocumentId('章节快照'));
   const [activeChapterMemoryId, setActiveChapterMemoryId] = useState<number | null>(null);
   const [activeGraphNodeId, setActiveGraphNodeId] = useState<string | null>(null);
+  const [graphViewMode, setGraphViewMode] = useState<'document' | 'graph'>('document');
+  const [graphDocumentGroup, setGraphDocumentGroup] = useState('');
+  const [graphDocumentQuery, setGraphDocumentQuery] = useState('');
+  const [graphDocumentType, setGraphDocumentType] = useState('全部类型');
+  const [graphOnlyIsolated, setGraphOnlyIsolated] = useState(false);
+  const [expandedGraphDocumentIds, setExpandedGraphDocumentIds] = useState<string[]>([]);
   const [selectedCardIds, setSelectedCardIds] = useState<number[]>([]);
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<number[]>([]);
+  const [selectedAgentSkillNames, setSelectedAgentSkillNames] = useState<string[]>([]);
+  const [showAgentSkillPicker, setShowAgentSkillPicker] = useState(false);
   const [cardTypeFilter, setCardTypeFilter] = useState<CardType | '全部'>('全部');
   const [cardDraft, setCardDraft] = useState<{ type: CardType; title: string; content: string }>({ type: '角色卡', title: '', content: '' });
   const [cardGenerating, setCardGenerating] = useState(false);
@@ -761,7 +1224,26 @@ function App() {
       return { serviceName: '帅apiGPT0.06', enabled: true, apiMode: 'openai' as const, baseURL: defaultBaseURL, apiKey: '', apiKeys: [], model: fallbackModels[0], contextWindow: 128, reasoningMode: 'auto' as const, proxyEnabled: false, proxyURL: 'http://127.0.0.1:7897', proxyBypassLocal: false };
     }
   });
+
+  useEffect(() => {
+    if (activeTab !== 'rankings' || rankingPlatform !== 'fanqie' || Object.values(fanqieCategories).some(items => items.length)) return;
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    setFanqieCategoriesLoading(true);
+    void invoke<{ sections?: Array<{ key: FanqieSection; categories?: RankingCategoryOption[] }> }>('call_agent_rpc', { method: 'ranking.categories', params: { ...agentNetworkParams(agentConfig) } })
+      .then(result => {
+        const next = { 'male-read': [], 'male-new': [], 'female-read': [], 'female-new': [] } as Record<FanqieSection, RankingCategoryOption[]>;
+        (result.sections || []).forEach(section => { if (section.key in next) next[section.key as FanqieSection] = Array.isArray(section.categories) ? section.categories : []; });
+        setFanqieCategories(next);
+        setFanqieCategoryId('all');
+      })
+      .catch(error => setNotice({ title: '番茄榜单分类加载失败', content: String(error) }))
+      .finally(() => setFanqieCategoriesLoading(false));
+  }, [activeTab, rankingPlatform, fanqieCategories, agentConfig]);
+
   const [agentInstruction, setAgentInstruction] = useState('根据当前章节上下文继续创作，保持人物设定和时间线一致，并在结尾留下自然的悬念。');
+  const [outlineAgentInstruction, setOutlineAgentInstruction] = useState('根据作品设定和当前大纲内容补全结构，明确章节目标、冲突推进、人物动机和结尾钩子。');
+  const [cardAgentInstruction, setCardAgentInstruction] = useState('根据作品设定、当前章节和已有卡片，补全这张知识卡的详细信息，保持设定一致。');
+  const [outlineGenerating, setOutlineGenerating] = useState(false);
   const [agentStage, setAgentStage] = useState<AgentStage>('idle');
   const [agentDraft, setAgentDraft] = useState<AgentDraftResult | null>(null);
   const [agentError, setAgentError] = useState('');
@@ -786,7 +1268,7 @@ function App() {
   const [bannedWordsDraft, setBannedWordsDraft] = useState('');
   const [writingMarksEnabled, setWritingMarksEnabled] = useState(true);
   const [chapterTargetWordsDraft, setChapterTargetWordsDraft] = useState('3000');
-  const [aiToolMode, setAIToolMode] = useState<'polish' | 'continue' | null>(null);
+  const [aiToolMode, setAIToolMode] = useState<'polish' | 'de-ai' | 'continue' | null>(null);
   const [aiToolInstruction, setAIToolInstruction] = useState('');
   const [aiToolRunning, setAIToolRunning] = useState(false);
   const [aiToolResult, setAIToolResult] = useState<AIToolResult | null>(null);
@@ -900,12 +1382,34 @@ function App() {
     };
   }, []);
 
+  // 拆书和文风是跨作品复用的本地资源，独立于单本小说目录保存。
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) {
+      setResourceStorageReady(true);
+      return;
+    }
+    Promise.all([
+      invoke<LibraryBook[] | null>('load_library_books'),
+      invoke<RankingBook[] | null>('load_ranking_books'),
+      invoke<DismantleBook[] | null>('load_dismantle_books'),
+      invoke<WritingStyle[] | null>('load_writing_styles'),
+    ]).then(([library, rankings, books, styles]) => {
+      if (Array.isArray(library)) setLibraryBooks(library.map(book => normalizeLibraryBook(book)));
+      if (Array.isArray(rankings)) setRankingBooks(rankings.map((book, index) => normalizeRankingBook(book, index)).filter(trustedRankingCache));
+      if (Array.isArray(books)) setDismantleBooks(books.map(book => normalizeDismantleBook(book)));
+      if (Array.isArray(styles)) setWritingStyles(styles.map(style => normalizeWritingStyle(style)));
+    }).catch(error => {
+      setNotice({ title: '读取本地书籍资源失败', content: String(error) });
+    }).finally(() => setResourceStorageReady(true));
+  }, []);
+
   // 应用启动时预热常驻 Agent Runtime，后续智能体请求复用同一进程。
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
-    void invoke<string>('start_agent_runtime').catch(error => {
-      console.warn('Agent Runtime 预热失败，将在首次请求时重试。', error);
-    });
+    void invoke<string>('start_agent_runtime')
+      .catch(error => {
+        console.warn('Agent Runtime 或小说书源初始化失败，将在首次请求时重试。', error);
+      });
   }, []);
 
   // App 启动时优先读取设备应用数据目录中的 projects.json。
@@ -934,11 +1438,13 @@ function App() {
               cards: Array.isArray(project.cards) ? project.cards : [],
               memories: Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [],
               graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
-              graphEdges: Array.isArray(project.graphEdges) ? project.graphEdges : [],
+              graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
               publishConfig: { ...defaultPublishConfig, ...(project.publishConfig || {}) },
               publishRecords: Array.isArray(project.publishRecords) ? project.publishRecords : [],
               chapterTargetWords: Number(project.chapterTargetWords) > 0 ? Number(project.chapterTargetWords) : 3000,
               aiDetection: project.aiDetection,
+              styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
+              sourceDismantleBookId: typeof project.sourceDismantleBookId === 'string' ? project.sourceDismantleBookId : undefined,
               memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
               wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
               createdAt: project.createdAt ?? project.updatedAt ?? new Date().toISOString(),
@@ -971,6 +1477,58 @@ function App() {
   }, [projects, deviceStorageReady]);
 
   useEffect(() => {
+    if (!resourceStorageReady) return;
+    const timer = window.setTimeout(() => {
+      if ('__TAURI_INTERNALS__' in window) {
+        Promise.all([
+          invoke<string>('save_library_books', { books: libraryBooks }),
+          invoke<string>('save_ranking_books', { books: rankingBooks }),
+          invoke<string>('save_dismantle_books', { books: dismantleBooks }),
+        ]).then(() => {
+          localStorage.removeItem('writer-library-books');
+          localStorage.removeItem('writer-ranking-books');
+          localStorage.removeItem('writer-dismantle-books');
+        }).catch(error => setNotice({ title: '保存本地书籍资源失败', content: String(error) }));
+      } else {
+        localStorage.setItem('writer-library-books', JSON.stringify(libraryBooks));
+        localStorage.setItem('writer-ranking-books', JSON.stringify(rankingBooks));
+        localStorage.setItem('writer-dismantle-books', JSON.stringify(dismantleBooks));
+      }
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [libraryBooks, rankingBooks, dismantleBooks, resourceStorageReady]);
+
+  useEffect(() => {
+    if (!resourceStorageReady) return;
+    const timer = window.setTimeout(() => {
+      if ('__TAURI_INTERNALS__' in window) {
+        void invoke<string>('save_writing_styles', { styles: writingStyles })
+          .then(() => localStorage.removeItem('writer-writing-styles'))
+          .catch(error => setNotice({ title: '保存文风失败', content: String(error) }));
+      } else {
+        localStorage.setItem('writer-writing-styles', JSON.stringify(writingStyles));
+      }
+    }, 350);
+    return () => window.clearTimeout(timer);
+  }, [writingStyles, resourceStorageReady]);
+
+  // 番茄以私有区字符保护部分网页内容。榜单与已下载书籍均保存相应字体，正常中文仍走系统字体。
+  useEffect(() => {
+    const id = 'fanqie-private-font';
+    const existing = document.getElementById(id) as HTMLStyleElement | null;
+    const defaultFont = '@font-face{font-family:ApiSaverWriterFanqie;font-display:swap;src:url(https://lf6-awef.bytetos.com/obj/awesome-font/c/dc027189e0ba4cd.woff2) format("woff2");unicode-range:U+E000-F8FF;}';
+    const fontCss = [defaultFont, rankingFontCss, ...libraryBooks.map(book => book.fontCss || '')].filter(Boolean).join('\n');
+    if (!fontCss.trim()) {
+      existing?.remove();
+      return;
+    }
+    const style = existing || document.createElement('style');
+    style.id = id;
+    style.textContent = fontCss;
+    if (!existing) document.head.appendChild(style);
+  }, [rankingFontCss, libraryBooks]);
+
+  useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!editingProject) return;
       const modifier = event.metaKey || event.ctrlKey;
@@ -990,9 +1548,7 @@ function App() {
   }, [editingProject, activeChapter, chapterSaving]);
 
   useEffect(() => {
-    if (editingProject) {
-      void loadSkills();
-    }
+    void loadSkills();
   }, [activeTab, editingProject?.id]);
 
   useEffect(() => {
@@ -1028,7 +1584,7 @@ function App() {
       }));
       const mergedBuiltins = builtinSkills.map(skill => {
         const override = builtinOverrides.find(item => String(item.id) === String(skill.id));
-        return override ? { ...skill, ...override, builtin: true } : skill;
+        return override ? { ...skill, ...override, displayName: override.displayName || skill.displayName, builtin: true } : skill;
       });
       setSkills([...mergedBuiltins, ...customSkills]);
     } finally {
@@ -1065,6 +1621,12 @@ function App() {
       return;
     }
 
+    const sourceChapter = imitationSource?.chapterId
+      ? dismantleBooks.find(book => book.id === imitationSource.bookId)?.chapters.find(chapter => chapter.id === imitationSource.chapterId)
+      : undefined;
+    const sourceOutline = sourceChapter?.detailedOutline.trim()
+      ? [{ id: Date.now() + 1, kind: '细纲' as OutlineKind, title: `参考章纲｜${sourceChapter.title}`, content: sourceChapter.detailedOutline, createdAt: now, updatedAt: now }]
+      : [];
     const project: Project = {
       id: Date.now(),
       title: newProject.title.trim(),
@@ -1079,7 +1641,7 @@ function App() {
       wordCount: 0,
       chapters: [],
       outline: [],
-      outlines: [],
+      outlines: sourceOutline,
       cards: [],
       memories: [],
       memoryDocuments: [],
@@ -1088,11 +1650,19 @@ function App() {
       publishConfig: { ...defaultPublishConfig },
       publishRecords: [],
       chapterTargetWords: 3000,
+      sourceDismantleBookId: imitationSource?.bookId,
       createdAt: now,
       updatedAt: now,
     };
     
     setProjects(current => [...current, project]);
+    if (imitationSource) {
+      setDismantleBooks(current => current.map(book => book.id === imitationSource.bookId
+        ? { ...book, boundProjectId: project.id, updatedAt: now }
+        : book));
+      setNotice({ title: '仿写项目已创建', content: sourceChapter?.detailedOutline ? '已绑定拆书资料并将当前细纲带入小说大纲。' : '已绑定拆书资料，可在拆书管理中把细纲生成到本书章节。' });
+    }
+    setImitationSource(null);
     resetProjectForm();
     setShowNewProjectModal(false);
   };
@@ -1114,6 +1684,7 @@ function App() {
   };
 
   const openNewProjectModal = () => {
+    setImitationSource(null);
     resetProjectForm();
     setShowNewProjectModal(true);
   };
@@ -1248,6 +1819,521 @@ function App() {
     reader.readAsDataURL(file);
   };
 
+  const updateDismantleBook = (bookId: string, updater: (book: DismantleBook) => DismantleBook) => {
+    setDismantleBooks(current => current.map(book => book.id === bookId ? updater(book) : book));
+  };
+
+  const createDismantleFromLibrary = (book: LibraryBook) => {
+    const chapters = book.chapters.filter(chapter => chapter.content.trim()).map((chapter, index) => normalizeDismantleChapter({
+      id: localResourceId('dismantle-chapter'), number: chapter.number || index + 1, title: chapter.title,
+      sourceContent: chapter.content, status: 'pending', updatedAt: new Date().toISOString(),
+    }, index));
+    if (!chapters.length) {
+      setNotice({ title: '还没有可拆正文', content: '请先在书籍管理下载至少一章正文。' });
+      return;
+    }
+    const existing = dismantleBooks.find(item => item.sourceLibraryBookId === book.id);
+    if (existing) {
+      setActiveDismantleBookId(existing.id);
+      setActiveDismantleChapterId(existing.chapters[0]?.id || null);
+      setActiveTab('dismantles');
+      setNotice({ title: '已打开拆书资料', content: `《${book.title}》已经在拆书管理中。` });
+      return;
+    }
+    const now = new Date().toISOString();
+    const dismantle: DismantleBook = {
+      id: localResourceId('dismantle'), title: book.title, sourceFileName: `${book.title}.txt`,
+      sourceLibraryBookId: book.id, chapters, createdAt: now, updatedAt: now,
+    };
+    setDismantleBooks(current => [...current, dismantle]);
+    setActiveDismantleBookId(dismantle.id);
+    setActiveDismantleChapterId(chapters[0]?.id || null);
+    setSelectedDismantleChapterIds(chapters.slice(0, 1).map(chapter => chapter.id));
+    setActiveTab('dismantles');
+    setNotice({ title: '已加入拆书管理', content: `《${book.title}》共 ${chapters.length} 章可分析。` });
+  };
+
+  const runBookSearch = async () => {
+    if (!bookSearchQuery.trim()) return;
+    setBookSearchLoading(true);
+    try {
+      const result = await invoke<{ books?: Partial<LibraryBook>[]; fontCss?: string; searchedSourceCount?: number; responsiveSourceCount?: number }>('call_agent_rpc', {
+        method: 'book.search.all',
+        params: { query: bookSearchQuery.trim(), ...agentNetworkParams(agentConfig) },
+      });
+      setLibrarySearchResults((result.books || []).map(book => normalizeLibraryBook({ ...book, fontCss: result.fontCss || book.fontCss })));
+      setNotice({ title: '书籍搜索完成', content: `已搜索 ${result.searchedSourceCount || 0} 个书源，其中 ${result.responsiveSourceCount || 0} 个响应，找到 ${(result.books || []).length} 本书。选择结果卡片即可从对应书源下载。` });
+    } catch (error) {
+      setNotice({ title: '书籍搜索失败', content: String(error) });
+    } finally {
+      setBookSearchLoading(false);
+    }
+  };
+
+  const fetchRankingBooks = async () => {
+    setRankingLoading(true);
+    try {
+      const fanqieSectionConfig = fanqieSectionOptions.find(option => option.value === fanqieSection) || fanqieSectionOptions[0];
+      const effectiveRankingGender = rankingPlatform === 'fanqie' ? fanqieSectionConfig.gender : 'all';
+      const effectiveRankingType = rankingPlatform === 'fanqie' ? fanqieSectionConfig.list : rankingType;
+      const selectedCategory = rankingPlatform === 'fanqie' ? fanqieCategories[fanqieSection].find(category => category.id === fanqieCategoryId) : undefined;
+      const result = await invoke<{ books?: Partial<RankingBook>[]; fontCss?: string; sourceName?: string }>('call_agent_rpc', {
+        method: 'ranking.fetch',
+        params: { platform: rankingPlatform, rankType: effectiveRankingType, gender: effectiveRankingGender, rankUrl: selectedCategory?.url || undefined, ...agentNetworkParams(agentConfig) },
+      });
+      const sourceName = result.sourceName || { fanqie: '番茄小说网', qidian: '起点中文网官网', faloo: '飞卢小说网官网' }[rankingPlatform];
+      const fetched = (result.books || []).map((book, index) => normalizeRankingBook({ ...book, platform: rankingPlatform, rankType: effectiveRankingType, gender: effectiveRankingGender, sourceName }, index));
+      setRankingBooks(fetched);
+      setRankingFontCss(result.fontCss || '');
+      setActiveRankingBookId(fetched[0]?.id || null);
+      const platformName = { fanqie: '番茄小说网', qidian: '起点', faloo: '飞卢中文网' }[rankingPlatform];
+      const sectionLabel = rankingPlatform === 'fanqie' ? fanqieSectionConfig.label : rankingTypeLabel(rankingPlatform, rankingType);
+      setNotice({ title: '榜单已更新', content: `${sourceName}返回${platformName}${sectionLabel}${selectedCategory ? `·${selectedCategory.label}` : ''} ${fetched.length} 本书。` });
+    } catch (error) {
+      setNotice({ title: '扫榜失败', content: String(error) });
+    } finally {
+      setRankingLoading(false);
+    }
+  };
+
+  const runRankingAnalysis = async () => {
+    if (!rankingBooks.length) {
+      setNotice({ title: '请先获取榜单', content: '刷新榜单后才能生成市场趋势盘点。' });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再运行扫榜分析。' });
+      return;
+    }
+    setRankingAnalysisRunning(true);
+    try {
+      const result = await invoke<{ report?: string }>('call_agent_rpc', {
+        method: 'ranking.analyze',
+        params: {
+          books: rankingBooks.slice(0, 60), platform: rankingPlatform, rankType: rankingType, gender: rankingPlatform === 'fanqie' ? (fanqieSection.startsWith('female') ? 'female' : 'male') : 'all',
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+        },
+      });
+      setRankingAnalysis(result.report?.trim() || '未生成可用的扫榜报告。');
+    } catch (error) {
+      setNotice({ title: '扫榜分析失败', content: String(error) });
+    } finally {
+      setRankingAnalysisRunning(false);
+    }
+  };
+
+  const downloadLibraryBook = async (book: LibraryBook | RankingBook): Promise<LibraryBook | null> => {
+    const id = String(book.id);
+    setBookDownloadRunningId(id);
+    try {
+      let downloadable: LibraryBook | RankingBook = book;
+      if ('platform' in book && book.platform !== 'fanqie') {
+        const search = await invoke<{ books?: Partial<LibraryBook>[] }>('call_agent_rpc', {
+          method: 'book.search',
+          params: { query: book.title, source: 'qianyue-kuwo', ...agentNetworkParams(agentConfig) },
+        });
+        const candidates = (search.books || []).map(candidate => normalizeLibraryBook(candidate));
+        const matched = candidates.find(candidate => candidate.title.trim() === book.title.trim()) || candidates[0];
+        if (!matched) throw new Error(`小说书源中没有找到《${book.title}》，可在书籍管理中切换书源搜索。`);
+        downloadable = matched;
+      }
+      const result = await invoke<{ chapters?: Partial<LibraryBookChapter>[]; intro?: string; cover?: string; downloadedChapterCount?: number; completedChapterCount?: number }>('call_agent_rpc', {
+        method: 'book.download',
+        params: {
+          title: downloadable.title, author: downloadable.author, source: downloadable.sourceId || 'fanqie', sourceBookId: downloadable.sourceBookId || downloadable.id, url: downloadable.url,
+          maxChapters: 200, ...agentNetworkParams(agentConfig),
+        },
+      });
+      const downloadedChapterCount = Number(result.completedChapterCount) || (result.chapters || []).filter(chapter => chapter.downloaded === true && typeof chapter.content === 'string' && chapter.content.trim()).length;
+      if (!downloadedChapterCount) throw new Error('没有获取到完整正文，未保存空章节。可稍后重试，或导入本地 TXT。');
+      const now = new Date().toISOString();
+      const normalized = normalizeLibraryBook({ ...downloadable, id: libraryBooks.find(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: result.chapters || [], intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
+      setLibraryBooks(current => {
+        const existing = current.findIndex(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id) || item.id === normalized.id);
+        if (existing >= 0) return current.map((item, index) => index === existing ? { ...item, ...normalized, id: item.id } : item);
+        return [...current, normalized];
+      });
+      setActiveLibraryBookId(normalized.id);
+      setActiveLibraryChapterId(normalized.chapters[0]?.id || null);
+      setActiveTab('books');
+      setNotice({ title: '小说下载完成', content: `《${normalized.title}》已保存 ${downloadedChapterCount}/${normalized.chapters.length} 章完整正文到书籍管理。` });
+      return normalized;
+    } catch (error) {
+      setNotice({ title: '小说下载失败', content: String(error) });
+      return null;
+    } finally {
+      setBookDownloadRunningId(null);
+    }
+  };
+
+  const requestLibraryChapterDownload = async (book: LibraryBook, chapter: LibraryBookChapter): Promise<LibraryBookChapter> => {
+    const sourceId = book.sourceId || (/番茄/u.test(book.source) ? 'fanqie' : '');
+    if (!sourceId) throw new Error('这本书没有保存书源信息，请重新搜索并下载该书。');
+    const result = await invoke<{ chapter?: Partial<LibraryBookChapter> }>('call_agent_rpc', {
+      method: 'book.chapter.download',
+      params: {
+        source: sourceId,
+        sourceBookId: book.sourceBookId || '',
+        bookUrl: book.url,
+        bookTitle: book.title,
+        chapter,
+        ...agentNetworkParams(agentConfig),
+      },
+    });
+    if (!result.chapter) throw new Error('书源没有返回本章结果。');
+    return normalizeLibraryBookChapter({ ...result.chapter, id: chapter.id, number: chapter.number, title: chapter.title, url: chapter.url }, chapter.number - 1);
+  };
+
+  const retryLibraryChapter = async (book: LibraryBook, chapter: LibraryBookChapter) => {
+    setLibraryChapterDownloadRunningId(chapter.id);
+    try {
+      const refreshed = await requestLibraryChapterDownload(book, chapter);
+      if (refreshed.downloaded) {
+        setLibraryBooks(current => current.map(item => item.id === book.id ? {
+          ...item,
+          chapters: item.chapters.map(existing => existing.id === chapter.id ? refreshed : existing),
+          updatedAt: new Date().toISOString(),
+        } : item));
+      }
+      setActiveLibraryChapterId(chapter.id);
+      setNotice(refreshed.downloaded
+        ? { title: '本章下载完成', content: `《${book.title}》${refreshed.title}已保存 ${refreshed.wordCount.toLocaleString()} 字。` }
+        : { title: '本章仍未完整下载', content: refreshed.unavailableReason || '书源仅返回片段，可稍后再次重试。' });
+    } catch (error) {
+      setNotice({ title: '本章下载失败', content: String(error) });
+    } finally {
+      setLibraryChapterDownloadRunningId(null);
+    }
+  };
+
+  const retryUnfinishedLibraryChapters = async (book: LibraryBook) => {
+    const pending = book.chapters.filter(chapter => !chapter.downloaded);
+    if (!pending.length) {
+      setNotice({ title: '没有未下载章节', content: '这本书的章节都已经下载完成。' });
+      return;
+    }
+    const runningId = `book:${book.id}`;
+    setLibraryChapterDownloadRunningId(runningId);
+    const updates = new Map<string, LibraryBookChapter>();
+    let completed = 0;
+    try {
+      for (const chapter of pending) {
+        try {
+          const refreshed = await requestLibraryChapterDownload(book, chapter);
+          if (refreshed.downloaded) {
+            updates.set(chapter.id, refreshed);
+            completed += 1;
+          }
+        } catch {
+          // Keep the existing preview and continue with the remaining chapters.
+        }
+      }
+      if (updates.size) {
+        setLibraryBooks(current => current.map(item => item.id === book.id ? {
+          ...item,
+          chapters: item.chapters.map(chapter => updates.get(chapter.id) || chapter),
+          updatedAt: new Date().toISOString(),
+        } : item));
+      }
+      setNotice({ title: '未下载章节处理完成', content: `《${book.title}》本次完成 ${completed}/${pending.length} 章；已下载章节保持不变。` });
+    } finally {
+      setLibraryChapterDownloadRunningId(null);
+    }
+  };
+
+  const importLibraryTxt = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    try {
+      const text = await readLocalTxtFile(file);
+      const sourceChapters = splitTxtIntoDismantleChapters(text);
+      if (!sourceChapters.length) throw new Error('TXT 文件没有可导入的正文。');
+      const now = new Date().toISOString();
+      const sourceBookId = `local-txt:${file.name}:${file.size}:${file.lastModified}`;
+      const existing = libraryBooks.find(book => book.sourceBookId === sourceBookId);
+      const title = file.name.replace(/\.txt$/iu, '').trim() || '未命名本地书籍';
+      const normalized = normalizeLibraryBook({
+        id: existing?.id || localResourceId('book'), title, author: '本地导入', source: '本地 TXT', sourceId: 'local-txt', sourceBookId, url: '', intro: '',
+        chapters: sourceChapters.map((chapter, index) => ({ id: `local-txt:${sourceBookId}:${index + 1}`, number: index + 1, title: chapter.title, url: '', content: chapter.sourceContent, wordCount: countNovelCharacters(chapter.sourceContent), downloaded: true })),
+        downloadedAt: now, createdAt: existing?.createdAt || now, updatedAt: now,
+      });
+      setLibraryBooks(current => {
+        const index = current.findIndex(book => book.sourceBookId === sourceBookId || book.id === normalized.id);
+        return index >= 0 ? current.map((book, currentIndex) => currentIndex === index ? { ...normalized, id: book.id } : book) : [...current, normalized];
+      });
+      setActiveLibraryBookId(normalized.id);
+      setActiveLibraryChapterId(normalized.chapters[0]?.id || null);
+      setNotice({ title: 'TXT 导入完成', content: `《${normalized.title}》已导入 ${normalized.chapters.length} 章，共 ${normalized.chapters.reduce((total, chapter) => total + chapter.wordCount, 0).toLocaleString()} 字。` });
+    } catch (error) {
+      setNotice({ title: 'TXT 导入失败', content: String(error) });
+    }
+  };
+
+  const deleteLibraryBook = async (book: LibraryBook) => {
+    setLibraryBooks(current => current.filter(item => item.id !== book.id));
+    setLibrarySearchResults(current => current.filter(item => item.id !== book.id));
+    setActiveLibraryBookId(current => current === book.id ? null : current);
+    setActiveLibraryChapterId(null);
+    try {
+      if ('__TAURI_INTERNALS__' in window) await invoke<string>('delete_library_book', { bookId: book.id, bookTitle: book.title });
+      setNotice({ title: '书籍已删除', content: `《${book.title}》的本地书籍文件已清理。` });
+    } catch (error) {
+      setLibraryBooks(current => current.some(item => item.id === book.id) ? current : [...current, book]);
+      setNotice({ title: '删除书籍失败', content: String(error) });
+    }
+  };
+
+  const deleteDismantleBook = async (book: DismantleBook) => {
+    setDismantleBooks(current => current.filter(item => item.id !== book.id));
+    setActiveDismantleBookId(current => current === book.id ? null : current);
+    setActiveDismantleChapterId(null);
+    setSelectedDismantleChapterIds([]);
+    try {
+      if ('__TAURI_INTERNALS__' in window) await invoke<string>('delete_dismantle_book', { bookId: book.id, bookTitle: book.title });
+      setNotice({ title: '拆书资料已删除', content: `《${book.title}》的原文、章纲和改写稿已清理。` });
+    } catch (error) {
+      setDismantleBooks(current => current.some(item => item.id === book.id) ? current : [...current, book]);
+      setNotice({ title: '删除拆书资料失败', content: String(error) });
+    }
+  };
+
+  const generateLibraryChapterOutline = async (book: LibraryBook, chapter: LibraryBookChapter) => {
+    if (!chapter.content.trim()) {
+      setNotice({ title: '章节暂无正文', content: '该章节尚未下载正文，无法生成章纲。' });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再生成章节章纲。' });
+      return;
+    }
+    setLibraryOutlineRunningId(chapter.id);
+    try {
+      const result = await invoke<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('call_agent_rpc', {
+        method: 'book.dismantle',
+        params: {
+          bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.content,
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+        },
+      });
+      const outline = [
+        result.summary?.trim() ? `## 剧情摘要\n${result.summary.trim()}` : '',
+        result.detailedOutline?.trim() ? `## 章节细纲\n${result.detailedOutline.trim()}` : '',
+        result.plotBeats?.length ? `## 情节节点\n${asTextList(result.plotBeats, 10).map(item => `- ${item}`).join('\n')}` : '',
+        result.characterDynamics?.length ? `## 人物关系\n${asTextList(result.characterDynamics, 10).map(item => `- ${item}`).join('\n')}` : '',
+        result.setupPayoff?.length ? `## 伏笔与回收\n${asTextList(result.setupPayoff, 10).map(item => `- ${item}`).join('\n')}` : '',
+        result.pacing?.trim() ? `## 节奏判断\n${result.pacing.trim()}` : '',
+      ].filter(Boolean).join('\n\n');
+      if (!outline) throw new Error('智能体没有返回可用章纲');
+      setLibraryBooks(current => current.map(item => item.id === book.id ? {
+        ...item,
+        chapters: item.chapters.map(value => value.id === chapter.id ? { ...value, outline } : value),
+        updatedAt: new Date().toISOString(),
+      } : item));
+      setNotice({ title: '章节章纲已生成', content: `《${book.title}》${chapter.title} 的章纲已保存到本地。` });
+    } catch (error) {
+      setNotice({ title: '生成章节章纲失败', content: String(error) });
+    } finally {
+      setLibraryOutlineRunningId(null);
+    }
+  };
+
+  const runDismantleAnalysis = async () => {
+    const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
+    if (!book) return;
+    const targets = book.chapters.filter(chapter => selectedDismantleChapterIds.includes(chapter.id) && chapter.sourceContent.trim());
+    if (!targets.length) {
+      setNotice({ title: '请选择章节', content: '勾选至少一章正文后再生成章纲。' });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再运行拆书分析。' });
+      return;
+    }
+    setDismantleRunningIds(targets.map(chapter => chapter.id));
+    let completed = 0;
+    try {
+      for (const chapter of targets) {
+        updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, status: 'analyzing' } : item), updatedAt: new Date().toISOString() }));
+        const result = await invoke<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('call_agent_rpc', {
+          method: 'book.dismantle',
+          params: {
+            bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.sourceContent,
+            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+            model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+            contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+          },
+        });
+        updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? {
+          ...item, summary: result.summary?.trim() || item.summary, detailedOutline: result.detailedOutline?.trim() || item.detailedOutline,
+          plotBeats: asTextList(result.plotBeats, 10), characterDynamics: asTextList(result.characterDynamics, 10), setupPayoff: asTextList(result.setupPayoff, 10),
+          pacing: result.pacing?.trim() || item.pacing, status: result.detailedOutline?.trim() ? 'analyzed' : item.status, updatedAt: new Date().toISOString(),
+        } : item), updatedAt: new Date().toISOString() }));
+        completed += 1;
+      }
+      setNotice({ title: '拆书章纲已生成', content: `已完成 ${completed} 章，章纲和分析结果会自动保存。` });
+    } catch (error) {
+      setNotice({ title: '拆书分析失败', content: String(error) });
+    } finally {
+      setDismantleRunningIds([]);
+    }
+  };
+
+  const runDismantleRewrite = async () => {
+    const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
+    const chapter = book?.chapters.find(item => item.id === activeDismantleChapterId);
+    if (!book || !chapter?.detailedOutline.trim()) {
+      setNotice({ title: '请先生成章纲', content: '确认当前章节的细纲后，再生成原创改写稿。' });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再生成原创改写稿。' });
+      return;
+    }
+    setDismantleRewriteRunning(true);
+    try {
+      const result = await invoke<{ content?: string }>('call_agent_rpc', {
+        method: 'book.rewrite',
+        params: {
+          bookTitle: book.title, chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline,
+          instruction: dismantleRewriteInstruction, targetWords: 2200,
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+        },
+      });
+      if (!result.content?.trim()) throw new Error('智能体没有返回原创改写稿');
+      updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, rewriteContent: result.content?.trim() || '', status: 'rewritten', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }));
+      setNotice({ title: '原创改写稿已生成', content: '请在右侧编辑并确认，确认后可生成到绑定小说。' });
+    } catch (error) {
+      setNotice({ title: '原创改写失败', content: String(error) });
+    } finally {
+      setDismantleRewriteRunning(false);
+    }
+  };
+
+  const distillDismantleStyle = async () => {
+    const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
+    if (!book) return;
+    const chapters = book.chapters.filter(chapter => selectedDismantleChapterIds.includes(chapter.id) && chapter.sourceContent.trim()).slice(0, 8);
+    if (!chapters.length) {
+      setNotice({ title: '请选择样本章节', content: '至少选择一章有正文的章节用于文风蒸馏。' });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再蒸馏文风。' });
+      return;
+    }
+    setStyleDistilling(true);
+    try {
+      const result = await invoke<{ name?: string; description?: string; tags?: string[]; content?: string }>('call_agent_rpc', {
+        method: 'book.style.distill',
+        params: {
+          bookTitle: book.title, styleName: `${book.title}文风`, samples: chapters.map(chapter => ({ title: chapter.title, content: chapter.sourceContent })),
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+        },
+      });
+      if (!result.content?.trim()) throw new Error('智能体没有返回文风 Skill');
+      const now = new Date().toISOString();
+      const style = normalizeWritingStyle({ id: localResourceId('style'), name: result.name || `${book.title}文风`, description: result.description || '', tags: result.tags || [], content: result.content, sourceBookId: book.id, createdAt: now, updatedAt: now });
+      setWritingStyles(current => [...current, style]);
+      setStyleDraft(style);
+      setNotice({ title: '文风蒸馏完成', content: `${style.name} 已保存到全局文风管理，可在任意小说中绑定。` });
+    } catch (error) {
+      setNotice({ title: '文风蒸馏失败', content: String(error) });
+    } finally {
+      setStyleDistilling(false);
+    }
+  };
+
+  const startDismantleImitation = (book: DismantleBook, chapter?: DismantleChapter) => {
+    setImitationSource({ bookId: book.id, chapterId: chapter?.id });
+    setProjectFormMode('create');
+    setProjectEditingId(null);
+    setNewProject({ title: '', channel: '男频', selectedTags: defaultProjectTags('男频'), cover: '', protagonist1: '', protagonist2: '', synopsis: '' });
+    setShowNewProjectModal(true);
+    setActiveTab('projects');
+    setNotice({ title: '已带入仿写创建', content: '请补充目标小说的书名、简介和分类后创建。只会带入抽象细纲，不会复制原文。' });
+  };
+
+  const bindDismantleToProject = (bookId: string, projectId?: number) => {
+    updateDismantleBook(bookId, book => ({ ...book, boundProjectId: projectId, updatedAt: new Date().toISOString() }));
+    setProjects(current => current.map(project => project.id === projectId ? { ...project, sourceDismantleBookId: bookId, updatedAt: new Date().toISOString() } : project));
+  };
+
+  const generateDismantleChapter = async () => {
+    const book = dismantleBooks.find(item => item.id === activeDismantleBookId);
+    const chapter = book?.chapters.find(item => item.id === activeDismantleChapterId);
+    const target = book?.boundProjectId ? projects.find(project => project.id === book.boundProjectId) : undefined;
+    if (!book || !chapter || !target) {
+      setNotice({ title: '请先绑定小说', content: '在拆书详情顶部选择目标小说后，才能把原创内容生成到章节。' });
+      return;
+    }
+    if (!chapter.rewriteContent.trim() && !chapter.detailedOutline.trim()) {
+      setNotice({ title: '请先准备章节素材', content: '先生成章纲，或完成原创改写稿后再生成章节。' });
+      return;
+    }
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥。' });
+      return;
+    }
+    try {
+      const style = target.styleProfileId ? writingStyles.find(item => item.id === target.styleProfileId) : undefined;
+      const result = await invoke<{ title?: string; content?: string }>('call_agent_rpc', {
+        method: 'book.adapt',
+        params: {
+          projectTitle: target.title, projectSynopsis: target.synopsis, projectOutlines: target.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n'),
+          chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline, rewriteContent: chapter.rewriteContent, styleProfile: style?.content,
+          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
+        },
+      });
+      if (!result.content?.trim()) throw new Error('智能体没有返回章节正文');
+      const now = new Date().toISOString();
+      const newChapter: Chapter = { id: Date.now(), title: result.title?.trim() || `第${target.chapters.length + 1}章`, content: result.content.trim(), wordCount: countNovelCharacters(result.content), createdAt: now, updatedAt: now };
+      const updated = { ...target, chapters: [...target.chapters, newChapter], wordCount: target.wordCount + newChapter.wordCount, updatedAt: now };
+      setProjects(current => current.map(project => project.id === updated.id ? updated : project));
+      setNotice({ title: '原创章节已生成', content: `已写入《${target.title}》的第 ${updated.chapters.length} 章，可进入小说继续编辑。` });
+    } catch (error) {
+      setNotice({ title: '生成目标章节失败', content: String(error) });
+    }
+  };
+
+  const openNewWritingStyle = () => {
+    const now = new Date().toISOString();
+    setStyleDraft(normalizeWritingStyle({ id: localResourceId('style'), name: '', description: '', tags: [], content: '# 文风 Skill\n\n## 写作指令\n\n', createdAt: now, updatedAt: now }));
+  };
+
+  const saveWritingStyleDraft = () => {
+    if (!styleDraft?.name.trim() || !styleDraft.content.trim()) {
+      setNotice({ title: '文风信息不完整', content: '请填写文风名称和 Skill 内容。' });
+      return;
+    }
+    const updated = { ...styleDraft, name: styleDraft.name.trim(), updatedAt: new Date().toISOString() };
+    setWritingStyles(current => current.some(style => style.id === updated.id) ? current.map(style => style.id === updated.id ? updated : style) : [...current, updated]);
+    setStyleDraft(updated);
+    setNotice({ title: '文风已保存', content: `${updated.name} 已更新，可在小说中绑定使用。` });
+  };
+
+  const deleteWritingStyle = (styleId: string) => {
+    setWritingStyles(current => current.filter(style => style.id !== styleId));
+    if (styleDraft?.id === styleId) setStyleDraft(null);
+    setProjects(current => current.map(project => project.styleProfileId === styleId ? { ...project, styleProfileId: undefined, updatedAt: new Date().toISOString() } : project));
+  };
+
+  const bindStyleToCurrentProject = (styleId: string) => {
+    if (!editingProject) return;
+    updateEditorProject(project => ({ ...project, styleProfileId: styleId || undefined, updatedAt: new Date().toISOString() }));
+    setNotice({ title: '文风绑定已更新', content: styleId ? '章节智能体会在相关创作中加入该文风 Skill。' : '已取消绑定文风。' });
+  };
+
   const handleProjectTagToggle = (tag: string) => {
     const selected = tagDraft[activeTagTab];
     const next = activeTagTab === '主分类'
@@ -1317,6 +2403,24 @@ function App() {
     }
   };
 
+  const handleOpenGraphNodeLocation = async (node: KnowledgeGraphNode) => {
+    if (!editingProject) return;
+    try {
+      await invoke<string>('save_projects', { projects });
+      await invoke<string>('open_graph_node_location', { projectId: editingProject.id, nodeId: node.id });
+    } catch (error) {
+      setNotice({ title: '打开图谱档案位置失败', content: String(error) });
+    }
+  };
+
+  const updateGraphNodeProfile = (nodeId: string, content: string) => {
+    updateEditorProject(project => ({
+      ...project,
+      graphNodes: project.graphNodes.map(node => node.id === nodeId ? { ...node, content, updatedAt: new Date().toISOString() } : node),
+      updatedAt: new Date().toISOString(),
+    }));
+  };
+
   const persistSkillRecords = (nextSkills: Skill[]) => {
     const records = nextSkills.filter(skill => !skill.builtin || builtinSkills.some(item => String(item.id) === String(skill.id)))
       .map(skill => ({ ...skill, ...(skill.builtin ? { builtin: true } : { builtin: false }) }));
@@ -1332,7 +2436,7 @@ function App() {
   const openSkillEditor = (skill: Skill) => {
     setSkillEditingId(skill.id);
     setNewSkill({
-      name: skill.name,
+      name: skill.displayName || skill.name,
       category: skill.category,
       description: skill.description,
       content: skill.content,
@@ -1349,7 +2453,8 @@ function App() {
     const editingSkill = skillEditingId === null ? null : skills.find(item => String(item.id) === String(skillEditingId));
     const skill: Skill = {
       id: editingSkill?.id ?? Date.now(),
-      name: newSkill.name.trim(),
+      name: editingSkill?.builtin ? editingSkill.name : newSkill.name.trim(),
+      displayName: editingSkill?.builtin ? newSkill.name.trim() : undefined,
       category: newSkill.category,
       description: newSkill.description.trim(),
       tags: newSkill.tags.split(',').map(t => t.trim()).filter(Boolean),
@@ -1372,7 +2477,7 @@ function App() {
     });
     setSkillEditingId(null);
     setShowNewSkillModal(false);
-    setNotice({ title: editingSkill ? '技能已更新' : '技能已创建', content: `${skill.name} 已保存到本机技能库。` });
+    setNotice({ title: editingSkill ? '技能已更新' : '技能已创建', content: `${skill.displayName || skill.name} 已保存到本机技能库。` });
   };
 
   const generateSkillWithAI = async () => {
@@ -1436,7 +2541,7 @@ function App() {
     const nextSkills = skills.filter(item => String(item.id) !== String(skill.id));
     persistSkillRecords(nextSkills);
     setSkills(nextSkills);
-    setNotice({ title: '技能已删除', content: `${skill.name} 已从本机技能库移除。` });
+    setNotice({ title: '技能已删除', content: `${skill.displayName || skill.name} 已从本机技能库移除。` });
   };
 
   const handleEditProject = (projectId: number) => {
@@ -1469,7 +2574,7 @@ function App() {
           memories: Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [],
           memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
           graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
-          graphEdges: Array.isArray(project.graphEdges) ? project.graphEdges : [],
+          graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
         };
         setProjects(prev => prev.map(p => p.id === projectId ? updatedProject : p));
         setEditingProject(updatedProject);
@@ -1488,7 +2593,7 @@ function App() {
           memories: Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [],
           memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
           graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
-          graphEdges: Array.isArray(project.graphEdges) ? project.graphEdges : [],
+          graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
         };
         setEditingProject(normalizedProject);
         setActiveChapter(chapters[0]);
@@ -1633,7 +2738,7 @@ function App() {
     }
   };
 
-  const runAITool = async (mode: 'polish' | 'continue') => {
+  const runAITool = async (mode: 'polish' | 'de-ai' | 'continue') => {
     if (!editingProject || !activeChapter || aiToolRunning) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
       setNotice({ title: '需要 API Key', content: '请先在设置中配置可用模型。' });
@@ -1675,20 +2780,25 @@ function App() {
         });
         const content = result.content?.trim() || '';
         if (!content) throw new Error('模型没有返回续写内容');
-        setAIToolResult({ mode, content, maxWords });
+        setAIToolResult({ mode, content, projectId: editingProject.id, chapterId: activeChapter.id, scope: 'chapter', maxWords });
       } catch (error) { setNotice({ title: 'AI 续写失败', content: String(error) }); }
       finally { setAIToolRunning(false); }
       return;
     }
     const element = chapterEditorRef.current;
-    const start = selectionSnapshot?.start ?? element?.selectionStart ?? 0;
-    const end = selectionSnapshot?.end ?? element?.selectionEnd ?? 0;
+    const liveStart = element?.selectionStart ?? 0;
+    const liveEnd = element?.selectionEnd ?? 0;
+    const savedSelectionValid = selectionSnapshot
+      && selectionSnapshot.end > selectionSnapshot.start
+      && activeChapter.content.slice(selectionSnapshot.start, selectionSnapshot.end) === selectionSnapshot.source;
+    const start = liveEnd > liveStart ? liveStart : savedSelectionValid ? selectionSnapshot.start : 0;
+    const end = liveEnd > liveStart ? liveEnd : savedSelectionValid ? selectionSnapshot.end : 0;
     const source = end > start ? activeChapter.content.slice(start, end) : activeChapter.content;
     if (!source.trim()) {
       setNotice({ title: '没有可润色内容', content: '请在章节中输入内容或选中一段文字。' });
       return;
     }
-    setAIToolMode('polish');
+    setAIToolMode(mode);
     setAIToolRunning(true);
     setAIToolResult(null);
     try {
@@ -1704,26 +2814,86 @@ function App() {
         },
       });
       const content = result.content?.trim() || '';
-      if (!content) throw new Error('模型没有返回润色内容');
-      setAIToolResult({ mode, content, source, start, end });
-    } catch (error) { setNotice({ title: 'AI 润色失败', content: String(error) }); }
+      if (!content) throw new Error(`模型没有返回${mode === 'de-ai' ? '去 AI 味' : '润色'}内容`);
+      setAIToolResult({
+        mode,
+        content,
+        projectId: editingProject.id,
+        chapterId: activeChapter.id,
+        scope: end > start ? 'selection' : 'chapter',
+        source,
+        start,
+        end,
+      });
+    } catch (error) { setNotice({ title: mode === 'de-ai' ? '去 AI 味失败' : 'AI 润色失败', content: String(error) }); }
     finally { setAIToolRunning(false); }
   };
 
-  const acceptAIToolResult = () => {
-    if (!aiToolResult || !activeChapter) return;
-    if (aiToolResult.mode === 'continue') {
-      const separator = activeChapter.content.trim() ? '\n\n' : '';
-      handleUpdateChapterContent(`${activeChapter.content}${separator}${aiToolResult.content}`);
-    } else if (aiToolResult.start !== undefined && aiToolResult.end !== undefined && activeChapter.content.slice(aiToolResult.start, aiToolResult.end) === aiToolResult.source) {
-      handleUpdateChapterContent(`${activeChapter.content.slice(0, aiToolResult.start)}${aiToolResult.content}${activeChapter.content.slice(aiToolResult.end)}`);
-    } else {
-      handleUpdateChapterContent(aiToolResult.content);
+  const acceptAIToolResult = async () => {
+    if (!aiToolResult) return;
+    const targetProject = projects.find(project => project.id === aiToolResult.projectId)
+      || (editingProject?.id === aiToolResult.projectId ? editingProject : null);
+    const targetChapter = targetProject?.chapters.find(chapter => chapter.id === aiToolResult.chapterId);
+    if (!targetProject || !targetChapter) {
+      setNotice({ title: '无法写入结果', content: '原章节已不存在，未覆盖任何内容。' });
+      return;
     }
+
+    let nextContent = targetChapter.content;
+    if (aiToolResult.mode === 'continue') {
+      nextContent = `${targetChapter.content}${targetChapter.content.trim() ? '\n\n' : ''}${aiToolResult.content}`;
+    } else if (aiToolResult.scope === 'chapter') {
+      nextContent = aiToolResult.content;
+    } else {
+      const source = aiToolResult.source || '';
+      const matchesOriginalRange = aiToolResult.start !== undefined
+        && aiToolResult.end !== undefined
+        && targetChapter.content.slice(aiToolResult.start, aiToolResult.end) === source;
+      if (matchesOriginalRange) {
+        nextContent = `${targetChapter.content.slice(0, aiToolResult.start)}${aiToolResult.content}${targetChapter.content.slice(aiToolResult.end)}`;
+      } else {
+        const currentIndex = source ? targetChapter.content.indexOf(source) : -1;
+        if (currentIndex < 0) {
+          setNotice({ title: '原段落已变更', content: '为避免覆盖你在生成期间的编辑，未替换正文。请重新选择该段后再处理。' });
+          return;
+        }
+        nextContent = `${targetChapter.content.slice(0, currentIndex)}${aiToolResult.content}${targetChapter.content.slice(currentIndex + source.length)}`;
+      }
+    }
+
+    const now = new Date().toISOString();
+    const updatedChapter: Chapter = { ...targetChapter, content: nextContent, wordCount: countNovelCharacters(nextContent), updatedAt: now };
+    const updatedChapters = targetProject.chapters.map(chapter => chapter.id === updatedChapter.id ? updatedChapter : chapter);
+    const updatedProject: Project = {
+      ...targetProject,
+      chapters: updatedChapters,
+      wordCount: updatedChapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
+      updatedAt: now,
+    };
+    const nextProjects = projects.some(project => project.id === updatedProject.id)
+      ? projects.map(project => project.id === updatedProject.id ? updatedProject : project)
+      : [...projects, updatedProject];
+
+    setProjects(nextProjects);
+    if (editingProject?.id === updatedProject.id) setEditingProject(updatedProject);
+    if (activeChapter?.id === updatedChapter.id) setActiveChapter(updatedChapter);
+    setAutoSaveStatus('saving');
     setAIToolResult(null);
     setAIToolMode(null);
     setAIToolInstruction('');
-    setNotice({ title: aiToolResult.mode === 'continue' ? '续写已插入章节' : '润色已写入章节', content: '内容已更新，正在自动保存。' });
+
+    try {
+      if ('__TAURI_INTERNALS__' in window) {
+        await invoke<string>('save_projects', { projects: nextProjects });
+      } else {
+        localStorage.setItem('projects', JSON.stringify(nextProjects));
+      }
+      setAutoSaveStatus('saved');
+      setNotice({ title: aiToolResult.mode === 'continue' ? '续写已插入章节' : aiToolResult.mode === 'de-ai' ? '去 AI 味已替换章节内容' : '润色已替换章节内容', content: '正文已写入并保存到本地。' });
+    } catch (error) {
+      setAutoSaveStatus('error');
+      setNotice({ title: '正文已更新但保存失败', content: String(error) });
+    }
   };
 
   const updateChapterTargetWords = () => {
@@ -1816,7 +2986,7 @@ function App() {
           const chapterNodeId = `chapter:${item.chapter.id}`;
           if (!graphNodes.some(node => node.id === chapterNodeId)) graphNodes.push({ id: chapterNodeId, label: item.chapter.title, type: 'chapter' });
           const edgeId = `${chapterNodeId}->card:${card.id}:状态引用`;
-          if (!graphEdges.some(edge => edge.id === edgeId)) graphEdges.push({ id: edgeId, source: chapterNodeId, target: `card:${card.id}`, label: '状态引用' });
+          upsertKnowledgeGraphEdge(graphEdges, { id: edgeId, source: chapterNodeId, target: `card:${card.id}`, label: '状态引用', weight: 0.88, updatedAt: now });
         }
         return { ...card, currentState: changes, stateHistory, updatedAt: now };
       });
@@ -1836,7 +3006,7 @@ function App() {
     const ensureNode = (id: string, label: string, type: KnowledgeGraphNode['type'], category?: string) => {
       const index = graphNodes.findIndex(node => node.id === id);
       if (index >= 0) graphNodes[index] = { ...graphNodes[index], label, type, category: category || graphNodes[index].category };
-      else graphNodes.push({ id, label, type, category });
+      else graphNodes.push({ id, label, type, category, content: createGraphNodeProfile(type, category), updatedAt: new Date().toISOString() });
     };
     project.cards.forEach(card => ensureNode(`card:${card.id}`, card.title, 'card', card.type));
     project.outlines.forEach(outline => ensureNode(`outline:${outline.id}`, outline.title, 'outline', outline.kind));
@@ -1850,11 +3020,12 @@ function App() {
     if (hasContent) {
       referencedCards.forEach(card => {
         const id = `${chapterNodeId}->card:${card.id}`;
-        graphEdges.push({ id, source: chapterNodeId, target: `card:${card.id}`, label: selectedCardIds.includes(card.id) ? '本章引用' : '正文提及' });
+        const label = selectedCardIds.includes(card.id) ? '本章引用' : '正文提及';
+        graphEdges.push({ id, source: chapterNodeId, target: `card:${card.id}`, label, weight: defaultKnowledgeGraphWeight(label), sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
       [project.protagonist1, project.protagonist2].filter((name): name is string => Boolean(name?.trim()) && chapter.content.includes(name.trim())).forEach(name => {
         const target = `entity:${name.trim()}`;
-        graphEdges.push({ id: `${chapterNodeId}->${target}`, source: chapterNodeId, target, label: '章节主角' });
+        graphEdges.push({ id: `${chapterNodeId}->${target}`, source: chapterNodeId, target, label: '章节主角', weight: 0.92, sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
     }
     const cards = project.cards.map(card => {
@@ -1898,7 +3069,7 @@ function App() {
   const mergeKnowledgeGraph = (project: Project, chapter: Chapter, result: AgentMemoryResult): Project => {
     const chapterNodeId = `chapter:${chapter.id}`;
     const nodes = [...project.graphNodes];
-    const edges = [...project.graphEdges];
+    const edges = normalizeKnowledgeGraphEdges(project.graphEdges);
     const now = new Date().toISOString();
     let cards = project.cards;
     const findNodeId = (label: string) => nodes.find(node => node.label === label)?.id
@@ -1909,22 +3080,22 @@ function App() {
       const existingId = findNodeId(normalized);
       if (existingId) return existingId;
       const id = `entity:${normalized}`;
-      nodes.push({ id, label: normalized, type: 'entity', category });
+      nodes.push({ id, label: normalized, type: 'entity', category, content: createGraphNodeProfile('entity', category), updatedAt: new Date().toISOString() });
       return id;
     };
     const chapterNode = nodes.find(node => node.id === chapterNodeId);
-    if (!chapterNode && chapter.content.trim()) nodes.push({ id: chapterNodeId, label: chapter.title, type: 'chapter' });
+    if (!chapterNode && chapter.content.trim()) nodes.push({ id: chapterNodeId, label: chapter.title, type: 'chapter', content: createGraphNodeProfile('chapter'), updatedAt: now });
     project.cards.forEach(card => {
-      if (!nodes.some(node => node.id === `card:${card.id}`)) nodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type });
+      if (!nodes.some(node => node.id === `card:${card.id}`)) nodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type, content: createGraphNodeProfile('card', card.type), updatedAt: now });
     });
     project.outlines.forEach(outline => {
-      if (!nodes.some(node => node.id === `outline:${outline.id}`)) nodes.push({ id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: outline.kind });
+      if (!nodes.some(node => node.id === `outline:${outline.id}`)) nodes.push({ id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: outline.kind, content: createGraphNodeProfile('outline', outline.kind), updatedAt: now });
     });
     for (const entity of result.entities || []) {
       const id = ensureEntity(String(entity.name || ''), String(entity.type || '实体'));
       if (!id) continue;
       const edgeId = `${chapterNodeId}->${id}`;
-      if (!edges.some(edge => edge.id === edgeId)) edges.push({ id: edgeId, source: chapterNodeId, target: id, label: '章节提及' });
+      upsertKnowledgeGraphEdge(edges, { id: edgeId, source: chapterNodeId, target: id, label: '章节提及', weight: 0.7, sourceChapterId: chapter.id, updatedAt: now });
     }
     for (const relation of result.relations || []) {
       const sourceLabel = String(relation.source || '').trim();
@@ -1935,7 +3106,7 @@ function App() {
       if (!source || !target || source === target) continue;
       const label = String(relation.label || '关联').trim().slice(0, 40) || '关联';
       const edgeId = `${source}->${target}:${label}`;
-      if (!edges.some(edge => edge.id === edgeId)) edges.push({ id: edgeId, source, target, label });
+      upsertKnowledgeGraphEdge(edges, { id: edgeId, source, target, label, weight: normalizeKnowledgeGraphWeight(relation.weight, label), sourceChapterId: chapter.id, updatedAt: now });
     }
     for (const update of result.cardUpdates || []) {
       const card = cards.find(item => (update.cardId !== undefined && String(item.id) === String(update.cardId)) || (update.cardTitle && item.title === update.cardTitle));
@@ -1947,7 +3118,7 @@ function App() {
       cards = cards.map(item => item.id === card.id ? { ...item, currentState: changes, stateHistory, updatedAt: now } : item);
       const cardNodeId = `card:${card.id}`;
       const edgeId = `${chapterNodeId}->${cardNodeId}:状态更新`;
-      if (!edges.some(edge => edge.id === edgeId)) edges.push({ id: edgeId, source: chapterNodeId, target: cardNodeId, label: '状态更新' });
+      upsertKnowledgeGraphEdge(edges, { id: edgeId, source: chapterNodeId, target: cardNodeId, label: '状态更新', weight: 0.95, sourceChapterId: chapter.id, updatedAt: now });
     }
     return { ...project, cards, graphNodes: nodes, graphEdges: edges, updatedAt: now };
   };
@@ -2111,7 +3282,7 @@ function App() {
   };
 
   const generateOutline = async () => {
-    if (!editingProject || activeOutlineId === null) return;
+    if (!editingProject || activeOutlineId === null || outlineGenerating) return;
     const outline = editingProject.outlines.find(item => item.id === activeOutlineId);
     if (!outline) return;
     if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
@@ -2119,9 +3290,10 @@ function App() {
       return;
     }
     setAgentError('');
-    setAgentStage('starting');
+    setOutlineGenerating(true);
     try {
       await invoke<string>('start_agent_runtime');
+      const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
       const result = await invoke<{ content?: string; title?: string }>('call_agent_rpc', {
         method: 'outline.write',
         params: {
@@ -2129,9 +3301,12 @@ function App() {
           projectTitle: editingProject.title,
           kind: outline.kind,
           existingContent: outline.content,
+          instruction: activeStyle ? `${outlineAgentInstruction.trim()}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : outlineAgentInstruction.trim(),
           synopsis: editingProject.synopsis,
           cards: editingProject.cards,
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
+          skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          preferredSkillNames: selectedAgentSkillNames,
           apiKey: agentConfig.apiKey.trim(),
           apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
@@ -2143,11 +3318,12 @@ function App() {
         },
       });
       updateActiveOutline({ content: result.content || outline.content });
-      setAgentStage('idle');
       setNotice({ title: '大纲已生成', content: `${outline.kind} 已由智能体生成，可继续手动编辑。` });
     } catch (error) {
-      setAgentStage('error');
       setAgentError(String(error));
+      setNotice({ title: '大纲生成失败', content: String(error) });
+    } finally {
+      setOutlineGenerating(false);
     }
   };
 
@@ -2178,6 +3354,7 @@ function App() {
           cardType: cardDraft.type,
           cardTitle: cardDraft.title.trim(),
           existingContent: cardDraft.content,
+          instruction: cardAgentInstruction.trim(),
           chapterTitle: activeChapter?.title,
           chapterContent: activeChapter?.content?.slice(-6000),
           outlines: editingProject.outlines.slice(-4).map(outline => ({ kind: outline.kind, content: outline.content })),
@@ -2333,8 +3510,10 @@ function App() {
         agentSkills = builtinSkills;
       }
     }
+    const prioritizedSkillNames = selectedAgentSkillNames.filter(name => agentSkills.some(skill => skill.name === name));
     const activeChapterIndex = editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id);
     const continuityChapter = activeChapterIndex > 0 ? editingProject.chapters[activeChapterIndex - 1] : null;
+    const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
     try {
       await invoke<string>('start_agent_runtime');
       setAgentProgress(items => items.map(item => item.id === 'starting'
@@ -2349,7 +3528,7 @@ function App() {
           projectId: String(editingProject.id),
           projectTitle: editingProject.title,
           chapterId: String(activeChapter.id),
-          instruction: agentInstruction,
+          instruction: activeStyle ? `${agentInstruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : agentInstruction,
           outlines: editingProject.outlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, content: outline.content })),
           activeOutlineId,
           outline: editingProject.outlines.length
@@ -2357,7 +3536,9 @@ function App() {
             : (editingProject.outline.length ? JSON.stringify(editingProject.outline) : ''),
           cards: editingProject.cards.filter(card => selectedCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
-          skills: agentSkills.map(skill => ({ name: skill.name, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
+            .map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          preferredSkillNames: prioritizedSkillNames,
           // 章节承接只传入紧邻上一章正文；更早章节只通过用户勾选的结构化记忆进入。
           previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
           memories: editingProject.memories.filter(memory => selectedMemoryIds.includes(memory.id)).map(memory => ({
@@ -2684,9 +3865,27 @@ function App() {
 
   const activeOutline = editingProject?.outlines.find(outline => outline.id === activeOutlineId) ?? null;
   const activeCard = editingProject?.cards.find(card => card.id === activeCardId) ?? null;
+  const activeWritingStyle = editingProject?.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) ?? null : null;
   const activeMemoryDocument = editingProject?.memoryDocuments.find(document => document.id === activeMemoryDocumentId) ?? null;
   const activeChapterMemory = editingProject?.memories.find(memory => memory.id === activeChapterMemoryId) ?? null;
   const activeGraphNode = editingProject?.graphNodes.find(node => node.id === activeGraphNodeId) ?? null;
+  const graphDocumentGroups = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeGroup))) : [];
+  const activeGraphDocumentGroup = graphDocumentGroups.includes(graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
+  const graphDocumentTypeOptions = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeTypeLabel))).sort((left, right) => left.localeCompare(right, 'zh-CN')) : [];
+  const graphDocumentNodes = editingProject ? editingProject.graphNodes.filter(node => {
+    const matchesGroup = !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup;
+    const matchesType = graphDocumentType === '全部类型' || graphNodeTypeLabel(node) === graphDocumentType;
+    const searchText = `${node.label}\n${graphNodeRelativePath(node)}\n${graphNodeProfile(node)}`.toLowerCase();
+    const matchesQuery = !graphDocumentQuery.trim() || searchText.includes(graphDocumentQuery.trim().toLowerCase());
+    const relationCount = editingProject.graphEdges.filter(edge => edge.source === node.id || edge.target === node.id).length;
+    return matchesGroup && matchesType && matchesQuery && (!graphOnlyIsolated || relationCount === 0);
+  }).sort((left, right) => {
+    const relationStrength = (node: KnowledgeGraphNode) => editingProject.graphEdges
+      .filter(edge => edge.source === node.id || edge.target === node.id)
+      .reduce((sum, edge) => sum + normalizeKnowledgeGraphWeight(edge.weight, edge.label), 0);
+    const relationDifference = relationStrength(right) - relationStrength(left);
+    return relationDifference || left.label.localeCompare(right.label, 'zh-CN');
+  }) : [];
   const visibleCards = editingProject?.cards.filter(card => cardTypeFilter === '全部' || card.type === cardTypeFilter) ?? [];
   const characterNames = editingProject ? Array.from(new Set([
     ...(editingProject.protagonist1 || '').split(/[、,，/\s]+/u),
@@ -2694,16 +3893,22 @@ function App() {
     ...editingProject.cards.filter(card => card.type === '角色卡').map(card => card.title),
   ].map(item => item.trim()).filter(item => item.length > 1))) : [];
   const markTerms = Array.from(new Set([...characterNames, ...bannedWords].filter(Boolean))).sort((left, right) => right.length - left.length);
+  const activeAIDetection = editingProject?.aiDetection?.chapters.find(item => item.chapterId === activeChapter?.id);
   const renderMarkedContent = (content: string) => {
-    if (!writingMarksEnabled || !content || !markTerms.length) return content || '\u200b';
-    const pattern = new RegExp(`(${markTerms.map(escapeRegExp).join('|')})`, 'gu');
-    return content.split(pattern).map((part, index) => {
-      if (!part) return null;
-      const isBanned = bannedWords.includes(part);
-      const isCharacter = characterNames.includes(part);
-      return isBanned || isCharacter
-        ? <mark key={`${part}-${index}`} className={isBanned ? 'banned-word-mark' : 'character-mark'}>{part}</mark>
-        : <span key={`${part}-${index}`}>{part}</span>;
+    if (!content) return '\u200b';
+    const hasDetectionSegments = Boolean(activeAIDetection?.segments?.length);
+    const detectionSegments = hasDetectionSegments ? activeAIDetection!.segments : [{ order: 1, text: content, confidence: 0, label: '人工' as AIDetectionLabel }];
+    return detectionSegments.map((segment, segmentIndex) => {
+      const detectionClass = hasDetectionSegments ? `ai-detection-mark ${segment.label === '人工' ? 'human' : segment.label === '疑似 AI' ? 'suspected' : 'ai'}` : '';
+      if (!writingMarksEnabled || !markTerms.length) return <span key={`detection-${segmentIndex}`} className={detectionClass}>{segment.text}</span>;
+      const pattern = new RegExp(`(${markTerms.map(escapeRegExp).join('|')})`, 'gu');
+      return <span key={`detection-${segmentIndex}`} className={detectionClass}>{segment.text.split(pattern).map((part, partIndex) => {
+        if (!part) return null;
+        const isBanned = bannedWords.includes(part);
+        const isCharacter = characterNames.includes(part);
+        const classes = [isBanned ? 'banned-word-mark' : '', !isBanned && isCharacter ? 'character-mark' : '', segment.label === 'AI 特征' ? 'ai-detection-emphasis' : ''].filter(Boolean).join(' ');
+        return classes ? <mark key={`${part}-${partIndex}`} className={classes}>{part}</mark> : <span key={`${part}-${partIndex}`}>{part}</span>;
+      })}</span>;
     });
   };
   const currentSearchMatches = activeChapter && searchQuery ? countOccurrences(activeChapter.content, searchQuery) : 0;
@@ -2736,7 +3941,9 @@ function App() {
         if (!source || !target) continue;
         const dx = target.x - source.x; const dy = target.y - source.y;
         const distance = Math.max(0.025, Math.hypot(dx, dy));
-        const force = (distance - 0.18) * 0.035;
+        const weight = normalizeKnowledgeGraphWeight(edge.weight, edge.label);
+        const preferredDistance = 0.27 - weight * 0.11;
+        const force = (distance - preferredDistance) * (0.018 + weight * 0.035);
         source.x += dx / distance * force; source.y += dy / distance * force;
         target.x -= dx / distance * force; target.y -= dy / distance * force;
       }
@@ -2755,8 +3962,19 @@ function App() {
   const visibleSkills = skills.filter(skill => {
     const matchesCategory = !skillCategoryFilter || skill.category === skillCategoryFilter;
     const query = skillSearch.trim().toLowerCase();
-    return matchesCategory && (!query || `${skill.name} ${skill.description} ${skill.tags.join(' ')}`.toLowerCase().includes(query));
+    return matchesCategory && (!query || `${skill.displayName || ''} ${skill.name} ${skill.description} ${skill.tags.join(' ')}`.toLowerCase().includes(query));
   });
+  const activeDismantleBook = dismantleBooks.find(book => book.id === activeDismantleBookId) || null;
+  const activeDismantleChapter = activeDismantleBook?.chapters.find(chapter => chapter.id === activeDismantleChapterId) || null;
+  const activeLibraryBook = libraryBooks.find(book => book.id === activeLibraryBookId) || null;
+  const activeLibraryChapter = activeLibraryBook?.chapters.find(chapter => chapter.id === activeLibraryChapterId) || activeLibraryBook?.chapters[0] || null;
+  const visibleRankingBooks = rankingQuery.trim()
+    ? rankingBooks.filter(book => `${book.title} ${book.author} ${book.intro} ${book.category || ''}`.toLowerCase().includes(rankingQuery.trim().toLowerCase()))
+    : rankingBooks;
+  const rankingSourceName = rankingBooks[0]?.sourceName || '';
+  const outlineMode = editingProject !== null && editorSidebarTab === 'outline';
+  const cardMode = editingProject !== null && editorSidebarTab === 'cards';
+  const styleMode = editingProject !== null && editorSidebarTab === 'style';
 
   return (
     <div className="app">
@@ -2765,14 +3983,19 @@ function App() {
           <header className="editor-header">
             <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
             <h2>{editingProject.title}</h2>
-            <button className="editor-tool-button" title="搜索章节与全文" onClick={() => { setShowSearchPanel(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
-            <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
-            <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
-            <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}>{chapterSaving ? '保存中...' : '保存章节'}</button>
-            <div className="editor-stats">
-              <span>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
-              <span>{editingProject.chapters.length} 章</span>
-            </div>
+            {!outlineMode && !cardMode && !styleMode && <>
+              <button className="editor-tool-button" title="搜索章节与全文" onClick={() => { setShowSearchPanel(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
+              <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
+              <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
+              <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}>{chapterSaving ? '保存中...' : '保存章节'}</button>
+              <div className="editor-stats">
+                <span>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
+                <span>{editingProject.chapters.length} 章</span>
+              </div>
+            </>}
+            {outlineMode && <span className="editor-mode-label">大纲编辑</span>}
+            {cardMode && <span className="editor-mode-label">卡片编辑</span>}
+            {styleMode && <span className="editor-mode-label">作品文风</span>}
           </header>
 
           {notice && (
@@ -2822,16 +4045,16 @@ function App() {
                   卡片
                 </button>
                 <button
+                  className={editorSidebarTab === 'style' ? 'active' : ''}
+                  onClick={() => setEditorSidebarTab('style')}
+                >
+                  文风
+                </button>
+                <button
                   className={editorSidebarTab === 'knowledge' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('knowledge')}
                 >
                   记忆中心
-                </button>
-                <button
-                  className={editorSidebarTab === 'skills' ? 'active' : ''}
-                  onClick={() => setEditorSidebarTab('skills')}
-                >
-                  技能
                 </button>
                 <button
                   className={editorSidebarTab === 'publish' ? 'active' : ''}
@@ -2865,42 +4088,21 @@ function App() {
 
               {editorSidebarTab === 'ai-detect' && (() => {
                 const report = editingProject.aiDetection;
+                const currentDetection = report?.chapters.find(item => item.chapterId === activeChapter?.id);
+                const segmentCounts = (currentDetection?.segments || []).reduce<Record<AIDetectionLabel, number>>((counts, segment) => ({ ...counts, [segment.label]: counts[segment.label] + 1 }), { '人工': 0, '疑似 AI': 0, 'AI 特征': 0 });
                 return <div className="ai-detection-panel">
-                  <div className="panel-section-title">AI 内容检测 <span>本地分析</span></div>
-                  <p className="ai-detection-hint">参考句子、逻辑词、口语化、心理描写和段落均匀度特征估算，不调用外部检测 API。</p>
-                  <div className="ai-detection-actions"><button className="btn-secondary" disabled={aiDetecting || !activeChapter} onClick={() => runAIDetection('chapter')}>检测当前章</button><button className="btn-primary" disabled={aiDetecting} onClick={() => runAIDetection('book')}>检测全书</button></div>
+                  <div className="panel-section-title">AI 内容检测 <span>{report?.provider || '本地初筛'}</span></div>
+                  <p className="ai-detection-hint">检测会把正文分段标为人工、疑似 AI、AI 特征，并同步显示在编辑器中。结果用于本地写作自检，建议结合人物口吻、具体细节和情节逻辑进行判断。</p>
+                  <div className="ai-detection-actions"><button className="btn-secondary" disabled={aiDetecting || !activeChapter} onClick={() => runAIDetection('chapter')}>{aiDetecting ? '检测中...' : '检测当前章'}</button><button className="btn-primary" disabled={aiDetecting} onClick={() => runAIDetection('book')}>检测全书</button></div>
                   {report ? <>
                     <div className="ai-detection-summary"><strong>{report.averageAIRate}%</strong><span>预估 AI 率 · {report.level}</span><small>{report.suggestion}</small></div>
                     <div className="ai-detection-metrics"><span>句子均匀度 {report.chapters.length === 1 ? `${report.chapters[0].sentenceUniformity}%` : '按章节查看'}</span><span>口语化 {report.chapters.length === 1 ? `${report.chapters[0].colloquialFrequency}/百字` : '按章节查看'}</span><span>逻辑词 {report.chapters.length === 1 ? `${report.chapters[0].logicFrequency}/百字` : '按章节查看'}</span></div>
-                    <div className="ai-detection-list">{report.chapters.map(item => <div className="ai-detection-item" key={item.chapterId}><div><strong>{item.chapterTitle}</strong><small>{item.wordCount} 字 · 句子均匀度 {item.sentenceUniformity}%</small></div><b className={item.aiRate >= 60 ? 'high' : item.aiRate >= 45 ? 'medium' : 'low'}>{item.aiRate}%</b></div>)}</div>
+                    {currentDetection && <section className="ai-detection-segments"><div className="ai-detection-legend"><span className="human">人工 {segmentCounts['人工']}</span><span className="suspected">疑似 AI {segmentCounts['疑似 AI']}</span><span className="ai">AI 特征 {segmentCounts['AI 特征']}</span></div><div className="ai-detection-segment-list">{currentDetection.segments?.length ? currentDetection.segments.map(segment => <div className={`ai-detection-segment ${segment.label === '人工' ? 'human' : segment.label === '疑似 AI' ? 'suspected' : 'ai'}`} key={segment.order}><div><strong>{segment.label}</strong><small>第 {segment.order} 段 · 置信度 {(segment.confidence * 100).toFixed(1)}%</small></div><p>{segment.text.trim()}</p></div>) : <p className="empty-hint compact">旧检测记录没有分段结果，请重新检测当前章节。</p>}</div></section>}
+                    <div className="ai-detection-list">{report.chapters.map(item => <button type="button" className="ai-detection-item" key={item.chapterId} onClick={() => { const target = editingProject.chapters.find(chapter => chapter.id === item.chapterId); if (target) setActiveChapter(target); }}><div><strong>{item.chapterTitle}</strong><small>{item.wordCount} 字 · {item.label || '待重新检测'} · 句子均匀度 {item.sentenceUniformity}%</small></div><b className={item.aiRate >= 60 ? 'high' : item.aiRate >= 45 ? 'medium' : 'low'}>{item.aiRate}%</b></button>)}</div>
                     <small className="ai-detection-updated">更新于 {new Date(report.updatedAt).toLocaleString()}</small>
                   </> : <p className="empty-hint compact">尚未检测，选择当前章或全书开始分析。</p>}
                 </div>;
               })()}
-
-              {editorSidebarTab === 'skills' && (
-                <div className="skills-panel editor-skills-panel">
-                  <div className="panel-section-title">写作技能 <span>{skills.length}</span></div>
-                  <div className="skills-panel-toolbar">
-                    <select className="select" value={skillCategoryFilter} onChange={(event) => setSkillCategoryFilter(event.target.value)}>
-                      <option value="">全部分类</option><option value="setup">项目设置</option><option value="write">写作</option><option value="review">审查</option><option value="polish">润色</option><option value="import">导入</option><option value="analyze">分析</option><option value="tool">工具</option><option value="creator">创建器</option>
-                    </select>
-                    <button className="btn-add-chapter" onClick={openNewSkill}>+ 新建</button>
-                  </div>
-                  <input type="search" className="input skills-panel-search" placeholder="搜索技能" value={skillSearch} onChange={(event) => setSkillSearch(event.target.value)} />
-                  <div className="editor-skill-list">
-                    {visibleSkills.map(skill => (
-                      <div className="editor-skill-item" key={skill.id}>
-                        <div className="editor-skill-copy"><strong>{skill.name}</strong><small>{skill.builtin ? '内置' : '自定义'} · {skill.category}</small><p>{skill.description}</p></div>
-                        <div className="editor-skill-actions"><button className="link-button" onClick={() => openSkillEditor(skill)}>查看 / 编辑</button><button className="link-button danger-link" onClick={() => deleteSkill(skill)}>{skill.builtin ? '恢复默认' : '删除'}</button></div>
-                        <details className="editor-skill-content"><summary>查看内容</summary><pre>{skill.content}</pre></details>
-                      </div>
-                    ))}
-                    {!visibleSkills.length && <p className="empty-hint">没有匹配的技能。</p>}
-                  </div>
-                  <button className="btn-secondary skills-reset-button" onClick={() => { void loadSkills(); setNotice({ title: '技能已刷新', content: '已重新读取内置技能和本机自定义技能。' }); }}>刷新技能</button>
-                </div>
-              )}
 
               {editorSidebarTab === 'chapters' && (
                 <div className="chapters-panel">
@@ -2957,8 +4159,7 @@ function App() {
                   {activeOutline ? (
                     <div className="outline-editor">
                       <input className="input" value={activeOutline.title} onChange={(event) => updateActiveOutline({ title: event.target.value })} />
-                      <textarea className="outline-content-editor" value={activeOutline.content} onChange={(event) => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />
-                      <button className="btn-primary" onClick={generateOutline}>AI 生成大纲</button>
+                      <p className="outline-editor-hint">选择大纲后，中间编辑区会显示对应 Markdown 内容。</p>
                     </div>
                   ) : <p className="empty-hint">点击“新建大纲”，再选择总纲、细纲或设定文档</p>}
                 </div>
@@ -2988,19 +4189,22 @@ function App() {
                       </div>
                     ))}
                   </div>
-                  <div className="card-editor">
-                    <select className="select" value={cardDraft.type} onChange={(event) => setCardDraft({ ...cardDraft, type: event.target.value as CardType })}>
-                      <option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option>
+                </div>
+              )}
+
+              {editorSidebarTab === 'style' && (
+                <div className="project-style-panel">
+                  <div className="panel-section-title">作品绑定文风 <span>{activeWritingStyle ? '已绑定' : '未绑定'}</span></div>
+                  <p className="project-style-hint">绑定后，章节智能体和大纲智能体都会自动带入这份文风 Skill。</p>
+                  <label className="project-style-select" htmlFor="project-style-profile">
+                    <span>当前文风</span>
+                    <select id="project-style-profile" className="select" value={editingProject.styleProfileId || ''} onChange={event => bindStyleToCurrentProject(event.target.value)}>
+                      <option value="">默认文风</option>
+                      {writingStyles.map(style => <option key={style.id} value={style.id}>{style.name}</option>)}
                     </select>
-                    <input className="input" placeholder="卡片名称" value={cardDraft.title} onChange={(event) => setCardDraft({ ...cardDraft, title: event.target.value })} />
-                    <textarea className="card-content-editor" placeholder="详细信息、性格、能力、关系、限制等" value={cardDraft.content} onChange={(event) => setCardDraft({ ...cardDraft, content: event.target.value })} />
-                    {activeCard?.currentState && <p className="card-state-preview"><strong>当前状态：</strong>{activeCard.currentState}</p>}
-                    <div className="card-editor-actions">
-                      <button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>
-                      {activeCard && <button className="btn-secondary" onClick={() => updateCardStatesFromBook(activeCard.id)}>更新状态</button>}
-                      <button className="btn-primary" disabled={cardGenerating} onClick={saveCard}>{activeCard ? '保存卡片' : '创建卡片'}</button>
-                    </div>
-                  </div>
+                  </label>
+                  {activeWritingStyle ? <div className="project-style-summary"><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.sourceBookId ? '拆书蒸馏' : '自定义'} · {activeWritingStyle.tags.slice(0, 4).join('、') || '未分类'}</small><p>{activeWritingStyle.description || '暂无说明'}</p></div> : <p className="empty-hint compact">选择一份全局文风后，后续生成章节和大纲都会遵循它。</p>}
+                  <button className="btn-secondary project-style-manage-button" onClick={() => { setActiveTab('styles'); setStyleDraft(activeWritingStyle || writingStyles[0] || null); setEditingProject(null); }}>管理全局文风</button>
                 </div>
               )}
 
@@ -3051,29 +4255,87 @@ function App() {
             </aside>
 
             <main className="editor-main">
-              {editorSidebarTab === 'knowledge-graph' ? (
+              {editorSidebarTab === 'outline' ? (
+                <section className="outline-workspace">
+                  {activeOutline ? <>
+                    <div className="outline-workspace-header"><span>{activeOutline.kind}</span><h3>{activeOutline.title || activeOutline.kind}</h3><small>Markdown 大纲文档 · 内容会自动保存</small></div>
+                    <textarea className="outline-main-editor" value={activeOutline.content} onChange={event => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />
+                  </> : <div className="empty-state"><p>从左侧选择一个大纲开始编辑。</p></div>}
+                </section>
+              ) : editorSidebarTab === 'cards' ? (
+                <section className="card-workspace">
+                  {activeCard || cardDraft.title || cardDraft.content ? <>
+                    <div className="card-workspace-header"><span>{cardDraft.type}</span><input className="card-main-title-input" value={cardDraft.title} onChange={event => setCardDraft(current => ({ ...current, title: event.target.value }))} placeholder="卡片名称" /><small>知识卡 Markdown · 内容会自动保存</small></div>
+                    <div className="card-workspace-controls"><select className="select" value={cardDraft.type} onChange={event => setCardDraft(current => ({ ...current, type: event.target.value as CardType }))}><option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option></select><button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>{activeCard && <button className="btn-secondary" onClick={() => void updateCardStatesFromBook(activeCard.id)}>更新状态</button>}</div>
+                    <div className="card-workspace-meta"><span>当前状态：{activeCard?.currentState || '尚未更新'}</span>{activeCard && <button className="link-button" onClick={() => void updateCardStatesFromBook(activeCard.id)}>全文检索并更新状态</button>}</div>
+                    <textarea className="card-main-editor" value={cardDraft.content} onChange={event => setCardDraft(current => ({ ...current, content: event.target.value }))} placeholder="编辑卡片详细信息..." />
+                    <div className="card-workspace-footer"><span>{countNovelCharacters(cardDraft.content)} 字</span><button className="btn-primary" onClick={saveCard}>{activeCard ? '保存卡片' : '创建卡片'}</button></div>
+                  </> : <div className="empty-state"><p>从左侧选择一张卡片，或新建卡片开始编辑。</p></div>}
+                </section>
+              ) : editorSidebarTab === 'style' ? (
+                <section className="project-style-workspace">
+                  {activeWritingStyle ? <>
+                    <div className="project-style-workspace-header"><span>已绑定至本作品</span><h3>{activeWritingStyle.name}</h3><small>章节生成与大纲生成均自动引用此文风</small></div>
+                    <div className="project-style-coverage"><span>章节智能体</span><b>自动带入</b><span>大纲智能体</span><b>自动带入</b></div>
+                    <div className="project-style-description">{activeWritingStyle.description || '这份文风没有补充说明。'}</div>
+                    <pre className="project-style-content">{activeWritingStyle.content}</pre>
+                  </> : <div className="empty-state"><p>从左侧选择一份文风，后续章节和大纲生成都会自动带入。</p></div>}
+                </section>
+              ) : editorSidebarTab === 'knowledge-graph' ? (
                 <section className="knowledge-graph-workspace">
-                  <div className="knowledge-graph-header"><div><span>关系视图</span><h3>知识图谱</h3></div><small>{editingProject.graphNodes.length} 个节点 · {editingProject.graphEdges.length} 条关系</small></div>
+                  <div className="knowledge-graph-header"><div><span>{graphViewMode === 'document' ? '图谱文档' : '关系视图'}</span><h3>知识图谱</h3></div><small>{editingProject.graphNodes.length} 个节点 · {editingProject.graphEdges.length} 条关系</small></div>
                   {editingProject.graphNodes.length === 0 ? <div className="empty-state"><p>保存章节并勾选知识卡后，这里会显示章节、设定和卡片的引用关系。</p></div> : <>
-                    <div className="knowledge-graph-canvas">
-                      <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">{editingProject.graphEdges.map(edge => {
-                        const source = graphLayout.find(item => item.id === edge.source);
-                        const target = graphLayout.find(item => item.id === edge.target);
-                        return source && target ? <line key={edge.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} /> : null;
-                      })}</svg>
-                      {editingProject.graphNodes.map(node => {
-                        const position = graphLayout.find(item => item.id === node.id) ?? { x: 50, y: 50 };
-                        return <button key={node.id} className={`knowledge-graph-vertex ${node.type} ${activeGraphNodeId === node.id ? 'active' : ''}`} style={{ left: `${position.x}%`, top: `${position.y}%` }} onClick={() => setActiveGraphNodeId(node.id)}>{node.label}</button>;
-                      })}
+                    <div className="knowledge-graph-view-switch" role="tablist" aria-label="图谱显示模式">
+                      <button className={graphViewMode === 'document' ? 'active' : ''} onClick={() => setGraphViewMode('document')}>文档</button>
+                      <button className={graphViewMode === 'graph' ? 'active' : ''} onClick={() => setGraphViewMode('graph')}>关系图</button>
                     </div>
-                    <div className="knowledge-graph-details">
-                      <div><strong>{activeGraphNode?.label || '选择一个节点'}</strong><span>{activeGraphNode ? ({ chapter: '章节', card: '知识卡', outline: '大纲', entity: activeGraphNode.category || '实体' }[activeGraphNode.type]) : '查看节点关联'}</span></div>
-                      <div className="knowledge-graph-relations">{!activeGraphNode ? '点击图中的节点查看关联。' : editingProject.graphEdges.filter(edge => edge.source === activeGraphNode.id || edge.target === activeGraphNode.id).map(edge => {
-                        const otherId = edge.source === activeGraphNode.id ? edge.target : edge.source;
-                        const other = editingProject.graphNodes.find(node => node.id === otherId);
-                        return <button key={edge.id} onClick={() => setActiveGraphNodeId(otherId)}>{edge.source === activeGraphNode.id ? '关联到' : '被引用于'} {other?.label || otherId}<small>{edge.label}</small></button>;
-                      })}</div>
-                    </div>
+                    {graphViewMode === 'document' ? <div className="graph-document-view">
+                      <div className="graph-document-toolbar">
+                        <div className="graph-document-groups">{graphDocumentGroups.map(group => <button key={group} className={group === activeGraphDocumentGroup ? 'active' : ''} onClick={() => setGraphDocumentGroup(group)}>{group} <small>{editingProject.graphNodes.filter(node => graphNodeGroup(node) === group).length}</small></button>)}</div>
+                        <div className="graph-document-controls">
+                          <select className="select" value={graphDocumentType} onChange={event => setGraphDocumentType(event.target.value)}><option>全部类型</option>{graphDocumentTypeOptions.map(type => <option key={type}>{type}</option>)}</select>
+                          <input className="input" type="search" value={graphDocumentQuery} placeholder="搜索节点标题或来源路径" onChange={event => setGraphDocumentQuery(event.target.value)} />
+                          <label className="graph-document-isolated"><input type="checkbox" checked={graphOnlyIsolated} onChange={event => setGraphOnlyIsolated(event.target.checked)} /> 只看孤立节点</label>
+                        </div>
+                        <div className="graph-document-summary"><span>当前显示 {graphDocumentNodes.length} / {editingProject.graphNodes.filter(node => !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup).length} 个节点</span><span>孤立节点 {editingProject.graphNodes.filter(node => !editingProject.graphEdges.some(edge => edge.source === node.id || edge.target === node.id)).length} 个</span><button className="link-button" onClick={() => setExpandedGraphDocumentIds(graphDocumentNodes.map(node => node.id))}>全部展开</button><button className="link-button" onClick={() => setExpandedGraphDocumentIds([])}>全部收起</button></div>
+                      </div>
+                      {graphDocumentNodes.length === 0 ? <div className="empty-state"><p>当前筛选下暂无图谱节点。</p></div> : <div className="graph-document-list">{graphDocumentNodes.map((node, index) => {
+                        const relations = editingProject.graphEdges.filter(edge => edge.source === node.id || edge.target === node.id)
+                          .sort((left, right) => normalizeKnowledgeGraphWeight(right.weight, right.label) - normalizeKnowledgeGraphWeight(left.weight, left.label));
+                        const relatedChapterNodes = relations.map(edge => editingProject.graphNodes.find(item => item.id === (edge.source === node.id ? edge.target : edge.source))).filter((item): item is KnowledgeGraphNode => Boolean(item && item.type === 'chapter'));
+                        const expanded = expandedGraphDocumentIds.includes(node.id);
+                        return <article className="graph-document-node" key={node.id}>
+                          <div className="graph-document-node-heading"><div><h4>{index + 1}. {node.label}</h4><span>{graphNodeTypeLabel(node)} · {relations.length} 条关联</span></div><button className="link-button" onClick={() => setExpandedGraphDocumentIds(current => current.includes(node.id) ? current.filter(id => id !== node.id) : [...current, node.id])}>{expanded ? '收起' : '展开'}</button></div>
+                          {expanded && <div className="graph-document-node-body">
+                            <div className="graph-document-node-actions"><button className="link-button" onClick={() => void handleOpenGraphNodeLocation(node)}>打开位置</button><span>来源路径：{graphNodeRelativePath(node)}</span></div>
+                            <div className="graph-document-profile"><strong>档案</strong><textarea value={graphNodeProfile(node)} onChange={event => updateGraphNodeProfile(node.id, event.target.value)} /></div>
+                            <div className="graph-document-relations"><strong>关系网络</strong>{relations.length === 0 ? <p>暂无关联关系。</p> : <table><thead><tr><th>关联对象</th><th>关系</th><th>方向</th><th>权重</th></tr></thead><tbody>{relations.map(edge => { const isSource = edge.source === node.id; const other = editingProject.graphNodes.find(item => item.id === (isSource ? edge.target : edge.source)); return <tr key={edge.id}><td><button className="link-button" onClick={() => { setActiveGraphNodeId(other?.id || null); setGraphViewMode('graph'); }}>{other?.label || '未知节点'}</button></td><td>{edge.label}</td><td>{isSource ? '指向对方' : '来自对方'}</td><td>{normalizeKnowledgeGraphWeight(edge.weight, edge.label).toFixed(2)}</td></tr>; })}</tbody></table>}</div>
+                            <div className="graph-document-events"><strong>相关事件</strong>{relatedChapterNodes.length ? relatedChapterNodes.map(chapter => <span key={chapter.id}>{chapter.label}</span>) : <p>暂无直接关联事件。</p>}</div>
+                          </div>}
+                        </article>;
+                      })}</div>}
+                    </div> : <>
+                      <div className="knowledge-graph-canvas">
+                        <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">{editingProject.graphEdges.map(edge => {
+                          const source = graphLayout.find(item => item.id === edge.source);
+                          const target = graphLayout.find(item => item.id === edge.target);
+                          const weight = normalizeKnowledgeGraphWeight(edge.weight, edge.label);
+                          return source && target ? <line key={edge.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} style={{ strokeWidth: `${0.3 + weight * 1.05}px`, opacity: 0.26 + weight * 0.68 }} /> : null;
+                        })}</svg>
+                        {editingProject.graphNodes.map(node => {
+                          const position = graphLayout.find(item => item.id === node.id) ?? { x: 50, y: 50 };
+                          return <button key={node.id} className={`knowledge-graph-vertex ${node.type} ${activeGraphNodeId === node.id ? 'active' : ''}`} style={{ left: `${position.x}%`, top: `${position.y}%` }} onClick={() => setActiveGraphNodeId(node.id)}>{node.label}</button>;
+                        })}
+                      </div>
+                      <div className="knowledge-graph-details">
+                        <div><strong>{activeGraphNode?.label || '选择一个节点'}</strong><span>{activeGraphNode ? graphNodeTypeLabel(activeGraphNode) : '查看节点关联'}</span></div>
+                        <div className="knowledge-graph-relations">{!activeGraphNode ? '点击图中的节点查看关联。' : editingProject.graphEdges.filter(edge => edge.source === activeGraphNode.id || edge.target === activeGraphNode.id).sort((left, right) => normalizeKnowledgeGraphWeight(right.weight, right.label) - normalizeKnowledgeGraphWeight(left.weight, left.label)).map(edge => {
+                          const otherId = edge.source === activeGraphNode.id ? edge.target : edge.source;
+                          const other = editingProject.graphNodes.find(node => node.id === otherId);
+                          return <button key={edge.id} onClick={() => setActiveGraphNodeId(otherId)}>{edge.source === activeGraphNode.id ? '关联到' : '被引用于'} {other?.label || otherId}<small>{edge.label} · {normalizeKnowledgeGraphWeight(edge.weight, edge.label).toFixed(2)}</small></button>;
+                        })}</div>
+                      </div>
+                    </>}
                   </>}
                 </section>
               ) : editorSidebarTab === 'knowledge' && activeMemoryDocumentId === memoryDocumentId('章节快照') && activeChapterMemory ? (
@@ -3170,9 +4432,9 @@ function App() {
               )}
             </main>
 
-            <aside className="agent-panel">
+          <aside className="agent-panel">
               <div className="agent-panel-header">
-                <span>AI 智能体</span>
+                <span>{outlineMode ? '大纲智能体' : cardMode ? '卡片创建智能体' : styleMode ? '文风说明' : 'AI 智能体'}</span>
                 <select
                   className="agent-model-select"
                   value={agentConfig.model}
@@ -3183,19 +4445,60 @@ function App() {
                 </select>
               </div>
 
+              {outlineMode ? (
+                <div className="agent-panel-scroll outline-agent-panel">
+                  <section className="agent-task-section">
+                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <textarea value={outlineAgentInstruction} onChange={event => setOutlineAgentInstruction(event.target.value)} placeholder="描述要补全的结构、节奏、冲突和章节安排" />
+                    {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择大纲技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><p>不选时由智能体按大纲创作意图自动选择技能。</p><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
+                    <div className="outline-agent-actions"><button className="btn-primary" disabled={outlineGenerating || !activeOutline} onClick={() => void generateOutline()}>{outlineGenerating ? '生成大纲中...' : '生成当前大纲'}</button></div>
+                    {outlineGenerating && <div className="outline-agent-progress"><span className="agent-progress-dot active" /><span>正在分析作品设定、卡片和知识图谱...</span></div>}
+                    {agentError && <div className="agent-error">{agentError}</div>}
+                  </section>
+                  <p className="outline-agent-hint">大纲智能体会读取作品简介、卡片、知识图谱和当前大纲内容，生成结果会直接回填左侧文本编辑区。</p>
+                </div>
+              ) : cardMode ? (
+                <div className="agent-panel-scroll card-agent-panel">
+                  <section className="agent-task-section">
+                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <textarea value={cardAgentInstruction} onChange={event => setCardAgentInstruction(event.target.value)} placeholder="描述要补充的身份、能力、关系、限制或状态变化" />
+                    {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择卡片技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
+                    <div className="card-agent-context"><span>当前卡片</span><strong>{activeCard?.title || cardDraft.title || '新建卡片'}</strong><small>{cardDraft.type} · {countNovelCharacters(cardDraft.content)} 字</small></div>
+                    <button className="agent-run-button" disabled={!cardDraft.title.trim() && !cardDraft.content.trim() || cardGenerating} onClick={() => void generateCardWithAI()}>{cardGenerating ? '卡片生成中...' : '运行卡片创建智能体'}</button>
+                    {cardGenerating && <div className="outline-agent-progress"><span className="agent-progress-dot active" /><span>正在分析作品设定、章节和已有卡片...</span></div>}
+                    <p className="outline-agent-hint">卡片智能体会读取作品简介、大纲、当前章节和已有知识卡，生成结果会直接回填中间卡片编辑区。</p>
+                  </section>
+                </div>
+              ) : styleMode ? (
+                <div className="agent-panel-scroll style-agent-panel">
+                  <section className="agent-task-section">
+                    <div className="agent-instruction-heading"><label>文风应用范围</label></div>
+                    {activeWritingStyle ? <>
+                      <div className="card-agent-context"><span>当前绑定</span><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.tags.join('、') || '无标签'}</small></div>
+                      <div className="style-agent-coverage"><div><strong>章节智能体</strong><span>生成正文时作为专用文风 Skill 带入。</span></div><div><strong>大纲智能体</strong><span>生成总纲、细纲和设定时同样带入，保证创作方向一致。</span></div></div>
+                    </> : <p className="empty-hint compact">尚未绑定文风。请在左侧选择一份全局文风。</p>}
+                  </section>
+                </div>
+              ) : (
               <div className="agent-panel-scroll">
                 <section className="agent-task-section">
-                  <label>创作指令</label>
+                  <div className="agent-instruction-heading"><label>创作指令</label><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                   <textarea value={agentInstruction} onChange={(event) => setAgentInstruction(event.target.value)} />
+                  {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择本次写作技能">
+                    <div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div>
+                    <p>不选时由智能体按创作意图自动调用；勾选后会优先带入，章节承接和下一章计划仍会自动保留。</p>
+                    <div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div>
+                  </section>}
                   <div className="ai-writing-tools">
                     <div className="agent-card-picker-title">润色 / 续写要求 <small>可选</small></div>
                     <textarea value={aiToolInstruction} onChange={event => setAIToolInstruction(event.target.value)} placeholder="例如：加强紧张感，保留冷峻文风；或让主角先观察再行动" />
                     <div className="ai-writing-tool-actions">
                       <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('polish')}>{aiToolRunning && aiToolMode === 'polish' ? '润色中...' : '润色选中内容 / 整章'}</button>
+                      <button className="btn-secondary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('de-ai')}>{aiToolRunning && aiToolMode === 'de-ai' ? '处理中...' : '去 AI 味'}</button>
                       <button className="btn-primary" disabled={aiToolRunning || !activeChapter} onClick={() => runAITool('continue')}>{aiToolRunning && aiToolMode === 'continue' ? '续写中...' : '生成续写'}</button>
                     </div>
                     {aiToolResult && <div className="ai-tool-result">
-                      <div><strong>{aiToolResult.mode === 'continue' ? '续写草稿' : '润色草稿'}</strong><span>{countNovelCharacters(aiToolResult.content)} 字{aiToolResult.maxWords ? ` / 最多 ${aiToolResult.maxWords} 字` : ''}</span></div>
+                      <div><strong>{aiToolResult.mode === 'continue' ? '续写草稿' : aiToolResult.mode === 'de-ai' ? '去 AI 味草稿' : '润色草稿'}</strong><span>{countNovelCharacters(aiToolResult.content)} 字{aiToolResult.maxWords ? ` / 最多 ${aiToolResult.maxWords} 字` : ''}</span></div>
                       <textarea value={aiToolResult.content} onChange={event => setAIToolResult(current => current ? { ...current, content: event.target.value } : current)} />
                       <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => copyText(aiToolResult.content)}>复制</button><button className="btn-primary" onClick={acceptAIToolResult}>{aiToolResult.mode === 'continue' ? '确认插入章节' : '确认替换'}</button></div>
                     </div>}
@@ -3247,7 +4550,12 @@ function App() {
                 {agentDraft?.draftContent && (
                   <section className="agent-result-section">
                     <div className="agent-result-title"><strong>章节草稿</strong><span>{countNovelCharacters(agentDraft.draftContent)} 字</span></div>
-                    {(agentDraft.recognizedIntent || agentDraft.selectedSkills?.length) && <div className="agent-intent-result"><span>识别意图：{agentDraft.recognizedIntent || '章节创作与续写'}</span>{agentDraft.selectedSkills?.map(skill => <b key={skill}>{skill}</b>)}</div>}
+                    {(agentDraft.recognizedIntent || agentDraft.selectedSkills?.length) && <div className="agent-intent-result"><span>识别意图：{agentDraft.recognizedIntent || '章节创作与续写'}</span>{agentDraft.selectedSkills?.map(skill => <b key={skill}>{skills.find(item => item.name === skill)?.displayName || skill}</b>)}</div>}
+                    {agentDraft.chapterPlan && <details className="agent-chapter-plan" open>
+                      <summary>下一章执行计划</summary>
+                      <div className="agent-plan-meta">已交给正文节点执行，接受草稿前可先核对承接与钩子。</div>
+                      <pre>{agentDraft.chapterPlan}</pre>
+                    </details>}
                     {agentDraft.contextReport && <div className="agent-context-report">
                       <span>{agentDraft.contextReport.cache === 'hit' ? '缓存命中' : '缓存未命中'}</span>
                       <span>发送上下文 {((agentDraft.contextReport.draftInputBytes || agentDraft.contextReport.packedBytes || 0) / 1024).toFixed(1)} KB</span>
@@ -3270,32 +4578,9 @@ function App() {
                   </section>
                 )}
               </div>
+              )}
             </aside>
           </div>
-          {showNewSkillModal && (
-            <div className="modal-overlay editor-modal-overlay" onClick={() => setShowNewSkillModal(false)}>
-              <div className="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title" onClick={(event) => event.stopPropagation()}>
-                <div className="modal-header">
-                  <h3 id="skill-modal-title">{skillEditingId === null ? '新建技能' : '编辑技能'}</h3>
-                  <button className="modal-close" aria-label="关闭" onClick={() => setShowNewSkillModal(false)}>×</button>
-                </div>
-                <div className="modal-body">
-                  <div className="form-group"><label>技能名称 *</label><input type="text" className="input" placeholder="例如：场景切换" value={newSkill.name} onChange={(event) => setNewSkill({ ...newSkill, name: event.target.value })} /></div>
-                  <div className="form-group">
-                    <label>分类</label>
-                    <select className="select" value={newSkill.category} onChange={(event) => setNewSkill({ ...newSkill, category: event.target.value })}>
-                      <option value="setup">项目设置</option><option value="write">写作</option><option value="review">审查</option><option value="polish">润色</option><option value="import">导入</option><option value="analyze">分析</option><option value="tool">工具</option><option value="creator">创建器</option>
-                    </select>
-                  </div>
-                  <div className="form-group"><label>简短描述</label><input type="text" className="input" placeholder="一句话描述这个技能" value={newSkill.description} onChange={(event) => setNewSkill({ ...newSkill, description: event.target.value })} /></div>
-                  <div className="form-group"><label>详细内容 *</label><textarea className="textarea" rows={6} placeholder="详细说明如何使用这个技能..." value={newSkill.content} onChange={(event) => setNewSkill({ ...newSkill, content: event.target.value })} /></div>
-                  <div className="form-group"><label>标签（逗号分隔）</label><input type="text" className="input" placeholder="场景,过渡,技巧" value={newSkill.tags} onChange={(event) => setNewSkill({ ...newSkill, tags: event.target.value })} /></div>
-                  <div className="skill-creator-actions"><button className="btn-secondary" onClick={generateSkillWithAI} disabled={skillGenerating}>{skillGenerating ? '生成中...' : 'AI 生成技能草稿'}</button><span>可先填写一句需求，再由 skill-creator 补全步骤和输出格式。</span></div>
-                </div>
-                <div className="modal-footer"><button className="btn-secondary" onClick={() => setShowNewSkillModal(false)}>取消</button><button className="btn-primary" onClick={handleCreateSkill}>{skillEditingId === null ? '创建' : '保存修改'}</button></div>
-              </div>
-            </div>
-          )}
         </div>
       ) : (
         <>
@@ -3312,7 +4597,28 @@ function App() {
           >
             📚 小说管理
           </button>
+          <button className={activeTab === 'books' ? 'active' : ''} onClick={() => setActiveTab('books')}>
+            ▣ 书籍管理 <small>{libraryBooks.length}</small>
+          </button>
+          <button
+            className={activeTab === 'dismantles' ? 'active' : ''}
+            onClick={() => { setActiveTab('dismantles'); if (!activeDismantleBookId && dismantleBooks[0]) { setActiveDismantleBookId(dismantleBooks[0].id); setActiveDismantleChapterId(dismantleBooks[0].chapters[0]?.id || null); } }}
+          >
+            ⌘ 拆书管理 <small>{dismantleBooks.length}</small>
+          </button>
+          <button className={activeTab === 'rankings' ? 'active' : ''} onClick={() => setActiveTab('rankings')}>
+            ↗ 扫榜管理 <small>{rankingBooks.length}</small>
+          </button>
+          <button className={activeTab === 'skills' ? 'active' : ''} onClick={() => setActiveTab('skills')}>
+            ✦ 技能管理 <small>{skills.length}</small>
+          </button>
+          <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); }}>
+            ◈ 文风管理 <small>{writingStyles.length}</small>
+          </button>
         </nav>
+        <div className="sidebar-footer">
+          <button className="settings-button" onClick={openSettings}>⚙ 设置</button>
+        </div>
       </aside>
 
       <main className="main">
@@ -3358,6 +4664,81 @@ function App() {
             )}
           </div>
         )}
+        {activeTab === 'skills' && (
+          <section className="global-management-page skills-management-page">
+            <header className="page-header"><div><span className="page-eyebrow">全局写作资源</span><h2>技能管理</h2><p>管理内置与自定义写作技能。小说智能体可从这里选择并调用合适的技能。</p></div><button className="btn-primary" onClick={openNewSkill}>+ 新建技能</button></header>
+            <div className="global-management-toolbar">
+              <select className="select" value={skillCategoryFilter} onChange={(event) => setSkillCategoryFilter(event.target.value)}>
+                <option value="">全部分类</option><option value="setup">项目设置</option><option value="write">写作</option><option value="review">审查</option><option value="polish">润色</option><option value="import">导入</option><option value="analyze">分析</option><option value="tool">工具</option><option value="creator">创建器</option>
+              </select>
+              <input type="search" className="input" placeholder="搜索技能名称、描述或标签" value={skillSearch} onChange={(event) => setSkillSearch(event.target.value)} />
+              <button className="btn-secondary" onClick={() => { void loadSkills(); setNotice({ title: '技能已刷新', content: '已重新读取内置技能和本机自定义技能。' }); }}>刷新技能</button>
+            </div>
+            <div className="global-skill-grid">
+              {visibleSkills.map(skill => <article className="global-skill-card" key={skill.id}>
+                <div className="global-skill-card-header"><div><strong>{skill.displayName || skill.name}</strong><small>{skill.builtin ? '内置' : '自定义'} · {skill.category}</small></div><span>{skill.tags.slice(0, 3).join(' · ') || '未分类'}</span></div>
+                <p>{skill.description || '暂无描述'}</p>
+                <details><summary>查看技能内容</summary><pre>{skill.content}</pre></details>
+                <div className="global-card-actions"><button className="btn-secondary" onClick={() => openSkillEditor(skill)}>查看 / 编辑</button><button className="link-button danger-link" onClick={() => deleteSkill(skill)}>{skill.builtin ? '恢复默认' : '删除'}</button></div>
+              </article>)}
+              {!visibleSkills.length && <div className="empty-state"><p>没有匹配的技能。</p></div>}
+            </div>
+          </section>
+        )}
+        {activeTab === 'styles' && (
+          <section className="global-management-page styles-management-page">
+            <header className="page-header"><div><span className="page-eyebrow">全局写作资源</span><h2>文风管理</h2><p>新建或编辑文风 Skill。保存后可在每部小说的章节侧栏绑定使用。</p></div><button className="btn-primary" onClick={openNewWritingStyle}>+ 新建文风</button></header>
+            <div className="global-style-workspace">
+              <aside className="global-style-list"><div className="panel-section-title">全部文风 <span>{writingStyles.length}</span></div>{writingStyles.map(style => <button type="button" key={style.id} className={`writing-style-item ${styleDraft?.id === style.id ? 'active' : ''}`} onClick={() => setStyleDraft(style)}><strong>{style.name}</strong><small>{style.sourceBookId ? '拆书蒸馏' : '自定义'} · {style.tags.slice(0, 3).join('、') || '未分类'}</small></button>)}{!writingStyles.length && <p className="empty-hint">暂无文风，点击“新建文风”开始。</p>}</aside>
+              <section className="global-style-editor">{styleDraft ? <div className="writing-style-editor"><label>文风名称<input className="input" value={styleDraft.name} onChange={event => setStyleDraft({ ...styleDraft, name: event.target.value })} /></label><label>简短说明<input className="input" value={styleDraft.description} onChange={event => setStyleDraft({ ...styleDraft, description: event.target.value })} /></label><label>Skill 内容<textarea className="style-content-editor" value={styleDraft.content} onChange={event => setStyleDraft({ ...styleDraft, content: event.target.value })} /></label><div className="style-editor-actions"><button className="btn-primary" onClick={saveWritingStyleDraft}>保存文风</button>{writingStyles.some(style => style.id === styleDraft.id) && <button className="link-button danger-link" onClick={() => deleteWritingStyle(styleDraft.id)}>删除</button>}</div></div> : <div className="empty-state"><p>选择一个文风，或新建文风开始编辑。</p></div>}</section>
+            </div>
+          </section>
+        )}
+        {activeTab === 'books' && (
+          <div className="library-page">
+            <header className="page-header library-page-header"><div><span className="page-eyebrow">本地资料库</span><h2>书籍管理</h2><p>搜索书名或作者后，系统会同时查询全部书源；从结果中选择要下载的来源。</p></div><div className="library-search"><input className="input" value={bookSearchQuery} onChange={event => setBookSearchQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void runBookSearch(); }} placeholder="搜索书名或作者" /><button className="btn-primary" onClick={() => void runBookSearch()} disabled={bookSearchLoading}>{bookSearchLoading ? '全书源搜索中...' : '搜索全部书源'}</button><button className="btn-secondary" onClick={() => txtImportInputRef.current?.click()}>导入 TXT</button><input ref={txtImportInputRef} type="file" accept=".txt,text/plain" hidden onChange={event => void importLibraryTxt(event)} /></div></header>
+            {librarySearchResults.length > 0 && <section className="library-search-results"><div className="panel-section-title">全部书源结果 <span>{librarySearchResults.length}</span></div><div className="library-result-grid">{librarySearchResults.map(book => <article className="library-result-card" key={book.id}><strong>{book.title}</strong><span>{book.author} · 来源：{book.source}</span><p>{book.intro || '暂无简介'}</p><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : `从${book.source}下载`}</button></article>)}</div></section>}
+            <div className="library-workspace">
+              <aside className="library-list"><div className="panel-section-title">已下载书籍 <span>{libraryBooks.length}</span></div>{libraryBooks.length === 0 ? <p className="empty-hint">还没有下载书籍。可先搜索，或从扫榜管理下载。</p> : libraryBooks.map(book => <button type="button" key={book.id} className={`library-book-item ${book.id === activeLibraryBookId ? 'active' : ''}`} onClick={() => { setActiveLibraryBookId(book.id); setActiveLibraryChapterId(book.chapters[0]?.id || null); }}><strong>{book.title}</strong><small>{book.author} · {book.chapters.length} 章</small></button>)}</aside>
+              {activeLibraryBook ? <section className="library-detail"><header className="library-detail-header"><div><span>{activeLibraryBook.source}</span><h3>{activeLibraryBook.title}</h3><small>{activeLibraryBook.author} · {activeLibraryBook.chapters.length} 章 · {activeLibraryBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="library-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_library_book_location', { bookId: activeLibraryBook.id, bookTitle: activeLibraryBook.title }).catch(error => setNotice({ title: '打开书籍位置失败', content: String(error) }))}>打开位置</button>{activeLibraryBook.chapters.some(chapter => !chapter.downloaded) && <button className="link-button" disabled={libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryUnfinishedLibraryChapters(activeLibraryBook)}>{libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}` ? '重新下载中...' : '重新下载未完成'}</button>}<button className="btn-primary library-dismantle-button" onClick={() => createDismantleFromLibrary(activeLibraryBook)}><span>拆</span>一键拆书</button><button className="link-button danger-link" onClick={() => void deleteLibraryBook(activeLibraryBook)}>删除</button></div></header><p className="library-intro">{activeLibraryBook.intro || '暂无简介'}</p><div className="library-reading-workspace"><div className="library-chapter-pane"><div className="library-chapter-pane-heading"><strong>章节目录</strong><span>{activeLibraryBook.chapters.length} 章</span></div><div className="library-chapter-list">{activeLibraryBook.chapters.map(chapter => <div className={`library-chapter-row ${chapter.id === activeLibraryChapter?.id ? 'active' : ''}`} key={chapter.id}><button type="button" className="library-chapter-select" onClick={() => setActiveLibraryChapterId(chapter.id)}><span>第 {chapter.number} 章</span><strong>{chapter.title}</strong><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.downloaded ? '已下载' : '未下载'}</small></button>{!chapter.downloaded && <button type="button" className="library-chapter-retry" disabled={libraryChapterDownloadRunningId === chapter.id || libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryLibraryChapter(activeLibraryBook, chapter)}>{libraryChapterDownloadRunningId === chapter.id ? '下载中...' : '重新下载'}</button>}</div>)}</div></div><article className="library-reader">{activeLibraryChapter ? <><header className="library-reader-header"><div><span>第 {activeLibraryChapter.number} 章</span><h4>{activeLibraryChapter.title}</h4><small>{activeLibraryChapter.wordCount.toLocaleString()} 字</small></div><button className="btn-secondary" disabled={libraryOutlineRunningId === activeLibraryChapter.id || !activeLibraryChapter.content.trim()} onClick={() => void generateLibraryChapterOutline(activeLibraryBook, activeLibraryChapter)}>{libraryOutlineRunningId === activeLibraryChapter.id ? '生成章纲中...' : '生成章纲'}</button></header>{activeLibraryChapter.unavailableReason && <div className="library-chapter-warning">{activeLibraryChapter.unavailableReason}</div>}{activeLibraryChapter.content.trim() ? <pre className="library-reader-content">{activeLibraryChapter.content}</pre> : <div className="library-reader-empty">该章节没有可阅读的本地正文。</div>}{activeLibraryChapter.outline && <details className="library-reader-outline" open><summary>本章章纲</summary><pre>{activeLibraryChapter.outline}</pre></details>}</> : <div className="library-reader-empty">选择章节开始阅读。</div>}</article></div></section> : <div className="empty-state"><p>选择一本已下载书籍查看章节。</p></div>}
+            </div>
+          </div>
+        )}
+        {activeTab === 'books' && activeLibraryBook && activeLibraryChapter && !activeLibraryChapter.downloaded && (
+          <button className="library-retry-chapter-button" disabled={libraryChapterDownloadRunningId === activeLibraryChapter.id} onClick={() => void retryLibraryChapter(activeLibraryBook, activeLibraryChapter)}>
+            {libraryChapterDownloadRunningId === activeLibraryChapter.id ? '重新下载中...' : '重新下载本章'}
+          </button>
+        )}
+        {activeTab === 'rankings' && (
+          <div className="ranking-page">
+            <header className="page-header"><div><span className="page-eyebrow">市场观察</span><h2>扫榜管理</h2><p>聚合番茄小说网、起点和飞卢榜单，选书后可下载或进入拆书流程。</p></div><div className="ranking-header-actions"><button className="btn-secondary" onClick={() => void runRankingAnalysis()} disabled={rankingAnalysisRunning || !rankingBooks.length}>{rankingAnalysisRunning ? '盘点中...' : 'AI 趋势盘点'}</button><button className="btn-primary" onClick={() => void fetchRankingBooks()} disabled={rankingLoading}>{rankingLoading ? '拉取中...' : '刷新榜单'}</button></div></header>
+            <div className="ranking-toolbar"><select className="select" aria-label="榜单平台" value={rankingPlatform} onChange={event => { const nextPlatform = event.target.value as RankingPlatform; setRankingPlatform(nextPlatform); setRankingBooks([]); if (nextPlatform === 'fanqie') { setFanqieSection('male-read'); setFanqieCategoryId('all'); setRankingType('read'); } else { setRankingType(rankingTypeOptions(nextPlatform)[0].value); } }}><option value="fanqie">番茄小说网</option><option value="qidian">起点中文网</option><option value="faloo">飞卢中文网</option></select>{rankingPlatform === 'fanqie' ? <><select className="select" aria-label="番茄榜单分类" value={fanqieSection} onChange={event => { setFanqieSection(event.target.value as FanqieSection); setFanqieCategoryId('all'); }} >{fanqieSectionOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select className="select" aria-label="番茄题材分类" value={fanqieCategoryId} onChange={event => setFanqieCategoryId(event.target.value)} disabled={fanqieCategoriesLoading}><option value="all">{fanqieCategoriesLoading ? '分类加载中...' : '总榜'}</option>{(fanqieCategories[fanqieSection] || []).filter(category => category.id !== 'all').map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></> : <select className="select" value={rankingType} onChange={event => setRankingType(event.target.value as RankingType)}>{rankingTypeOptions(rankingPlatform).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>}<input className="input" value={rankingQuery} onChange={event => setRankingQuery(event.target.value)} placeholder="筛选书名、作者、分类" />{rankingSourceName && <span className="ranking-source-label">数据来源：{rankingSourceName}</span>}</div>
+            {rankingAnalysis && <section className="ranking-analysis"><div className="panel-section-title">story-long-scan 市场盘点 <button className="link-button" onClick={() => setRankingAnalysis('')}>收起</button></div><pre>{rankingAnalysis}</pre></section>}
+            {visibleRankingBooks.length === 0 ? <div className="empty-state"><p>选择平台后点击“刷新榜单”。</p></div> : <div className="ranking-grid">{visibleRankingBooks.map(book => <article className="ranking-book-card" key={book.id}><div className="ranking-book-rank">{book.rank}</div><div className="ranking-book-copy"><h3>{book.title}</h3><span>{book.author} · {book.category || '未分类'}</span><p>{book.intro || '暂无简介'}</p><small>{book.wordCount ? `${book.wordCount.toLocaleString()} 字` : '字数未知'}{book.readCount ? ` · ${book.readCount.toLocaleString()} 热度` : ''}</small><div className="ranking-book-actions"><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : '一键下载 TXT'}</button><button className="link-button" onClick={async () => { const downloaded = libraryBooks.find(item => item.title === book.title); const ready = downloaded || await downloadLibraryBook(book); if (ready) createDismantleFromLibrary(ready); }}>{bookDownloadRunningId === book.id ? '处理中...' : '一键拆书'}</button></div></div></article>)}</div>}
+          </div>
+        )}
+        {activeTab === 'dismantles' && (
+          <div className="dismantle-page">
+            <header className="page-header dismantle-page-header">
+              <div><span className="page-eyebrow">本地资料库</span><h2>拆书管理</h2><p>从书籍管理选择已下载小说，逐章提炼剧情结构，再生成独立原创章节。</p></div>
+              <button className="btn-secondary" onClick={() => setActiveTab('books')}>去书籍管理下载</button>
+            </header>
+            {dismantleBooks.length === 0 ? <div className="dismantle-empty"><div className="dismantle-empty-mark">拆</div><h3>还没有拆书资料</h3><p>请先在书籍管理下载小说，再选择“加入拆书管理”。</p><button className="btn-primary" onClick={() => setActiveTab('books')}>选择本地书籍</button></div> : <div className="dismantle-workspace">
+              <aside className="dismantle-library">
+                <div className="dismantle-library-heading"><div><strong>拆书书库</strong><small>{dismantleBooks.length} 部作品</small></div><button className="link-button" onClick={() => setActiveTab('books')}>选择书籍</button></div>
+                <div className="dismantle-book-list">{dismantleBooks.map(book => <button type="button" key={book.id} className={`dismantle-book-item ${book.id === activeDismantleBookId ? 'active' : ''}`} onClick={() => { setActiveDismantleBookId(book.id); setActiveDismantleChapterId(book.chapters[0]?.id || null); setSelectedDismantleChapterIds(book.chapters.slice(0, 1).map(chapter => chapter.id)); }}><div><strong>{book.title}</strong><small>{book.chapters.length} 章 · {book.chapters.filter(chapter => chapter.status === 'analyzed' || chapter.status === 'rewritten').length} 章已分析</small>{book.boundProjectId && <em>已绑定小说</em>}</div></button>)}</div>
+              </aside>
+              {activeDismantleBook && <section className="dismantle-detail">
+                <header className="dismantle-detail-header"><div><span>拆书资料</span><h3>{activeDismantleBook.title}</h3><small>{activeDismantleBook.chapters.length} 章 · {activeDismantleBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="dismantle-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_dismantle_location', { bookTitle: activeDismantleBook.title }).catch(error => setNotice({ title: '打开拆书位置失败', content: String(error) }))}>打开位置</button><button className="link-button danger-link" onClick={() => void deleteDismantleBook(activeDismantleBook)}>删除</button></div></header>
+                <div className="dismantle-detail-toolbar"><label>绑定目标小说<select className="select" value={activeDismantleBook.boundProjectId?.toString() || ''} onChange={event => bindDismantleToProject(activeDismantleBook.id, event.target.value ? Number(event.target.value) : undefined)}><option value="">暂不绑定</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label><button className="btn-secondary" onClick={() => startDismantleImitation(activeDismantleBook)}>一键仿写此书</button><button className="btn-secondary" disabled={styleDistilling} onClick={() => void distillDismantleStyle()}>{styleDistilling ? '蒸馏中...' : '蒸馏文风 Skill'}</button><button className="btn-primary" disabled={Boolean(dismantleRunningIds.length)} onClick={() => void runDismantleAnalysis()}>{dismantleRunningIds.length ? `分析中 ${dismantleRunningIds.length} 章` : `生成选中章纲（${selectedDismantleChapterIds.length}）`}</button></div>
+                <div className="dismantle-detail-body">
+                  <div className="dismantle-chapter-list"><div className="dismantle-list-heading"><strong>章节选择</strong><button className="link-button" onClick={() => setSelectedDismantleChapterIds(activeDismantleBook.chapters.map(chapter => chapter.id))}>全选</button><button className="link-button" onClick={() => setSelectedDismantleChapterIds([])}>清空</button></div>{activeDismantleBook.chapters.map(chapter => <label key={chapter.id} className={`dismantle-chapter-row ${chapter.id === activeDismantleChapterId ? 'active' : ''}`}><input type="checkbox" checked={selectedDismantleChapterIds.includes(chapter.id)} onChange={() => setSelectedDismantleChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><button type="button" onClick={() => setActiveDismantleChapterId(chapter.id)}><strong>第 {chapter.number} 章</strong><span>{chapter.title}</span><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.status === 'rewritten' ? '已改写' : chapter.status === 'analyzed' ? '已分析' : chapter.status === 'analyzing' ? '分析中' : '待分析'}</small></button></label>)}</div>
+                  {activeDismantleChapter && <article className="dismantle-chapter-editor"><div className="dismantle-chapter-heading"><div><span>第 {activeDismantleChapter.number} 章</span><h4>{activeDismantleChapter.title}</h4></div><button className="btn-secondary" onClick={() => void runDismantleRewrite()} disabled={dismantleRewriteRunning || !activeDismantleChapter.detailedOutline.trim()}>{dismantleRewriteRunning ? '原创生成中...' : '根据章纲生成原创稿'}</button></div><div className="dismantle-analysis-grid"><div><strong>剧情摘要</strong><textarea value={activeDismantleChapter.summary} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, summary: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="分析后显示剧情摘要" /></div><div><strong>节奏判断</strong><textarea value={activeDismantleChapter.pacing} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, pacing: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="开场、发展、转折、收束" /></div></div><label className="dismantle-outline-field"><strong>章节细纲（可人工修改）</strong><textarea value={activeDismantleChapter.detailedOutline} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, detailedOutline: event.target.value, status: event.target.value.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="选择章节后点击生成章纲" /></label><details className="dismantle-source-details"><summary>查看原文（只读）</summary><pre>{activeDismantleChapter.sourceContent}</pre></details><label className="dismantle-outline-field"><strong>原创改写稿（确认前可编辑）</strong><textarea value={activeDismantleChapter.rewriteContent} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, rewriteContent: event.target.value, status: event.target.value.trim() ? 'rewritten' : item.detailedOutline.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="AI 生成后可人工修改，确认后生成到目标小说" /></label><div className="dismantle-rewrite-footer"><input className="input" value={dismantleRewriteInstruction} onChange={event => setDismantleRewriteInstruction(event.target.value)} placeholder="原创改写要求（可选）" />{activeDismantleBook.boundProjectId && <button className="btn-primary" onClick={() => void generateDismantleChapter()}>确认并生成目标章节</button>}</div></article>}
+                </div>
+              </section>}
+            </div>}
+          </div>
+        )}
 
       </main>
 
@@ -3368,6 +4749,25 @@ function App() {
             <span>{notice.content}</span>
           </div>
           <button className="app-notice-close" aria-label="关闭提示" onClick={() => setNotice(null)}>×</button>
+        </div>
+      )}
+      {showNewSkillModal && (
+        <div className="modal-overlay" onClick={() => setShowNewSkillModal(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="skill-modal-title">{skillEditingId === null ? '新建技能' : '编辑技能'}</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowNewSkillModal(false)}>×</button>
+            </div>
+            <div className="modal-body">
+              <div className="form-group"><label>技能名称 *</label><input type="text" className="input" placeholder="例如：场景切换" value={newSkill.name} onChange={(event) => setNewSkill({ ...newSkill, name: event.target.value })} /></div>
+              <div className="form-group"><label>分类</label><select className="select" value={newSkill.category} onChange={(event) => setNewSkill({ ...newSkill, category: event.target.value })}><option value="setup">项目设置</option><option value="write">写作</option><option value="review">审查</option><option value="polish">润色</option><option value="import">导入</option><option value="analyze">分析</option><option value="tool">工具</option><option value="creator">创建器</option></select></div>
+              <div className="form-group"><label>简短描述</label><input type="text" className="input" placeholder="一句话描述这个技能" value={newSkill.description} onChange={(event) => setNewSkill({ ...newSkill, description: event.target.value })} /></div>
+              <div className="form-group"><label>详细内容 *</label><textarea className="textarea" rows={6} placeholder="详细说明如何使用这个技能..." value={newSkill.content} onChange={(event) => setNewSkill({ ...newSkill, content: event.target.value })} /></div>
+              <div className="form-group"><label>标签（逗号分隔）</label><input type="text" className="input" placeholder="场景,过渡,技巧" value={newSkill.tags} onChange={(event) => setNewSkill({ ...newSkill, tags: event.target.value })} /></div>
+              <div className="skill-creator-actions"><button className="btn-secondary" onClick={generateSkillWithAI} disabled={skillGenerating}>{skillGenerating ? '生成中...' : 'AI 生成技能草稿'}</button><span>可先填写一句需求，再由 skill-creator 补全步骤和输出格式。</span></div>
+            </div>
+            <div className="modal-footer"><button className="btn-secondary" onClick={() => setShowNewSkillModal(false)}>取消</button><button className="btn-primary" onClick={handleCreateSkill}>{skillEditingId === null ? '创建' : '保存修改'}</button></div>
+          </div>
         </div>
       )}
       </>

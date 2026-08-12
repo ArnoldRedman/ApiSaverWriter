@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
@@ -43,16 +43,56 @@ struct AgentRuntimeState {
     process: Arc<Mutex<Option<AgentRuntimeProcess>>>,
 }
 
+fn node_executable() -> Result<PathBuf, String> {
+    let mut candidates = Vec::new();
+    if let Some(path) = bundled_agent_resource("node") {
+        candidates.push(path);
+    }
+    if let Some(path) = bundled_agent_resource("node.exe") {
+        candidates.push(path);
+    }
+    if let Ok(value) = std::env::var("APISAVERWRITER_NODE") {
+        if !value.trim().is_empty() {
+            candidates.push(PathBuf::from(value));
+        }
+    }
+    // Finder/launched applications do not inherit a shell's PATH, so probe the
+    // common per-user Node locations before relying on the bare command name.
+    if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        candidates.push(home.join(".local/bin/node"));
+        candidates.push(home.join(".volta/bin/node"));
+        candidates.push(home.join(".fnm/current/bin/node"));
+        if let Ok(entries) = fs::read_dir(home.join(".nvm/versions/node")) {
+            let mut versions = entries.filter_map(Result::ok).map(|entry| entry.path()).collect::<Vec<_>>();
+            versions.sort();
+            versions.reverse();
+            candidates.extend(versions.into_iter().map(|version| version.join("bin/node")));
+        }
+    }
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/node"),
+        PathBuf::from("/usr/local/bin/node"),
+        PathBuf::from("node"),
+    ]);
+
+    let mut attempted = Vec::new();
+    let mut seen = HashSet::new();
+    for candidate in candidates {
+        let key = candidate.to_string_lossy().to_string();
+        if !seen.insert(key.clone()) { continue; }
+        attempted.push(key);
+        if Command::new(&candidate).arg("--version").output().map(|output| output.status.success()).unwrap_or(false) {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("找不到可用的 Node.js 运行时（已检查 {}）。可设置 APISAVERWRITER_NODE 指向 node 可执行文件。", attempted.join("、")))
+}
+
 fn spawn_agent_runtime() -> Result<AgentRuntimeProcess, String> {
     let script = agent_runtime_script()?;
-    let output = Command::new("node")
-        .arg("--version")
-        .output()
-        .map_err(|error| format!("启动 Agent 需要 Node.js: {error}"))?;
-    if !output.status.success() {
-        return Err("当前设备没有可用的 Node.js 运行时".to_string());
-    }
-    let mut child = Command::new("node")
+    let node = node_executable()?;
+    let mut child = Command::new(&node)
         .arg(&script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -89,46 +129,46 @@ fn start_agent_runtime(state: State<'_, AgentRuntimeState>) -> Result<String, St
 #[tauri::command]
 fn call_agent_rpc_blocking(app: tauri::AppHandle, process: Arc<Mutex<Option<AgentRuntimeProcess>>>, method: String, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let mut runtime = process.lock().map_err(|_| "Agent runtime 状态锁定失败".to_string())?;
-    let needs_spawn = runtime.as_mut().map(|process| process.child.try_wait().map(|status| status.is_some()).unwrap_or(true)).unwrap_or(true);
-    if needs_spawn {
-        if let Some(mut old) = runtime.take() { let _ = old.child.kill(); }
-        *runtime = Some(spawn_agent_runtime()?);
-    }
-    let process = runtime.as_mut().ok_or_else(|| "Agent runtime 未启动".to_string())?;
     let request = serde_json::json!({ "id": 1, "method": method, "params": params });
-    process.stdin.write_all(format!("{}\n", request).as_bytes()).map_err(|error| format!("发送 Agent 请求失败: {error}"))?;
-    process.stdin.flush().map_err(|error| format!("刷新 Agent 请求失败: {error}"))?;
-    let mut response: Option<Value> = None;
-    for line in process.stdout.by_ref().lines() {
-        let line = line.map_err(|error| format!("读取 Agent 进度失败: {error}"))?;
-        if line.trim().is_empty() {
-            continue;
+    for attempt in 0..2 {
+        let needs_spawn = runtime.as_mut().map(|process| process.child.try_wait().map(|status| status.is_some()).unwrap_or(true)).unwrap_or(true);
+        if needs_spawn {
+            if let Some(mut old) = runtime.take() { let _ = old.child.kill(); }
+            *runtime = Some(spawn_agent_runtime()?);
         }
-        let payload: Value = serde_json::from_str(&line)
-            .map_err(|error| format!("解析 Agent 输出失败: {error}"))?;
-        if payload.get("type").and_then(Value::as_str) == Some("agent_stream") {
-            if let Some(event) = payload.get("event") {
-                let mut event = event.clone();
-                if let Some(run_id) = payload.get("runId") {
-                    event["runId"] = run_id.clone();
+        let active = runtime.as_mut().ok_or_else(|| "Agent runtime 未启动".to_string())?;
+        if let Err(error) = active.stdin.write_all(format!("{}\n", request).as_bytes()).and_then(|_| active.stdin.flush()) {
+            let _ = active.child.kill();
+            if attempt == 0 { continue; }
+            return Err(format!("发送 Agent 请求失败: {error}"));
+        }
+        let mut response: Option<Value> = None;
+        for line in active.stdout.by_ref().lines() {
+            let line = line.map_err(|error| format!("读取 Agent 进度失败: {error}"))?;
+            if line.trim().is_empty() { continue; }
+            let payload: Value = serde_json::from_str(&line)
+                .map_err(|error| format!("解析 Agent 输出失败: {error}"))?;
+            if payload.get("type").and_then(Value::as_str) == Some("agent_stream") {
+                if let Some(event) = payload.get("event") {
+                    let mut event = event.clone();
+                    if let Some(run_id) = payload.get("runId") { event["runId"] = run_id.clone(); }
+                    app.emit("agent-progress", event)
+                        .map_err(|error| format!("发送 Agent 进度失败: {error}"))?;
                 }
-                app.emit("agent-progress", event)
-                    .map_err(|error| format!("发送 Agent 进度失败: {error}"))?;
+                continue;
             }
-            continue;
+            response = Some(payload);
+            break;
         }
-        response = Some(payload);
-        break;
+        if let Some(response) = response {
+            if let Some(error) = response.get("error") {
+                return Err(error.get("message").and_then(Value::as_str).unwrap_or("Agent 执行失败").to_string());
+            }
+            return Ok(response.get("result").cloned().unwrap_or(response));
+        }
+        if let Some(mut old) = runtime.take() { let _ = old.child.kill(); }
     }
-    let response = response.ok_or_else(|| "Agent 没有返回结果".to_string())?;
-    if let Some(error) = response.get("error") {
-        return Err(error
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("Agent 执行失败")
-            .to_string());
-    }
-    Ok(response.get("result").cloned().unwrap_or(response))
+    Err("Agent 重启后仍未返回结果，请检查网络设置".to_string())
 }
 
 #[tauri::command]
@@ -185,15 +225,36 @@ fn publish_fanqie(app: tauri::AppHandle, payload: Value) -> Result<Value, String
 }
 
 fn agent_runtime_script() -> Result<PathBuf, String> {
-    let candidates = [
+    let mut candidates = Vec::new();
+    if let Some(path) = bundled_agent_resource("main.cjs") {
+        candidates.push(path);
+    }
+    candidates.extend([
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../sidecars/agent-runtime/dist/main.js"),
         PathBuf::from("../sidecars/agent-runtime/dist/main.js"),
         PathBuf::from("sidecars/agent-runtime/dist/main.js"),
-    ];
+    ]);
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            // macOS bundle: Contents/MacOS/<binary> -> Contents/Resources/agent-runtime/main.js
+            candidates.push(directory.join("../Resources/agent-runtime/main.cjs"));
+            candidates.push(directory.join("agent-runtime/main.cjs"));
+        }
+    }
     candidates
         .into_iter()
-        .find(|path| path.exists())
+        .find(|path| Path::new(path).exists())
         .ok_or_else(|| "找不到 Agent runtime，请先构建 sidecars/agent-runtime".to_string())
+}
+
+fn bundled_agent_resource(name: &str) -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let candidates = [
+        directory.join("../Resources/agent-runtime").join(name),
+        directory.join("agent-runtime").join(name),
+    ];
+    candidates.into_iter().find(|path| path.exists())
 }
 
 fn app_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -315,6 +376,19 @@ fn load_projects(app: tauri::AppHandle) -> Result<Option<Value>, String> {
                     }
                 }
             }
+            // 图谱节点的详细档案以 Markdown 作为事实来源；metadata 仅保留索引字段。
+            if let Some(nodes) = project.get_mut("graphNodes").and_then(Value::as_array_mut) {
+                for node in nodes {
+                    let relative_path = node.get("sourcePath").and_then(Value::as_str)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| graph_node_relative_path(node));
+                    let path = project_dir.join(&relative_path);
+                    if let Ok(content) = fs::read_to_string(&path) {
+                        node["content"] = Value::String(graph_node_profile_from_markdown(&content));
+                    }
+                    node["sourcePath"] = Value::String(relative_path.to_string_lossy().into_owned());
+                }
+            }
             projects.push(project);
         }
 
@@ -386,10 +460,12 @@ fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, Strin
         let outline_dir = project_dir.join("大纲");
         let cards_dir = project_dir.join("卡片");
         let memories_dir = project_dir.join("记忆");
+        let graph_dir = project_dir.join("图谱");
         fs::create_dir_all(&chapters_dir).map_err(|error| format!("创建章节目录失败: {error}"))?;
         fs::create_dir_all(&outline_dir).map_err(|error| format!("创建大纲目录失败: {error}"))?;
         fs::create_dir_all(&cards_dir).map_err(|error| format!("创建卡片目录失败: {error}"))?;
         fs::create_dir_all(&memories_dir).map_err(|error| format!("创建记忆目录失败: {error}"))?;
+        fs::create_dir_all(&graph_dir).map_err(|error| format!("创建图谱目录失败: {error}"))?;
         if let Ok(entries) = fs::read_dir(&chapters_dir) {
             for entry in entries.filter_map(Result::ok).filter(|entry| {
                 entry.path().extension().and_then(|value| value.to_str()) == Some("md")
@@ -522,6 +598,21 @@ fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, Strin
                 .map_err(|error| format!("保存聚合记忆 Markdown 失败: {error}"))?;
             }
         }
+        let graph_edges = project.get("graphEdges").and_then(Value::as_array).cloned().unwrap_or_default();
+        let graph_node_snapshots = project.get("graphNodes").and_then(Value::as_array).cloned().unwrap_or_default();
+        if let Some(nodes) = metadata.get_mut("graphNodes").and_then(Value::as_array_mut) {
+            for node in nodes.iter_mut() {
+                let relative_path = graph_node_relative_path(node);
+                let path = project_dir.join(&relative_path);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| format!("创建图谱档案目录失败: {error}"))?;
+                }
+                fs::write(&path, graph_node_to_markdown(node, &graph_node_snapshots, &graph_edges))
+                    .map_err(|error| format!("保存图谱档案 Markdown 失败: {error}"))?;
+                node["sourcePath"] = Value::String(relative_path.to_string_lossy().into_owned());
+                node["content"] = Value::String(String::new());
+            }
+        }
 
         let metadata_content = serde_json::to_vec_pretty(&metadata)
             .map_err(|error| format!("序列化小说元数据失败: {error}"))?;
@@ -532,6 +623,389 @@ fn save_projects(app: tauri::AppHandle, projects: Value) -> Result<String, Strin
     let legacy_path = app_data.join("projects.json");
     if legacy_path.exists() {
         let _ = fs::remove_file(legacy_path);
+    }
+    Ok(root.to_string_lossy().into_owned())
+}
+
+fn dismantle_chapter_stem(chapter: &Value, index: usize) -> String {
+    let number = chapter.get("number").and_then(Value::as_u64).unwrap_or((index + 1) as u64);
+    let title = chapter.get("title").and_then(Value::as_str).unwrap_or("未命名章节");
+    format!("{number:03}-{}", safe_file_name(title))
+}
+
+#[tauri::command]
+fn load_dismantle_books(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    let root = app_data_directory(&app)?.join("dismantles");
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut books = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&root)
+        .map_err(|error| format!("读取拆书目录失败: {error}"))?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        let directory = entry.path();
+        let metadata_path = directory.join("metadata.json");
+        if !metadata_path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&metadata_path)
+            .map_err(|error| format!("读取拆书元数据失败: {error}"))?;
+        let mut book: Value = serde_json::from_str(&content)
+            .map_err(|error| format!("拆书元数据格式错误: {error}"))?;
+        if let Some(chapters) = book.get_mut("chapters").and_then(Value::as_array_mut) {
+            for (index, chapter) in chapters.iter_mut().enumerate() {
+                let stem = dismantle_chapter_stem(chapter, index);
+                let source_path = chapter.get("sourcePath").and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("原文").join(format!("{stem}.txt")));
+                let outline_path = chapter.get("outlinePath").and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("章纲").join(format!("{stem}.md")));
+                let rewrite_path = chapter.get("rewritePath").and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("原创改写").join(format!("{stem}.md")));
+                if let Ok(source) = fs::read_to_string(directory.join(&source_path)) {
+                    chapter["sourceContent"] = Value::String(source);
+                }
+                if let Ok(outline) = fs::read_to_string(directory.join(&outline_path)) {
+                    chapter["detailedOutline"] = Value::String(outline);
+                }
+                if let Ok(rewrite) = fs::read_to_string(directory.join(&rewrite_path)) {
+                    chapter["rewriteContent"] = Value::String(rewrite);
+                }
+                chapter["sourcePath"] = Value::String(source_path.to_string_lossy().into_owned());
+                chapter["outlinePath"] = Value::String(outline_path.to_string_lossy().into_owned());
+                chapter["rewritePath"] = Value::String(rewrite_path.to_string_lossy().into_owned());
+            }
+        }
+        books.push(book);
+    }
+    Ok(Some(Value::Array(books)))
+}
+
+#[tauri::command]
+fn save_dismantle_books(app: tauri::AppHandle, books: Value) -> Result<String, String> {
+    let root = app_data_directory(&app)?.join("dismantles");
+    fs::create_dir_all(&root).map_err(|error| format!("创建拆书目录失败: {error}"))?;
+    let books = books.as_array().ok_or_else(|| "拆书数据必须是数组".to_string())?;
+    let mut used_directory_names = HashSet::new();
+    let mut current_directory_names = HashSet::new();
+
+    for book in books {
+        let id = book.get("id").and_then(Value::as_str).unwrap_or("book");
+        let title = book.get("title").and_then(Value::as_str).unwrap_or("未命名拆书");
+        let mut name = safe_folder_name(title);
+        if !used_directory_names.insert(name.clone()) {
+            name = format!("{name}-{id}");
+            used_directory_names.insert(name.clone());
+        }
+        current_directory_names.insert(name.clone());
+        let directory = root.join(name);
+        let source_dir = directory.join("原文");
+        let outline_dir = directory.join("章纲");
+        let rewrite_dir = directory.join("原创改写");
+        fs::create_dir_all(&source_dir).map_err(|error| format!("创建拆书原文目录失败: {error}"))?;
+        fs::create_dir_all(&outline_dir).map_err(|error| format!("创建拆书章纲目录失败: {error}"))?;
+        fs::create_dir_all(&rewrite_dir).map_err(|error| format!("创建原创改写目录失败: {error}"))?;
+
+        let mut metadata = book.clone();
+        if let Some(chapters) = metadata.get_mut("chapters").and_then(Value::as_array_mut) {
+            for (index, chapter) in chapters.iter_mut().enumerate() {
+                let stem = dismantle_chapter_stem(chapter, index);
+                let source = chapter.get("sourceContent").and_then(Value::as_str).unwrap_or("");
+                let outline = chapter.get("detailedOutline").and_then(Value::as_str).unwrap_or("");
+                let rewrite = chapter.get("rewriteContent").and_then(Value::as_str).unwrap_or("");
+                let source_path = PathBuf::from("原文").join(format!("{stem}.txt"));
+                let outline_path = PathBuf::from("章纲").join(format!("{stem}.md"));
+                let rewrite_path = PathBuf::from("原创改写").join(format!("{stem}.md"));
+                fs::write(directory.join(&source_path), source)
+                    .map_err(|error| format!("保存拆书原文失败: {error}"))?;
+                if !outline.trim().is_empty() {
+                    fs::write(directory.join(&outline_path), outline)
+                        .map_err(|error| format!("保存拆书章纲失败: {error}"))?;
+                }
+                if !rewrite.trim().is_empty() {
+                    fs::write(directory.join(&rewrite_path), rewrite)
+                        .map_err(|error| format!("保存原创改写稿失败: {error}"))?;
+                }
+                chapter["sourcePath"] = Value::String(source_path.to_string_lossy().into_owned());
+                chapter["outlinePath"] = Value::String(outline_path.to_string_lossy().into_owned());
+                chapter["rewritePath"] = Value::String(rewrite_path.to_string_lossy().into_owned());
+                chapter["sourceContent"] = Value::String(String::new());
+                chapter["detailedOutline"] = Value::String(String::new());
+                chapter["rewriteContent"] = Value::String(String::new());
+            }
+        }
+        fs::write(
+            directory.join("metadata.json"),
+            serde_json::to_vec_pretty(&metadata).map_err(|error| format!("序列化拆书元数据失败: {error}"))?,
+        ).map_err(|error| format!("保存拆书元数据失败: {error}"))?;
+    }
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_dir()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !current_directory_names.contains(&name) {
+                fs::remove_dir_all(entry.path()).map_err(|error| format!("清理已删除拆书失败: {error}"))?;
+            }
+        }
+    }
+    Ok(root.to_string_lossy().into_owned())
+}
+
+fn library_chapter_stem(chapter: &Value, index: usize) -> String {
+    let number = chapter.get("number").and_then(Value::as_u64).unwrap_or((index + 1) as u64);
+    let title = chapter.get("title").and_then(Value::as_str).unwrap_or("未命名章节");
+    format!("{number:03}-{}", safe_file_name(title))
+}
+
+#[tauri::command]
+fn load_library_books(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    let root = app_data_directory(&app)?.join("books");
+    if !root.exists() { return Ok(None); }
+    let mut books = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&root).map_err(|error| format!("读取书籍目录失败: {error}"))?
+        .filter_map(Result::ok).filter(|entry| entry.path().is_dir()).collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let directory = entry.path();
+        let metadata_path = directory.join("metadata.json");
+        if !metadata_path.exists() { continue; }
+        let content = fs::read_to_string(&metadata_path).map_err(|error| format!("读取书籍元数据失败: {error}"))?;
+        let mut book: Value = serde_json::from_str(&content).map_err(|error| format!("书籍元数据格式错误: {error}"))?;
+        if let Some(chapters) = book.get_mut("chapters").and_then(Value::as_array_mut) {
+            for (index, chapter) in chapters.iter_mut().enumerate() {
+                let relative = chapter.get("sourcePath").and_then(Value::as_str).map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("章节").join(format!("{}.md", library_chapter_stem(chapter, index))));
+                if let Ok(text) = fs::read_to_string(directory.join(&relative)) {
+                    let has_content = !text.trim().is_empty();
+                    let was_downloaded = chapter.get("downloaded").and_then(Value::as_bool).unwrap_or(has_content);
+                    let incomplete = chapter.get("unavailableReason").and_then(Value::as_str).is_some_and(|reason| !reason.trim().is_empty());
+                    chapter["content"] = Value::String(text);
+                    chapter["downloaded"] = Value::Bool(has_content && was_downloaded && !incomplete);
+                }
+                chapter["sourcePath"] = Value::String(relative.to_string_lossy().into_owned());
+            }
+        }
+        book["localPath"] = Value::String(directory.to_string_lossy().into_owned());
+        books.push(book);
+    }
+    Ok(Some(Value::Array(books)))
+}
+
+#[tauri::command]
+fn save_library_books(app: tauri::AppHandle, books: Value) -> Result<String, String> {
+    let root = app_data_directory(&app)?.join("books");
+    fs::create_dir_all(&root).map_err(|error| format!("创建书籍目录失败: {error}"))?;
+    let books = books.as_array().ok_or_else(|| "书籍数据必须是数组".to_string())?;
+    let mut active = HashSet::new();
+    for book in books {
+        let id = book.get("id").and_then(Value::as_str).unwrap_or("book");
+        let title = book.get("title").and_then(Value::as_str).unwrap_or("未命名书籍");
+        let directory = root.join(format!("{}-{}", safe_folder_name(title), safe_file_name(id)));
+        active.insert(directory.file_name().unwrap_or_default().to_string_lossy().into_owned());
+        let chapter_dir = directory.join("章节");
+        fs::create_dir_all(&chapter_dir).map_err(|error| format!("创建书籍章节目录失败: {error}"))?;
+        let mut metadata = book.clone();
+        if let Some(chapters) = metadata.get_mut("chapters").and_then(Value::as_array_mut) {
+            let mut combined = String::new();
+            for (index, chapter) in chapters.iter_mut().enumerate() {
+                let relative = PathBuf::from("章节").join(format!("{}.md", library_chapter_stem(chapter, index)));
+                let content = chapter.get("content").and_then(Value::as_str).unwrap_or("");
+                fs::write(directory.join(&relative), content).map_err(|error| format!("保存书籍章节失败: {error}"))?;
+                if !content.trim().is_empty() {
+                    if !combined.is_empty() { combined.push_str("\n\n"); }
+                    combined.push_str(chapter.get("title").and_then(Value::as_str).unwrap_or("未命名章节"));
+                    combined.push('\n');
+                    combined.push_str(content);
+                }
+                chapter["sourcePath"] = Value::String(relative.to_string_lossy().into_owned());
+                chapter["content"] = Value::String(String::new());
+            }
+            fs::write(directory.join(format!("{}.txt", safe_file_name(title))), combined)
+                .map_err(|error| format!("保存书籍 TXT 失败: {error}"))?;
+        }
+        metadata["localPath"] = Value::String(directory.to_string_lossy().into_owned());
+        fs::write(directory.join("metadata.json"), serde_json::to_vec_pretty(&metadata).map_err(|error| format!("序列化书籍元数据失败: {error}"))?)
+            .map_err(|error| format!("保存书籍元数据失败: {error}"))?;
+    }
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_dir()) {
+            if !active.contains(&entry.file_name().to_string_lossy().into_owned()) {
+                fs::remove_dir_all(entry.path()).map_err(|error| format!("清理已删除书籍失败: {error}"))?;
+            }
+        }
+    }
+    Ok(root.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn delete_library_book(app: tauri::AppHandle, book_id: String, book_title: String) -> Result<String, String> {
+    let root = app_data_directory(&app)?.join("books");
+    if !root.exists() { return Ok(root.to_string_lossy().into_owned()); }
+    let preferred = root.join(format!("{}-{}", safe_folder_name(&book_title), safe_file_name(&book_id)));
+    let directory = if preferred.exists() { Some(preferred) } else {
+        fs::read_dir(&root).ok().and_then(|entries| entries.filter_map(Result::ok).find(|entry| {
+            if !entry.path().is_dir() { return false; }
+            let metadata = fs::read_to_string(entry.path().join("metadata.json")).ok();
+            metadata.and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                .and_then(|value| value.get("id").and_then(Value::as_str).map(|id| id == book_id))
+                .unwrap_or(false)
+        }).map(|entry| entry.path()))
+    };
+    if let Some(directory) = directory {
+        fs::remove_dir_all(&directory).map_err(|error| format!("删除书籍目录失败: {error}"))?;
+        return Ok(directory.to_string_lossy().into_owned());
+    }
+    Ok(root.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn load_ranking_books(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    let path = app_data_directory(&app)?.join("rankings").join("metadata.json");
+    if !path.exists() { return Ok(None); }
+    let content = fs::read_to_string(path).map_err(|error| format!("读取榜单缓存失败: {error}"))?;
+    serde_json::from_str(&content).map(Some).map_err(|error| format!("榜单缓存格式错误: {error}"))
+}
+
+#[tauri::command]
+fn save_ranking_books(app: tauri::AppHandle, books: Value) -> Result<String, String> {
+    let directory = app_data_directory(&app)?.join("rankings");
+    fs::create_dir_all(&directory).map_err(|error| format!("创建榜单目录失败: {error}"))?;
+    fs::write(directory.join("metadata.json"), serde_json::to_vec_pretty(&books).map_err(|error| format!("序列化榜单缓存失败: {error}"))?)
+        .map_err(|error| format!("保存榜单缓存失败: {error}"))?;
+    Ok(directory.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_library_book_location(app: tauri::AppHandle, book_id: String, book_title: String) -> Result<String, String> {
+    let root = app_data_directory(&app)?.join("books");
+    let preferred = root.join(format!("{}-{}", safe_folder_name(&book_title), safe_file_name(&book_id)));
+    let directory = if preferred.exists() { preferred } else {
+        fs::read_dir(&root).ok().and_then(|entries| entries.filter_map(Result::ok).find(|entry| entry.path().is_dir() && entry.file_name().to_string_lossy().contains(&safe_file_name(&book_id))).map(|entry| entry.path())).unwrap_or(preferred)
+    };
+    if !directory.exists() { return Err("书籍尚未保存到本地".to_string()); }
+    #[cfg(target_os = "macos")]
+    Command::new("open").arg(&directory).status().map_err(|error| format!("打开书籍位置失败: {error}"))?;
+    #[cfg(target_os = "windows")]
+    Command::new("explorer").arg(&directory).status().map_err(|error| format!("打开书籍位置失败: {error}"))?;
+    #[cfg(target_os = "linux")]
+    Command::new("xdg-open").arg(&directory).status().map_err(|error| format!("打开书籍位置失败: {error}"))?;
+    Ok(directory.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn load_writing_styles(app: tauri::AppHandle) -> Result<Option<Value>, String> {
+    let directory = app_data_directory(&app)?.join("styles");
+    let metadata_path = directory.join("metadata.json");
+    if !metadata_path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&metadata_path).map_err(|error| format!("读取文风索引失败: {error}"))?;
+    let mut styles: Value = serde_json::from_str(&content).map_err(|error| format!("文风索引格式错误: {error}"))?;
+    if let Some(items) = styles.as_array_mut() {
+        for style in items {
+            let source_path = style.get("sourcePath").and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(format!("{}.md", safe_file_name(style.get("name").and_then(Value::as_str).unwrap_or("未命名文风")))));
+            if let Ok(markdown) = fs::read_to_string(directory.join(&source_path)) {
+                style["content"] = Value::String(markdown);
+            }
+            style["sourcePath"] = Value::String(source_path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(Some(styles))
+}
+
+#[tauri::command]
+fn save_writing_styles(app: tauri::AppHandle, styles: Value) -> Result<String, String> {
+    let directory = app_data_directory(&app)?.join("styles");
+    fs::create_dir_all(&directory).map_err(|error| format!("创建文风目录失败: {error}"))?;
+    let styles = styles.as_array().ok_or_else(|| "文风数据必须是数组".to_string())?;
+    let mut metadata = styles.clone();
+    let mut current_files = HashSet::from(["metadata.json".to_string()]);
+    for style in metadata.iter_mut() {
+        let id = style.get("id").and_then(Value::as_str).unwrap_or("style");
+        let name = style.get("name").and_then(Value::as_str).unwrap_or("未命名文风");
+        let content = style.get("content").and_then(Value::as_str).unwrap_or("");
+        let source_path = PathBuf::from(format!("{}-{}.md", safe_file_name(name), safe_file_name(id)));
+        current_files.insert(source_path.to_string_lossy().into_owned());
+        fs::write(directory.join(&source_path), content).map_err(|error| format!("保存文风 Markdown 失败: {error}"))?;
+        style["sourcePath"] = Value::String(source_path.to_string_lossy().into_owned());
+        style["content"] = Value::String(String::new());
+    }
+    fs::write(
+        directory.join("metadata.json"),
+        serde_json::to_vec_pretty(&metadata).map_err(|error| format!("序列化文风索引失败: {error}"))?,
+    ).map_err(|error| format!("保存文风索引失败: {error}"))?;
+    if let Ok(entries) = fs::read_dir(&directory) {
+        for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_file()) {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !current_files.contains(&name) {
+                fs::remove_file(entry.path()).map_err(|error| format!("清理已删除文风失败: {error}"))?;
+            }
+        }
+    }
+    Ok(directory.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_dismantle_location(app: tauri::AppHandle, book_title: String) -> Result<String, String> {
+    let root = app_data_directory(&app)?.join("dismantles");
+    let mut directory = root.join(safe_folder_name(&book_title));
+    if !directory.exists() {
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_dir()) {
+                let metadata_path = entry.path().join("metadata.json");
+                let matches = fs::read_to_string(metadata_path).ok()
+                    .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                    .and_then(|value| value.get("title").and_then(Value::as_str).map(|title| title == book_title))
+                    .unwrap_or(false);
+                if matches {
+                    directory = entry.path();
+                    break;
+                }
+            }
+        }
+    }
+    if !directory.exists() {
+        return Err("拆书资料尚未保存，请稍后再试".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    Command::new("open").arg(&directory).status().map_err(|error| format!("打开拆书位置失败: {error}"))?;
+    #[cfg(target_os = "windows")]
+    Command::new("explorer").arg(&directory).status().map_err(|error| format!("打开拆书位置失败: {error}"))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    Command::new("xdg-open").arg(&directory).status().map_err(|error| format!("打开拆书位置失败: {error}"))?;
+    Ok(directory.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn delete_dismantle_book(app: tauri::AppHandle, book_id: String, book_title: String) -> Result<String, String> {
+    let root = app_data_directory(&app)?.join("dismantles");
+    if !root.exists() { return Ok(root.to_string_lossy().into_owned()); }
+    let mut directory = None;
+    if let Ok(entries) = fs::read_dir(&root) {
+        for entry in entries.filter_map(Result::ok).filter(|entry| entry.path().is_dir()) {
+            let metadata = fs::read_to_string(entry.path().join("metadata.json")).ok();
+            let matches = metadata.and_then(|content| serde_json::from_str::<Value>(&content).ok())
+                .map(|value| {
+                    value.get("id").and_then(Value::as_str).map(|id| id == book_id).unwrap_or(false)
+                        || value.get("title").and_then(Value::as_str).map(|title| title == book_title).unwrap_or(false)
+                }).unwrap_or(false);
+            if matches {
+                directory = Some(entry.path());
+                break;
+            }
+        }
+    }
+    if let Some(directory) = directory {
+        fs::remove_dir_all(&directory).map_err(|error| format!("删除拆书目录失败: {error}"))?;
+        return Ok(directory.to_string_lossy().into_owned());
     }
     Ok(root.to_string_lossy().into_owned())
 }
@@ -656,6 +1130,106 @@ fn open_card_location(
     }
     reveal_location(&path)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn open_graph_node_location(
+    app: tauri::AppHandle,
+    project_id: i64,
+    node_id: String,
+) -> Result<String, String> {
+    let project_dir = find_project_directory(&app, project_id)?;
+    let metadata: Value = serde_json::from_str(&fs::read_to_string(project_dir.join("metadata.json"))
+        .map_err(|error| format!("读取图谱索引失败: {error}"))?)
+        .map_err(|error| format!("图谱索引格式错误: {error}"))?;
+    let node = metadata.get("graphNodes").and_then(Value::as_array)
+        .and_then(|nodes| nodes.iter().find(|node| node.get("id").and_then(Value::as_str) == Some(node_id.as_str())))
+        .ok_or_else(|| "找不到图谱节点档案".to_string())?;
+    let relative_path = node.get("sourcePath").and_then(Value::as_str)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| graph_node_relative_path(node));
+    let path = project_dir.join(relative_path);
+    if !path.exists() {
+        return Err("图谱档案尚未保存，请稍后再试".to_string());
+    }
+    reveal_location(&path)?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn graph_node_folder(node: &Value) -> &'static str {
+    let node_type = node.get("type").and_then(Value::as_str).unwrap_or("entity");
+    let category = node.get("category").and_then(Value::as_str).unwrap_or("");
+    match node_type {
+        "chapter" => "章节事件",
+        "outline" => "大纲设定",
+        "card" if category.contains("角色") || category.contains("人物") => "重要角色",
+        "card" if category.contains("地点") => "地点与场景",
+        "card" if category.contains("势力") => "组织与势力",
+        "card" => "物品与设定",
+        "entity" if category.contains("人物") || category.contains("角色") => "重要角色",
+        "entity" if category.contains("地点") || category.contains("场景") => "地点与场景",
+        "entity" if category.contains("势力") || category.contains("组织") => "组织与势力",
+        "entity" if category.contains("物品") || category.contains("金手指") => "物品与设定",
+        _ => "其他实体",
+    }
+}
+
+fn graph_node_type_label(node: &Value) -> String {
+    let node_type = node.get("type").and_then(Value::as_str).unwrap_or("entity");
+    let category = node.get("category").and_then(Value::as_str).unwrap_or("");
+    match node_type {
+        "chapter" => "章节".to_string(),
+        "outline" => "大纲".to_string(),
+        "card" => if category.is_empty() { "知识卡".to_string() } else { category.to_string() },
+        _ => if category.is_empty() { "实体".to_string() } else { category.to_string() },
+    }
+}
+
+fn graph_node_relative_path(node: &Value) -> PathBuf {
+    let title = node.get("label").and_then(Value::as_str).unwrap_or("未命名节点");
+    PathBuf::from("图谱")
+        .join(graph_node_folder(node))
+        .join(format!("{}.md", safe_file_name(title)))
+}
+
+fn graph_node_profile_from_markdown(content: &str) -> String {
+    let marker = "\n## 档案内容\n";
+    let Some((_, after)) = content.split_once(marker) else { return content.trim().to_string(); };
+    after.split("\n## 关系网络\n").next().unwrap_or(after).trim().to_string()
+}
+
+fn graph_edge_default_weight(label: &str) -> f64 {
+    match label {
+        "本章引用" => 1.0,
+        "状态更新" => 0.95,
+        "章节主角" => 0.92,
+        "状态引用" => 0.88,
+        "正文提及" => 0.75,
+        "章节提及" => 0.70,
+        _ => 0.65,
+    }
+}
+
+fn graph_node_to_markdown(node: &Value, nodes: &[Value], edges: &[Value]) -> String {
+    let id = node.get("id").and_then(Value::as_str).unwrap_or("");
+    let title = node.get("label").and_then(Value::as_str).unwrap_or("未命名节点");
+    let content = node.get("content").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or("待补充。");
+    let status = node.get("status").and_then(Value::as_str).filter(|value| !value.trim().is_empty()).unwrap_or("待补充");
+    let mut relation_lines = Vec::new();
+    for edge in edges {
+        let source = edge.get("source").and_then(Value::as_str).unwrap_or("");
+        let target = edge.get("target").and_then(Value::as_str).unwrap_or("");
+        if source != id && target != id { continue; }
+        let other_id = if source == id { target } else { source };
+        let other_label = nodes.iter().find(|item| item.get("id").and_then(Value::as_str) == Some(other_id))
+            .and_then(|item| item.get("label").and_then(Value::as_str)).unwrap_or(other_id);
+        let relation = edge.get("label").and_then(Value::as_str).unwrap_or("关联");
+        let direction = if source == id { "指向对方" } else { "来自对方" };
+        let weight = edge.get("weight").and_then(Value::as_f64).unwrap_or_else(|| graph_edge_default_weight(relation)).clamp(0.1, 1.0);
+        relation_lines.push(format!("- {other_label}｜{relation}｜{direction}｜权重：{weight:.2}"));
+    }
+    let relation_text = if relation_lines.is_empty() { "- 暂无".to_string() } else { relation_lines.join("\n") };
+    format!("# {title}\n\n<!-- ApiSaverWriter Graph Node: {id} -->\n\n## 基础信息\n- 节点类型：{}\n- 当前状态：{status}\n- 来源路径：{}\n\n## 档案内容\n{content}\n\n## 关系网络\n{relation_text}\n", graph_node_type_label(node), graph_node_relative_path(node).to_string_lossy())
 }
 
 fn safe_folder_name(value: &str) -> String {
@@ -788,6 +1362,46 @@ fn detect_system_proxy() -> Result<Option<String>, String> {
     Ok(None)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn graph_node_document_preserves_profile_and_relationships() {
+        let node = json!({
+            "id": "entity:林舟",
+            "label": "林舟",
+            "type": "entity",
+            "category": "人物",
+            "status": "重伤后恢复中",
+            "content": "## 人物状态\n- 在城南客栈养伤。\n- 对沈砚保持戒备。"
+        });
+        let related = json!({
+            "id": "chapter:3",
+            "label": "第3章 城南夜雨",
+            "type": "chapter"
+        });
+        let edge = json!({
+            "id": "chapter:3->entity:林舟",
+            "source": "chapter:3",
+            "target": "entity:林舟",
+            "label": "章节提及",
+            "weight": 0.7
+        });
+
+        let markdown = graph_node_to_markdown(&node, &[node.clone(), related], &[edge]);
+
+        assert_eq!(graph_node_relative_path(&node), PathBuf::from("图谱/重要角色/林舟.md"));
+        assert!(markdown.contains("- 当前状态：重伤后恢复中"));
+        assert!(markdown.contains("第3章 城南夜雨｜章节提及｜来自对方｜权重：0.70"));
+        assert_eq!(
+            graph_node_profile_from_markdown(&markdown),
+            "## 人物状态\n- 在城南客栈养伤。\n- 对沈砚保持戒备。"
+        );
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AgentRuntimeState::default())
@@ -797,11 +1411,24 @@ fn main() {
             publish_fanqie,
             load_projects,
             save_projects,
+            load_dismantle_books,
+            save_dismantle_books,
+            load_library_books,
+            save_library_books,
+            delete_library_book,
+            load_ranking_books,
+            save_ranking_books,
+            load_writing_styles,
+            save_writing_styles,
             projects_storage_path,
             open_project_location,
+            open_dismantle_location,
+            delete_dismantle_book,
+            open_library_book_location,
             open_chapter_location,
             open_outline_location,
             open_card_location,
+            open_graph_node_location,
             detect_system_proxy
         ])
         .run(tauri::generate_context!())

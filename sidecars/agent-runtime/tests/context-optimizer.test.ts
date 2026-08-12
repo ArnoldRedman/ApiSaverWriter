@@ -24,6 +24,22 @@ describe("context optimizer", () => {
     expect(byteLength(result)).toBeLessThanOrEqual(800);
   });
 
+  it("puts stronger graph relationships ahead of weaker ones in the chapter context", () => {
+    const result = compactKnowledgeGraph({
+      nodes: [
+        { id: "a", label: "沈砚", type: "entity" },
+        { id: "b", label: "锁匙", type: "card" },
+        { id: "c", label: "旧传闻", type: "entity" },
+      ],
+      edges: [
+        { source: "a", target: "c", label: "听说", weight: 0.2 },
+        { source: "a", target: "b", label: "持有", weight: 0.95 },
+      ],
+    }, "沈砚准备使用锁匙", 800);
+    expect(result).toContain("权重 0.95");
+    expect(result.indexOf("持有")).toBeLessThan(result.indexOf("听说"));
+  });
+
   it("uses deterministic hashes and reports source pruning", () => {
     const input = {
       instruction: "继续写沈砚发现旧电台",

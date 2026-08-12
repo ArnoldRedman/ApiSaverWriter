@@ -8,6 +8,7 @@ import { byteLength, compactText, formatContextReport, type ContextReport } from
 
 export interface SkillDefinition {
   name: string;
+  displayName?: string;
   category?: string;
   description?: string;
   tags?: string[];
@@ -40,10 +41,14 @@ const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时
 
 重点检查：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"]}。没有明确问题时 issues 和 suggestions 返回空数组。`;
 
+const chapterPlanSystemPrompt = `你是长篇网络小说主编。先为下一章制作一份短小、可执行的写作计划，不写正文，不输出隐藏思考。
+只依据给定资料，优先处理上一章结尾。返回严格 JSON 对象：{"plan":"Markdown 计划","handoff":"下一章交接"}。
+计划必须包含：承接锚点（人物位置、情绪、未解决事件、道具/线索、时间线、伏笔、章末钩子）、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进、结尾钩子、下一章交接。未知项标为待确认，不能凭空补设定。`;
+
 export function selectSkillsByIntent(instruction: string, catalog: SkillDefinition[]): { intent: string; skills: SkillDefinition[] } {
   const query = instruction.toLowerCase();
   const scored = catalog.map(skill => {
-    const terms = [skill.name, skill.category || "", skill.description || "", ...(skill.tags || [])]
+    const terms = [skill.name, skill.displayName || "", skill.category || "", skill.description || "", ...(skill.tags || [])]
       .join(" ").toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
     let score = terms.reduce((total, term) => total + (term.length > 1 && query.includes(term) ? 2 : 0), 0);
     const categoryTerms: Record<string, string[]> = {
@@ -75,6 +80,7 @@ export const ChapterState = Annotation.Root({
   knowledgeGraph: Annotation<string | undefined>,
   cards: Annotation<Array<{ type?: string; title: string; content: string }> | undefined>,
   skillCatalog: Annotation<SkillDefinition[]>({ reducer: (_prev, next) => next, default: () => [] }),
+  preferredSkillNames: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   selectedSkills: Annotation<string[]>({ reducer: (_prev, next) => next, default: () => [] }),
   recognizedIntent: Annotation<string | undefined>,
   retrievedContext: Annotation<string[]>({
@@ -82,6 +88,7 @@ export const ChapterState = Annotation.Root({
     default: () => [],
   }),
   continuityContext: Annotation<string | undefined>,
+  chapterPlan: Annotation<string | undefined>,
   draftContent: Annotation<string | undefined>,
   summary: Annotation<string | undefined>,
   contextReport: Annotation<ContextReport | undefined>,
@@ -137,15 +144,18 @@ export function createChapterGraph(config: ChapterGraphConfig) {
   const graph = new StateGraph(ChapterState)
     .addNode("intent", async (state: ChapterStateType) => {
       const selection = selectSkillsByIntent(state.instruction, state.skillCatalog);
-      const continuitySkill = state.skillCatalog.find(skill => skill.name === "chapter-continuity");
-      const useContinuity = continuitySkill && selection.intent === intentLabels.write;
-      const selectedSkills = useContinuity
-        ? [continuitySkill, ...selection.skills.filter(skill => skill.name !== continuitySkill.name)]
-        : selection.skills;
-      emitter?.progress("intent", 8, `识别意图：${selection.intent}，自动启用 ${selectedSkills.length} 个技能${useContinuity ? "（含章节承接）" : ""}`);
+      const isWriting = selection.skills.some(skill => skill.category === "write") || /章节|正文|续写|创作|写作/u.test(state.instruction);
+      const mandatoryNames = isWriting
+        ? ["chapter-continuity", "next-chapter-plan"]
+        : [];
+      const mandatory = mandatoryNames.map(name => state.skillCatalog.find(skill => skill.name === name)).filter((skill): skill is SkillDefinition => Boolean(skill));
+      const preferred = state.preferredSkillNames.map(name => state.skillCatalog.find(skill => skill.name === name)).filter((skill): skill is SkillDefinition => Boolean(skill));
+      const selectedSkills = [...mandatory, ...preferred, ...selection.skills].filter((skill, index, list) => list.findIndex(item => item.name === skill.name) === index).slice(0, 6);
+      const preferenceMessage = preferred.length ? `；手动优先：${preferred.map(skill => skill.name).join("、")}` : "";
+      emitter?.progress("intent", 8, `工具 SkillRouter：识别意图“${selection.intent}”；已选技能：${selectedSkills.map(skill => skill.displayName || skill.name).join("、") || "默认写作规则"}${preferenceMessage}`);
       return {
         recognizedIntent: selection.intent,
-        selectedSkills: selectedSkills.slice(0, 3).map(skill => skill.name),
+        selectedSkills: selectedSkills.map(skill => skill.name),
       };
     })
     .addNode("retrieve", async (state: ChapterStateType) => {
@@ -192,7 +202,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const retrievedBytes = byteLength(context.join("\n\n"));
       const contextReport = state.contextReport ? { ...state.contextReport, retrievedBytes } : undefined;
       
-      emitter?.progress("retrieve", 25, `找到 ${context.length} 条相关记忆${contextReport ? `；${formatContextReport(contextReport)}` : ""}`);
+      emitter?.progress("retrieve", 25, `工具 StoryStore.searchHybrid：找到 ${context.length} 条相关记忆${contextReport ? `；${formatContextReport(contextReport)}` : ""}`);
       return { retrievedContext: context, contextReport };
     })
     .addNode("continuity", async (state: ChapterStateType) => {
@@ -207,8 +217,40 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.progress("retrieve", 29, `已锁定${previous.title}结尾，生成阶段将优先承接`);
       return { continuityContext };
     })
+    .addNode("plan", async (state: ChapterStateType) => {
+      emitter?.progress("plan", 30, "工具 ChapterPlanner：正在根据承接清单制作下一章计划");
+      const skillSection = state.skillCatalog
+        .filter(skill => state.selectedSkills.includes(skill.name))
+        .slice(0, 6)
+        .map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, 420)}`)
+        .join("\n\n");
+      const planPrompt = [
+        "## 本章任务\n" + state.instruction,
+        state.outline ? "## 章节细纲\n" + compactText(state.outline, 1800) : "",
+        state.continuityContext ? "## 上一章承接（最高优先级）\n" + compactText(state.continuityContext, 3200) : "",
+        state.retrievedContext.length ? "## 结构化记忆\n" + compactText(state.retrievedContext.join("\n\n"), 2600) : "",
+        state.knowledgeGraph ? "## 相关知识图谱\n" + compactText(state.knowledgeGraph, 1800) : "",
+        skillSection ? "## 执行技能\n" + skillSection : "",
+        "请输出 600 字以内的章节计划，计划是正文生成的硬约束。",
+      ].filter(Boolean).join("\n\n");
+      const response = await client.chat([
+        { role: "system", content: chapterPlanSystemPrompt },
+        { role: "user", content: planPrompt },
+      ], { response_format: { type: "json_object" }, temperature: 0.25, max_tokens: 900, retryAttempts: 2 });
+      let chapterPlan = "";
+      try {
+        const result = JSON.parse(response.content) as Record<string, unknown>;
+        chapterPlan = typeof result.plan === "string" ? result.plan.trim() : "";
+        if (!chapterPlan && typeof result.content === "string") chapterPlan = String(result.content).trim();
+      } catch {
+        chapterPlan = response.content.trim();
+      }
+      if (!chapterPlan) chapterPlan = "承接上一章结尾，确认人物位置与情绪，推进当前目标并在章末留下有因果依据的钩子。";
+      emitter?.progress("plan", 42, `模型规划完成（${chapterPlan.length.toLocaleString()} 字）；已交给正文节点执行`);
+      return { chapterPlan };
+    })
     .addNode("draft", async (state: ChapterStateType) => {
-      emitter?.progress("draft", 30, "正在组织章节设定、记忆和技能提示");
+      emitter?.progress("draft", 44, "工具 ContextAssembler：正在组织章节计划、设定、记忆和技能提示");
       
       // 构建 prompt
       const contextSection = state.retrievedContext.length > 0
@@ -225,14 +267,15 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         ? `\n## 本章知识卡片\n${state.cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}\n`
         : "";
       const skillsSection = state.selectedSkills.length
-        ? `\n## 意图识别\n${state.recognizedIntent || "章节创作与续写"}\n\n## 自动选用技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.name}\n${compactText(skill.content, skill.name === "chapter-continuity" ? 1800 : 700)}`).join("\n\n")}\n`
+        ? `\n## 意图识别\n${state.recognizedIntent || "章节创作与续写"}\n\n## 自动选用技能\n${state.skillCatalog.filter(skill => state.selectedSkills.includes(skill.name)).slice(0, 3).map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, skill.name === "chapter-continuity" ? 1800 : 700)}`).join("\n\n")}\n`
         : "";
 
       const continuitySection = state.continuityContext
         ? `\n## 章节承接（最高优先级）\n${state.continuityContext}\n`
         : "";
-      const contextPacket = [continuitySection, outlineSection, cardsSection, graphSection, contextSection, skillsSection].filter(Boolean).join("");
-      const taskPrompt = `## 本章任务\n${state.instruction}\n\n请创作 2000-3000 字左右的章节正文。`;
+      const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
+      const contextPacket = [continuitySection, planSection, outlineSection, cardsSection, graphSection, contextSection, skillsSection].filter(Boolean).join("");
+      const taskPrompt = `## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：先承接上一章最后的动作、位置和情绪，再推进计划中的事件；不要复述计划或解释过程。`;
       const draftInputBytes = byteLength(chapterWriterSystemPrompt) + byteLength(contextPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
 
@@ -263,7 +306,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       }
     })
     .addNode("review", async (state: ChapterStateType) => {
-      emitter?.progress("review", 75, "正在审查章节...");
+      emitter?.progress("review", 75, "工具 ConsistencyChecker：正在审查人物、设定、时间线和因果...");
       
       if (!state.draftContent) {
         return {
@@ -328,7 +371,8 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     .addEdge("__start__", "intent")
     .addEdge("intent", "retrieve")
     .addEdge("retrieve", "continuity")
-    .addEdge("continuity", "draft")
+    .addEdge("continuity", "plan")
+    .addEdge("plan", "draft")
     .addEdge("draft", "review")
     .addEdge("review", "__end__");
 

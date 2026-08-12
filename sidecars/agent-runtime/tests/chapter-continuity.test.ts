@@ -52,6 +52,8 @@ describe("chapter continuity context", () => {
     expect(requests[0]?.messages && JSON.stringify(requests[0].messages)).toContain("上一章结尾（最高优先级）");
     expect(requests[0]?.messages && JSON.stringify(requests[0].messages)).toContain("三声敲门");
     expect(result.selectedSkills).toContain("chapter-continuity");
+    expect(result.chapterPlan).toBeTruthy();
+    expect(requests[1]?.messages && JSON.stringify(requests[1].messages)).toContain("下一章计划");
     store.close();
   });
 });

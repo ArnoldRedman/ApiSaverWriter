@@ -1,6 +1,8 @@
 import type { Skill } from '../App';
+import { advancedBuiltinSkills } from './advanced-skills';
 
-export const builtinSkills: Skill[] = [
+const builtinSkillDefinitions: Skill[] = [
+  ...advancedBuiltinSkills,
   {
     id: 'builtin-story-setup', name: 'story-setup', category: 'setup',
     description: '搭建小说写作工程，检查章节、大纲、卡片与记忆目录。',
@@ -103,3 +105,47 @@ export const builtinSkills: Skill[] = [
     content: '# skill-creator\n\n输入目标、适用场景、触发词、输入字段、执行步骤和输出格式，生成一份可复用 Markdown 技能；保存前检查名称、边界和失败处理。',
   },
 ];
+
+// Keep the English names as stable routing keys while presenting every built-in
+// skill in Chinese throughout the application.
+const builtinSkillDisplayNames: Record<string, string> = {
+  'next-chapter-plan': '下一章计划',
+  'mainline-check': '主线检查',
+  'character-motivation': '人物动机',
+  'conflict-escalation': '冲突升级',
+  'foreshadowing-manager': '伏笔管理',
+  'ending-hook': '结尾钩子',
+  'pacing-check': '节奏检查',
+  'prose-output-protocol': '正文输出协议',
+  'suspense-design': '悬念设计',
+  'character-entrance': '人物出场',
+  'worldview-implant': '世界观植入',
+  'setting-consistency': '设定一致性',
+  'faction-structure': '势力结构',
+  'map-progression': '地图推进',
+  'scene-description': '场景描写',
+  'dialogue-design': '对话设计',
+  transition: '转场过渡',
+  'emotion-rendering': '情绪渲染',
+  'story-setup': '项目初始化',
+  'story-long-write': '长篇写作',
+  'chapter-continuity': '章节承接',
+  'story-review': '故事审查',
+  'story-deslop': '去 AI 味',
+  'story-import': '小说导入',
+  'story-long-analyze': '长篇拆解',
+  'story-long-scan': '长篇扫榜',
+  'story-short-write': '短篇写作',
+  'story-short-analyze': '短篇拆解',
+  'story-short-scan': '短篇扫榜',
+  'story-cover': '小说封面',
+  'browser-cdp': '浏览器采集',
+  'skill-creator': '技能创建器',
+};
+
+export const builtinSkills: Skill[] = builtinSkillDefinitions.map(skill => ({
+  ...skill,
+  displayName: builtinSkillDisplayNames[skill.name] || skill.name,
+  // The first Markdown heading is also user-visible in the skill editor.
+  content: skill.content.replace(new RegExp(`^#\\s*${skill.name}\\b`, 'm'), `# ${builtinSkillDisplayNames[skill.name] || skill.name}`),
+}));
