@@ -104,6 +104,65 @@ export interface ChatOptions {
   retryAttempts?: number;
 }
 
+export interface ApiUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cachedInputTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+}
+
+export interface RuntimeUsageSummary extends Required<ApiUsage> {
+  requests: number;
+  startedAt: string;
+}
+
+const runtimeUsage: RuntimeUsageSummary = {
+  inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0,
+  cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString(),
+};
+
+function recordRuntimeUsage(usage?: ApiUsage): void {
+  if (!usage) return;
+  runtimeUsage.inputTokens += usage.inputTokens || 0;
+  runtimeUsage.outputTokens += usage.outputTokens || 0;
+  runtimeUsage.totalTokens += usage.totalTokens || 0;
+  runtimeUsage.cachedInputTokens += usage.cachedInputTokens || 0;
+  runtimeUsage.cacheWriteTokens += usage.cacheWriteTokens || 0;
+  runtimeUsage.reasoningTokens += usage.reasoningTokens || 0;
+  runtimeUsage.requests += 1;
+}
+
+export function getRuntimeUsageSummary(): RuntimeUsageSummary {
+  return { ...runtimeUsage };
+}
+
+function numeric(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseUsage(value: unknown): ApiUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const usage = value as Record<string, unknown>;
+  const prompt = usage.prompt_tokens_details as Record<string, unknown> | undefined;
+  const input = usage.input_tokens_details as Record<string, unknown> | undefined;
+  const completion = usage.completion_tokens_details as Record<string, unknown> | undefined;
+  const output = usage.output_tokens_details as Record<string, unknown> | undefined;
+  const result: ApiUsage = {
+    inputTokens: numeric(usage.prompt_tokens) ?? numeric(usage.input_tokens),
+    outputTokens: numeric(usage.completion_tokens) ?? numeric(usage.output_tokens),
+    totalTokens: numeric(usage.total_tokens),
+    cachedInputTokens: numeric(prompt?.cached_tokens) ?? numeric(input?.cached_tokens) ?? numeric(usage.cache_read_input_tokens) ?? numeric(usage.cached_tokens) ?? numeric(usage.prompt_cache_hit_tokens),
+    cacheWriteTokens: numeric(prompt?.cache_write_tokens) ?? numeric(input?.cache_write_tokens) ?? numeric(usage.cache_creation_input_tokens),
+    reasoningTokens: numeric(completion?.reasoning_tokens) ?? numeric(output?.reasoning_tokens),
+  };
+  if (result.totalTokens === undefined && result.inputTokens !== undefined && result.outputTokens !== undefined) {
+    result.totalTokens = result.inputTokens + result.outputTokens;
+  }
+  return Object.values(result).some(value => value !== undefined) ? result : undefined;
+}
+
 const proxyAgents = new Map<string, ProxyAgent>();
 
 const isPrivateOrLocalHost = (hostname: string) => {
@@ -194,7 +253,7 @@ export class ApiSaverClient {
   async chat(
     messages: ChatMessage[],
     options: ChatOptions = {}
-  ): Promise<{ content: string; model: string }> {
+  ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
     const rawBaseURL = trimTrailingSlash(this.config.baseURL || "https://api.apisaver.com/v1")
       .replace(/\/(?:chat\/completions|responses|messages)$/i, "");
@@ -279,7 +338,9 @@ export class ApiSaverClient {
               ? (typeof data.output_text === "string" ? data.output_text : outputText)
               : (typeof firstMessage?.content === "string" ? firstMessage.content : "");
           if (!content) throw new Error("API Saver 返回内容为空");
-          return { content, model: typeof data.model === "string" ? data.model : model };
+          const usage = parseUsage(data.usage);
+          recordRuntimeUsage(usage);
+          return { content, model: typeof data.model === "string" ? data.model : model, usage };
         }
 
         const detail = await response.text();

@@ -11,6 +11,15 @@ export interface ContextReport {
   reviewInputBytes?: number;
   estimatedInputTokens?: number;
   sections: Record<string, number>;
+  upstreamUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+    cachedInputTokens: number;
+    cacheWriteTokens: number;
+    reasoningTokens: number;
+    requests: number;
+  };
 }
 
 export interface ContextCard {
@@ -165,7 +174,7 @@ function compactOutlines(outlines: ContextOutline[], activeOutlineId: unknown, t
       outline,
       score: (String(outline.id ?? "") === String(activeOutlineId ?? "") ? 100 : 0)
         + relevanceScore(`${outline.kind || ""} ${outline.title || ""}`, text)
-        + (outline.kind === "细纲" ? 8 : outline.kind === "总纲" ? 4 : 0),
+        + (outline.kind === "章纲" || outline.kind === "细纲" ? 8 : outline.kind === "总纲" ? 4 : 0),
     }))
     .sort((left, right) => right.score - left.score || String(left.outline.id ?? "").localeCompare(String(right.outline.id ?? "")));
   let remaining = maxBytes;

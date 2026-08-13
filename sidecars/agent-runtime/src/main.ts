@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createChapterGraph } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
-import { ApiSaverClient } from "./models/api-saver.js";
+import { ApiSaverClient, getRuntimeUsageSummary } from "./models/api-saver.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, LruCache, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { ProxyAgent } from "undici";
@@ -1117,6 +1117,9 @@ const fetchFalooRanking = async (rankType: string, gender: string, params?: Reco
 
 async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
   try {
+    if (req.method === "usage.summary") {
+      return { id: req.id, result: getRuntimeUsageSummary() };
+    }
     if (req.method === "models.list") {
       const { apiKey, apiKeys, baseURL, apiMode, reasoningMode, contextWindow, proxyEnabled, proxyURL, proxyBypassLocal } = req.params ?? {};
       if (!apiKey) {
@@ -1871,8 +1874,16 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           preferredSkillNames: stringList(preferredSkillNames, 8),
           contextReport,
         });
+        const resultWithUsage = {
+          ...result,
+          contextReport: {
+            ...contextReport,
+            ...(result.contextReport || {}),
+            upstreamUsage: result.upstreamUsage,
+          },
+        };
         streamEmitter.complete("章节草稿和一致性审查已完成");
-        return { id: req.id, result };
+        return { id: req.id, result: resultWithUsage };
       } catch (error) {
         streamEmitter.error(error instanceof Error ? error.message : String(error));
         throw error;

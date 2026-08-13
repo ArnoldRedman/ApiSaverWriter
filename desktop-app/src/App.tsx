@@ -37,11 +37,12 @@ interface OutlineNode {
   status: 'planned' | 'writing' | 'completed';
 }
 
-type OutlineKind = '总纲' | '细纲' | '金手指' | '世界观与作品设定';
+type OutlineKind = '总纲' | '章纲' | '世界观与作品设定';
 
 interface OutlineDocument {
   id: number;
   kind: OutlineKind;
+  chapterId?: number;
   title: string;
   content: string;
   createdAt: string;
@@ -429,7 +430,27 @@ interface AgentDraftResult {
     reviewInputBytes?: number;
     estimatedInputTokens?: number;
     sections?: Record<string, number>;
+    upstreamUsage?: {
+      inputTokens: number;
+      outputTokens: number;
+      totalTokens: number;
+      cachedInputTokens: number;
+      cacheWriteTokens: number;
+      reasoningTokens: number;
+      requests: number;
+    };
   };
+}
+
+interface RuntimeUsageSummary {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens: number;
+  cacheWriteTokens: number;
+  reasoningTokens: number;
+  requests: number;
+  startedAt: string;
 }
 
 interface AgentMemoryResult {
@@ -538,7 +559,7 @@ const defaultPublishConfig: PublishConfig = {
   autoPublishOnSave: false,
 };
 const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
-const outlineKinds: OutlineKind[] = ['总纲', '细纲', '金手指', '世界观与作品设定'];
+const outlineKinds: OutlineKind[] = ['总纲', '章纲', '世界观与作品设定'];
 const memoryDocumentKinds: MemoryDocumentKind[] = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'];
 
 const memoryDocumentId = (kind: MemoryDocumentKind) => `memory-document:${kind}`;
@@ -1060,6 +1081,12 @@ function App() {
               createdAt: chapter.createdAt ?? new Date().toISOString(),
               updatedAt: chapter.updatedAt ?? new Date().toISOString(),
             })) : [];
+            const legacyOutlines = Array.isArray(project.outlines) ? project.outlines : [];
+            const legacyGoldFingerCards = legacyOutlines.filter((outline: any) => outline?.kind === '金手指' && String(outline.content || '').trim()).map((outline: any) => ({
+              id: Number(outline.id) || Date.now(), type: '金手指卡' as CardType, title: outline.title || '金手指设定', content: outline.content,
+              currentState: '', stateHistory: [], createdAt: outline.createdAt ?? new Date().toISOString(), updatedAt: outline.updatedAt ?? new Date().toISOString(),
+            }));
+            const existingCards = Array.isArray(project.cards) ? project.cards : [];
             return {
               id: Number(project.id) || Date.now(),
               title: project.title ?? '未命名小说',
@@ -1074,8 +1101,8 @@ function App() {
               wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
               chapters,
               outline: Array.isArray(project.outline) ? project.outline : [],
-              outlines: Array.isArray(project.outlines) ? project.outlines : [],
-              cards: Array.isArray(project.cards) ? project.cards : [],
+              outlines: legacyOutlines.filter((outline: any) => outline?.kind !== '金手指').map((outline: any) => ({ ...outline, kind: outline.kind === '细纲' ? '章纲' : outline.kind })),
+              cards: [...existingCards, ...legacyGoldFingerCards.filter(card => !existingCards.some((existing: any) => existing.title === card.title && existing.content === card.content))],
               memories: Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [],
               memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
               graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
@@ -1193,10 +1220,16 @@ function App() {
   const [expandedGraphDocumentIds, setExpandedGraphDocumentIds] = useState<string[]>([]);
   const [selectedCardIds, setSelectedCardIds] = useState<number[]>([]);
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<number[]>([]);
+  const [selectedOutlineIds, setSelectedOutlineIds] = useState<number[]>([]);
   const [selectedAgentSkillNames, setSelectedAgentSkillNames] = useState<string[]>([]);
   const [showAgentSkillPicker, setShowAgentSkillPicker] = useState(false);
   const [cardTypeFilter, setCardTypeFilter] = useState<CardType | '全部'>('全部');
   const [cardDraft, setCardDraft] = useState<{ type: CardType; title: string; content: string }>({ type: '角色卡', title: '', content: '' });
+  useEffect(() => {
+    if (!activeChapter || !editingProject) return;
+    const linked = editingProject.outlines.filter(outline => outline.kind === '章纲' && outline.chapterId === activeChapter.id).map(outline => outline.id);
+    if (linked.length) setSelectedOutlineIds(current => Array.from(new Set([...current, ...linked])));
+  }, [activeChapter?.id, editingProject?.id, editingProject?.outlines]);
   const [cardGenerating, setCardGenerating] = useState(false);
   const [agentConfig, setAgentConfig] = useState<AgentConfig>(() => {
     const saved = localStorage.getItem('agent-config');
@@ -1250,7 +1283,36 @@ function App() {
   const [agentProgress, setAgentProgress] = useState<AgentProgressItem[]>([]);
   const [agentProgressPercent, setAgentProgressPercent] = useState(0);
   const [agentProgressMessage, setAgentProgressMessage] = useState('');
+  const [runtimeUsage, setRuntimeUsage] = useState<RuntimeUsageSummary>(() => {
+    try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
+  });
   const activeAgentRunRef = useRef('');
+  const runtimeUsageSessionRef = useRef<RuntimeUsageSummary | null>(null);
+  const syncRuntimeUsage = async () => {
+    try {
+      const latest = await invoke<RuntimeUsageSummary>('call_agent_rpc', { method: 'usage.summary', params: {} });
+      const prior = runtimeUsageSessionRef.current;
+      runtimeUsageSessionRef.current = latest;
+      if (!prior) return;
+      const delta = {
+        inputTokens: Math.max(0, latest.inputTokens - prior.inputTokens), outputTokens: Math.max(0, latest.outputTokens - prior.outputTokens),
+        totalTokens: Math.max(0, latest.totalTokens - prior.totalTokens), cachedInputTokens: Math.max(0, latest.cachedInputTokens - prior.cachedInputTokens),
+        cacheWriteTokens: Math.max(0, latest.cacheWriteTokens - prior.cacheWriteTokens), reasoningTokens: Math.max(0, latest.reasoningTokens - prior.reasoningTokens),
+        requests: Math.max(0, latest.requests - prior.requests),
+      };
+      if (!delta.requests) return;
+      setRuntimeUsage(current => {
+        const next = { ...current, inputTokens: current.inputTokens + delta.inputTokens, outputTokens: current.outputTokens + delta.outputTokens, totalTokens: current.totalTokens + delta.totalTokens, cachedInputTokens: current.cachedInputTokens + delta.cachedInputTokens, cacheWriteTokens: current.cacheWriteTokens + delta.cacheWriteTokens, reasoningTokens: current.reasoningTokens + delta.reasoningTokens, requests: current.requests + delta.requests };
+        localStorage.setItem('writer-runtime-usage', JSON.stringify(next));
+        return next;
+      });
+    } catch { /* Runtime may not have started yet. */ }
+  };
+  useEffect(() => { void invoke<string>('start_agent_runtime').then(() => syncRuntimeUsage()); }, []);
+  useEffect(() => {
+    const timer = window.setInterval(() => { void syncRuntimeUsage(); }, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [chapterSaving, setChapterSaving] = useState(false);
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [showSearchPanel, setShowSearchPanel] = useState(false);
@@ -1625,7 +1687,7 @@ function App() {
       ? dismantleBooks.find(book => book.id === imitationSource.bookId)?.chapters.find(chapter => chapter.id === imitationSource.chapterId)
       : undefined;
     const sourceOutline = sourceChapter?.detailedOutline.trim()
-      ? [{ id: Date.now() + 1, kind: '细纲' as OutlineKind, title: `参考章纲｜${sourceChapter.title}`, content: sourceChapter.detailedOutline, createdAt: now, updatedAt: now }]
+      ? [{ id: Date.now() + 1, kind: '章纲' as OutlineKind, title: `参考章纲｜${sourceChapter.title}`, content: sourceChapter.detailedOutline, createdAt: now, updatedAt: now }]
       : [];
     const project: Project = {
       id: Date.now(),
@@ -3242,11 +3304,14 @@ function App() {
   const handleCreateOutline = (kind: OutlineKind) => {
     if (!editingProject) return;
     const now = new Date().toISOString();
+    const chapterId = kind === '章纲' ? activeChapter?.id : undefined;
+    const chapterTitle = chapterId ? editingProject.chapters.find(chapter => chapter.id === chapterId)?.title : undefined;
     const outline: OutlineDocument = {
       id: Date.now(),
       kind,
-      title: kind,
-      content: `# ${kind}\n\n`,
+      chapterId,
+      title: kind === '章纲' ? (chapterTitle ? `章纲｜${chapterTitle}` : '章纲') : kind,
+      content: `# ${kind}${chapterTitle ? `｜${chapterTitle}` : ''}\n\n`,
       createdAt: now,
       updatedAt: now,
     };
@@ -3514,6 +3579,7 @@ function App() {
     const activeChapterIndex = editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id);
     const continuityChapter = activeChapterIndex > 0 ? editingProject.chapters[activeChapterIndex - 1] : null;
     const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
+    const selectedOutlines = editingProject.outlines.filter(outline => selectedOutlineIds.includes(outline.id) || outline.kind !== '章纲');
     try {
       await invoke<string>('start_agent_runtime');
       setAgentProgress(items => items.map(item => item.id === 'starting'
@@ -3529,7 +3595,7 @@ function App() {
           projectTitle: editingProject.title,
           chapterId: String(activeChapter.id),
           instruction: activeStyle ? `${agentInstruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : agentInstruction,
-          outlines: editingProject.outlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, content: outline.content })),
+          outlines: selectedOutlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
           activeOutlineId,
           outline: editingProject.outlines.length
             ? editingProject.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n')
@@ -3566,6 +3632,7 @@ function App() {
         },
       });
       setAgentDraft(result);
+      await syncRuntimeUsage();
       setAgentStage('done');
       setAgentProgressPercent(100);
       setAgentProgressMessage('章节草稿和一致性审查已完成');
@@ -3978,11 +4045,21 @@ function App() {
 
   return (
     <div className="app">
+      <div className="global-usage-topbar" title="本机运行期间中转站实际返回 usage 的累计统计">
+        <span>总消耗 <b>{runtimeUsage.totalTokens.toLocaleString()}</b> tokens</span>
+        <span>缓存命中 <b>{runtimeUsage.cachedInputTokens.toLocaleString()}</b></span>
+        <span>命中率 <b>{runtimeUsage.inputTokens ? `${((runtimeUsage.cachedInputTokens / runtimeUsage.inputTokens) * 100).toFixed(1)}%` : '--'}</b></span>
+      </div>
       {editingProject ? (
         <div className="editor-view">
           <header className="editor-header">
             <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
             <h2>{editingProject.title}</h2>
+            <div className="runtime-usage-summary" title="仅统计中转站实际返回 usage 的请求；未返回 usage 的请求不会计入">
+              <span>总用量 <b>{runtimeUsage.totalTokens.toLocaleString()}</b> tokens</span>
+              <span>缓存命中 <b>{runtimeUsage.cachedInputTokens.toLocaleString()}</b></span>
+              <span>命中率 <b>{runtimeUsage.inputTokens ? `${((runtimeUsage.cachedInputTokens / runtimeUsage.inputTokens) * 100).toFixed(1)}%` : '--'}</b></span>
+            </div>
             {!outlineMode && !cardMode && !styleMode && <>
               <button className="editor-tool-button" title="搜索章节与全文" onClick={() => { setShowSearchPanel(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
@@ -4151,7 +4228,7 @@ function App() {
                   <div className="outline-document-list">
                     {editingProject.outlines.map(outline => (
                       <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
-                        <div><strong>{outline.kind}</strong><small>{outline.title}</small></div>
+                        <div><strong>{outline.kind}</strong><small>{outline.title}{outline.kind === '章纲' && outline.chapterId ? ` · ${editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节'}` : ''}</small></div>
                         <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}>×</button>
                       </div>
                     ))}
@@ -4161,7 +4238,7 @@ function App() {
                       <input className="input" value={activeOutline.title} onChange={(event) => updateActiveOutline({ title: event.target.value })} />
                       <p className="outline-editor-hint">选择大纲后，中间编辑区会显示对应 Markdown 内容。</p>
                     </div>
-                  ) : <p className="empty-hint">点击“新建大纲”，再选择总纲、细纲或设定文档</p>}
+                  ) : <p className="empty-hint">点击“新建大纲”，再选择总纲、章纲或设定文档</p>}
                 </div>
               )}
 
@@ -4264,13 +4341,13 @@ function App() {
                 </section>
               ) : editorSidebarTab === 'cards' ? (
                 <section className="card-workspace">
-                  {activeCard || cardDraft.title || cardDraft.content ? <>
+                  <>
                     <div className="card-workspace-header"><span>{cardDraft.type}</span><input className="card-main-title-input" value={cardDraft.title} onChange={event => setCardDraft(current => ({ ...current, title: event.target.value }))} placeholder="卡片名称" /><small>知识卡 Markdown · 内容会自动保存</small></div>
                     <div className="card-workspace-controls"><select className="select" value={cardDraft.type} onChange={event => setCardDraft(current => ({ ...current, type: event.target.value as CardType }))}><option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option></select><button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>{activeCard && <button className="btn-secondary" onClick={() => void updateCardStatesFromBook(activeCard.id)}>更新状态</button>}</div>
                     <div className="card-workspace-meta"><span>当前状态：{activeCard?.currentState || '尚未更新'}</span>{activeCard && <button className="link-button" onClick={() => void updateCardStatesFromBook(activeCard.id)}>全文检索并更新状态</button>}</div>
                     <textarea className="card-main-editor" value={cardDraft.content} onChange={event => setCardDraft(current => ({ ...current, content: event.target.value }))} placeholder="编辑卡片详细信息..." />
                     <div className="card-workspace-footer"><span>{countNovelCharacters(cardDraft.content)} 字</span><button className="btn-primary" onClick={saveCard}>{activeCard ? '保存卡片' : '创建卡片'}</button></div>
-                  </> : <div className="empty-state"><p>从左侧选择一张卡片，或新建卡片开始编辑。</p></div>}
+                  </>
                 </section>
               ) : editorSidebarTab === 'style' ? (
                 <section className="project-style-workspace">
@@ -4475,7 +4552,7 @@ function App() {
                     <div className="agent-instruction-heading"><label>文风应用范围</label></div>
                     {activeWritingStyle ? <>
                       <div className="card-agent-context"><span>当前绑定</span><strong>{activeWritingStyle.name}</strong><small>{activeWritingStyle.tags.join('、') || '无标签'}</small></div>
-                      <div className="style-agent-coverage"><div><strong>章节智能体</strong><span>生成正文时作为专用文风 Skill 带入。</span></div><div><strong>大纲智能体</strong><span>生成总纲、细纲和设定时同样带入，保证创作方向一致。</span></div></div>
+                    <div className="style-agent-coverage"><div><strong>章节智能体</strong><span>生成正文时作为专用文风 Skill 带入。</span></div><div><strong>大纲智能体</strong><span>生成总纲、章纲和设定时同样带入，保证创作方向一致。</span></div></div>
                     </> : <p className="empty-hint compact">尚未绑定文风。请在左侧选择一份全局文风。</p>}
                   </section>
                 </div>
@@ -4502,6 +4579,15 @@ function App() {
                       <textarea value={aiToolResult.content} onChange={event => setAIToolResult(current => current ? { ...current, content: event.target.value } : current)} />
                       <div className="ai-writing-tool-actions"><button className="btn-secondary" onClick={() => copyText(aiToolResult.content)}>复制</button><button className="btn-primary" onClick={acceptAIToolResult}>{aiToolResult.mode === 'continue' ? '确认插入章节' : '确认替换'}</button></div>
                     </div>}
+                  </div>
+                  <div className="agent-card-picker">
+                    <div className="agent-card-picker-title">本章带入章纲 <small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
+                    {editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => (
+                      <label key={outline.id} className="agent-card-option">
+                        <input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} />
+                        <span><strong>{outline.title || '未命名章纲'}</strong><small>{outline.chapterId === activeChapter?.id ? '当前章节' : '其他章纲'}</small></span>
+                      </label>
+                    ))}
                   </div>
                   <div className="agent-card-picker">
                     <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length} 张</small></div>
@@ -4557,10 +4643,11 @@ function App() {
                       <pre>{agentDraft.chapterPlan}</pre>
                     </details>}
                     {agentDraft.contextReport && <div className="agent-context-report">
-                      <span>{agentDraft.contextReport.cache === 'hit' ? '缓存命中' : '缓存未命中'}</span>
+                      <span>本地上下文包{agentDraft.contextReport.cache === 'hit' ? '缓存命中' : '缓存未命中'}</span>
                       <span>发送上下文 {((agentDraft.contextReport.draftInputBytes || agentDraft.contextReport.packedBytes || 0) / 1024).toFixed(1)} KB</span>
                       {agentDraft.contextReport.prunedBytes ? <span>已裁剪 {(agentDraft.contextReport.prunedBytes / 1024).toFixed(1)} KB</span> : null}
                       {agentDraft.contextReport.estimatedInputTokens ? <span>估算输入 {agentDraft.contextReport.estimatedInputTokens.toLocaleString()} tokens</span> : null}
+                      {agentDraft.contextReport.upstreamUsage?.requests ? <><span>中转输入 {agentDraft.contextReport.upstreamUsage.inputTokens.toLocaleString()} tokens</span><span>中转输出 {agentDraft.contextReport.upstreamUsage.outputTokens.toLocaleString()} tokens</span><span>中转总计 {agentDraft.contextReport.upstreamUsage.totalTokens.toLocaleString()} tokens</span><span>上游缓存命中 {agentDraft.contextReport.upstreamUsage.cachedInputTokens.toLocaleString()} tokens</span><span>上游缓存命中率 {agentDraft.contextReport.upstreamUsage.inputTokens ? `${((agentDraft.contextReport.upstreamUsage.cachedInputTokens / agentDraft.contextReport.upstreamUsage.inputTokens) * 100).toFixed(1)}%` : '未返回输入用量'}</span></> : <span>中转站未返回用量与缓存字段</span>}
                     </div>}
                     <textarea className="agent-draft-preview" value={agentDraft.draftContent} onChange={(event) => setAgentDraft({ ...agentDraft, draftContent: event.target.value })} />
                     {agentDraft.summary && <p className="agent-summary">{agentDraft.summary}</p>}

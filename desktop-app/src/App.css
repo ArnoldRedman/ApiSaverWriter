@@ -16,6 +16,9 @@ body {
   height: 100vh;
   overflow: hidden;
 }
+.global-usage-topbar { position: fixed; z-index: 100; top: 10px; right: 18px; display: flex; gap: 8px; color: #CBD5E1; font-size: 11px; pointer-events: none; }
+.global-usage-topbar span { padding: 5px 8px; border: 1px solid #334155; border-radius: 5px; background: rgba(15, 23, 42, .94); box-shadow: 0 4px 12px rgba(0,0,0,.18); }
+.global-usage-topbar b { color: #67E8F9; font-weight: 600; }
 
 /* 侧边栏 */
 .sidebar {
@@ -1337,6 +1340,9 @@ select.input {
   color: #F8FAFC;
   flex: 1;
 }
+.runtime-usage-summary { display: flex; align-items: center; gap: 10px; flex: 0 1 auto; color: #94A3B8; font-size: 11px; white-space: nowrap; }
+.runtime-usage-summary span { padding: 5px 8px; border: 1px solid #334155; border-radius: 5px; background: #0F172A; }
+.runtime-usage-summary b { color: #67E8F9; font-weight: 600; }
 .editor-mode-label { flex: 0 0 auto; color: #A5F3FC; font-size: 12px; }
 
 .editor-notice {
@@ -2101,6 +2107,7 @@ select.input {
 }
 
 @media (max-width: 820px) {
+  .global-usage-topbar { display: none; }
   .memory-snapshot-grid { grid-template-columns: 1fr; }
 }
 
@@ -2498,6 +2505,7 @@ select.input {
   .editor-header { padding: 0 10px; gap: 7px; }
   .editor-header h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .editor-header .editor-stats { display: none; }
+  .runtime-usage-summary { display: none; }
   .editor-tool-button { padding: 6px 7px; font-size: 11px; }
   .editor-sidebar { width: 205px; }
   .agent-panel { display: none; }

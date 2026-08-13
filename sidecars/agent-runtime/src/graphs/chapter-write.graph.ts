@@ -1,7 +1,7 @@
 import { StateGraph, Annotation } from "@langchain/langgraph";
 import type { BaseMessage } from "@langchain/core/messages";
 import { StoryStore } from "../storage/story-store.js";
-import { ApiSaverClient } from "../models/api-saver.js";
+import { ApiSaverClient, type ApiUsage } from "../models/api-saver.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, type ContextReport } from "../context/context-optimizer.js";
@@ -14,6 +14,17 @@ export interface SkillDefinition {
   tags?: string[];
   content: string;
 }
+
+type UsageTotals = NonNullable<ContextReport["upstreamUsage"]>;
+const addUsage = (left: UsageTotals | undefined, right: ApiUsage | undefined): UsageTotals => ({
+  inputTokens: (left?.inputTokens || 0) + (right?.inputTokens || 0),
+  outputTokens: (left?.outputTokens || 0) + (right?.outputTokens || 0),
+  totalTokens: (left?.totalTokens || 0) + (right?.totalTokens || 0),
+  cachedInputTokens: (left?.cachedInputTokens || 0) + (right?.cachedInputTokens || 0),
+  cacheWriteTokens: (left?.cacheWriteTokens || 0) + (right?.cacheWriteTokens || 0),
+  reasoningTokens: (left?.reasoningTokens || 0) + (right?.reasoningTokens || 0),
+  requests: (left?.requests || 0) + (right ? 1 : 0),
+});
 
 const intentLabels: Record<string, string> = {
   setup: "项目设定与大纲",
@@ -44,6 +55,20 @@ const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时
 const chapterPlanSystemPrompt = `你是长篇网络小说主编。先为下一章制作一份短小、可执行的写作计划，不写正文，不输出隐藏思考。
 只依据给定资料，优先处理上一章结尾。返回严格 JSON 对象：{"plan":"Markdown 计划","handoff":"下一章交接"}。
 计划必须包含：承接锚点（人物位置、情绪、未解决事件、道具/线索、时间线、伏笔、章末钩子）、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进、结尾钩子、下一章交接。未知项标为待确认，不能凭空补设定。`;
+
+/** A deterministic, stable prefix lets compatible upstreams reuse prompt cache. */
+function stableProjectPacket(state: ChapterStateType): string {
+  const cards = [...(state.cards || [])].sort((a, b) => a.title.localeCompare(b.title));
+  const skills = state.skillCatalog
+    .filter(skill => state.selectedSkills.includes(skill.name))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return [
+    state.outline ? `## 作品大纲与设定\n${state.outline}` : "",
+    cards.length ? `## 知识卡\n${cards.map(card => `### ${card.type || "知识卡"}：${card.title}\n${card.content}`).join("\n\n")}` : "",
+    state.knowledgeGraph ? `## 知识图谱\n${state.knowledgeGraph}` : "",
+    skills.length ? `## 写作技能\n${skills.map(skill => `### ${skill.displayName || skill.name}\n${compactText(skill.content, skill.name === "chapter-continuity" ? 1800 : 700)}`).join("\n\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+}
 
 export function selectSkillsByIntent(instruction: string, catalog: SkillDefinition[]): { intent: string; skills: SkillDefinition[] } {
   const query = instruction.toLowerCase();
@@ -92,6 +117,7 @@ export const ChapterState = Annotation.Root({
   draftContent: Annotation<string | undefined>,
   summary: Annotation<string | undefined>,
   contextReport: Annotation<ContextReport | undefined>,
+  upstreamUsage: Annotation<UsageTotals | undefined>({ reducer: (_prev, next) => next, default: () => undefined }),
   reviewResult: Annotation<{
     consistent: boolean;
     issues: string[];
@@ -247,7 +273,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       }
       if (!chapterPlan) chapterPlan = "承接上一章结尾，确认人物位置与情绪，推进当前目标并在章末留下有因果依据的钩子。";
       emitter?.progress("plan", 42, `模型规划完成（${chapterPlan.length.toLocaleString()} 字）；已交给正文节点执行`);
-      return { chapterPlan };
+      return { chapterPlan, upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
     })
     .addNode("draft", async (state: ChapterStateType) => {
       emitter?.progress("draft", 44, "工具 ContextAssembler：正在组织章节计划、设定、记忆和技能提示");
@@ -274,9 +300,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
         ? `\n## 章节承接（最高优先级）\n${state.continuityContext}\n`
         : "";
       const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
-      const contextPacket = [continuitySection, planSection, outlineSection, cardsSection, graphSection, contextSection, skillsSection].filter(Boolean).join("");
+      // Keep project facts first and byte-stable; only the dynamic turn changes after it.
+      const stablePacket = stableProjectPacket(state);
+      const dynamicPacket = [continuitySection, planSection, contextSection].filter(Boolean).join("");
       const taskPrompt = `## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：先承接上一章最后的动作、位置和情绪，再推进计划中的事件；不要复述计划或解释过程。`;
-      const draftInputBytes = byteLength(chapterWriterSystemPrompt) + byteLength(contextPacket) + byteLength(taskPrompt);
+      const draftInputBytes = byteLength(chapterWriterSystemPrompt) + byteLength(stablePacket) + byteLength(dynamicPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
 
       // 流式生成文本
@@ -287,7 +315,8 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.progress("draft", 38, "已提交模型请求，正在生成正文");
       const response = await client.chat([
         { role: "system", content: chapterWriterSystemPrompt },
-        { role: "user", content: `## 作品资料\n${contextPacket || "（暂无额外资料）"}` },
+        { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
+        { role: "user", content: `## 本章动态资料\n${dynamicPacket || "（暂无动态资料）"}` },
         { role: "user", content: taskPrompt },
       ], { response_format: { type: "json_object" } });
       
@@ -300,9 +329,10 @@ export function createChapterGraph(config: ChapterGraphConfig) {
           draftContent: result.content || response.content,
           summary: result.summary,
           contextReport,
+          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
         };
       } catch {
-        return { draftContent: response.content, contextReport };
+        return { draftContent: response.content, contextReport, upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
       }
     })
     .addNode("review", async (state: ChapterStateType) => {
@@ -356,6 +386,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
             suggestions: result.suggestions || [],
           },
           contextReport,
+          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
         };
       } catch {
         return {
@@ -365,6 +396,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
             suggestions: ["无法解析审查结果"],
           },
           contextReport,
+          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
         };
       }
     })
