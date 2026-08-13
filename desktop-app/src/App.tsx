@@ -452,6 +452,8 @@ interface RuntimeUsageSummary {
   requests: number;
   startedAt: string;
 }
+interface UsageDay extends RuntimeUsageSummary { date: string }
+interface AgentChatMessage { role: 'user' | 'assistant'; content: string; createdAt: string }
 
 interface AgentMemoryResult {
   summary?: string;
@@ -1219,6 +1221,7 @@ function App() {
   const [graphOnlyIsolated, setGraphOnlyIsolated] = useState(false);
   const [expandedGraphDocumentIds, setExpandedGraphDocumentIds] = useState<string[]>([]);
   const [selectedCardIds, setSelectedCardIds] = useState<number[]>([]);
+  const [selectedOutlineCardIds, setSelectedOutlineCardIds] = useState<number[]>([]);
   const [selectedMemoryIds, setSelectedMemoryIds] = useState<number[]>([]);
   const [selectedOutlineIds, setSelectedOutlineIds] = useState<number[]>([]);
   const [selectedAgentSkillNames, setSelectedAgentSkillNames] = useState<string[]>([]);
@@ -1279,6 +1282,14 @@ function App() {
   const [outlineGenerating, setOutlineGenerating] = useState(false);
   const [agentStage, setAgentStage] = useState<AgentStage>('idle');
   const [agentDraft, setAgentDraft] = useState<AgentDraftResult | null>(null);
+  const [agentDisplayContent, setAgentDisplayContent] = useState('');
+  const [outlineChatMessages, setOutlineChatMessages] = useState<AgentChatMessage[]>([]);
+  const [cardChatMessages, setCardChatMessages] = useState<AgentChatMessage[]>([]);
+  const [outlineStreamContent, setOutlineStreamContent] = useState('');
+  const [cardStreamContent, setCardStreamContent] = useState('');
+  const outlineRunRef = useRef('');
+  const cardRunRef = useRef('');
+  const agentTypewriterRef = useRef<number | null>(null);
   const [agentError, setAgentError] = useState('');
   const [agentProgress, setAgentProgress] = useState<AgentProgressItem[]>([]);
   const [agentProgressPercent, setAgentProgressPercent] = useState(0);
@@ -1286,6 +1297,11 @@ function App() {
   const [runtimeUsage, setRuntimeUsage] = useState<RuntimeUsageSummary>(() => {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
+  const [usageDays, setUsageDays] = useState<UsageDay[]>(() => { try { const value = JSON.parse(localStorage.getItem('writer-runtime-usage-days') || '[]'); return Array.isArray(value) ? value : []; } catch { return []; } });
+  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage'>('model');
+  const [usageDateFilter, setUsageDateFilter] = useState('all');
+  const [usageStartDate, setUsageStartDate] = useState('');
+  const [usageEndDate, setUsageEndDate] = useState('');
   const activeAgentRunRef = useRef('');
   const runtimeUsageSessionRef = useRef<RuntimeUsageSummary | null>(null);
   const syncRuntimeUsage = async () => {
@@ -1304,6 +1320,13 @@ function App() {
       setRuntimeUsage(current => {
         const next = { ...current, inputTokens: current.inputTokens + delta.inputTokens, outputTokens: current.outputTokens + delta.outputTokens, totalTokens: current.totalTokens + delta.totalTokens, cachedInputTokens: current.cachedInputTokens + delta.cachedInputTokens, cacheWriteTokens: current.cacheWriteTokens + delta.cacheWriteTokens, reasoningTokens: current.reasoningTokens + delta.reasoningTokens, requests: current.requests + delta.requests };
         localStorage.setItem('writer-runtime-usage', JSON.stringify(next));
+        const date = new Date().toISOString().slice(0, 10);
+        setUsageDays(days => {
+          const existing = days.find(day => day.date === date);
+          const updated = existing ? days.map(day => day.date === date ? { ...day, inputTokens: day.inputTokens + delta.inputTokens, outputTokens: day.outputTokens + delta.outputTokens, totalTokens: day.totalTokens + delta.totalTokens, cachedInputTokens: day.cachedInputTokens + delta.cachedInputTokens, cacheWriteTokens: day.cacheWriteTokens + delta.cacheWriteTokens, reasoningTokens: day.reasoningTokens + delta.reasoningTokens, requests: day.requests + delta.requests } : day) : [...days, { ...delta, date, startedAt: new Date().toISOString() }];
+          localStorage.setItem('writer-runtime-usage-days', JSON.stringify(updated));
+          return updated;
+        });
         return next;
       });
     } catch { /* Runtime may not have started yet. */ }
@@ -1394,9 +1417,13 @@ function App() {
     let unlisten: (() => void) | undefined;
     void listen<AgentProgressEvent>('agent-progress', event => {
       const payload = event.payload;
-      if (!payload || payload.runId !== activeAgentRunRef.current) return;
+      if (!payload) return;
       const data = payload.data ?? {};
+      if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
+      if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
+      if (payload.runId !== activeAgentRunRef.current) return;
       if (payload.type === 'chunk' && data.text) {
+        setAgentDisplayContent(current => current + String(data.text));
         const characters = countNovelCharacters(data.text);
         setAgentProgressMessage(characters ? `正文已返回 ${characters.toLocaleString()} 字，正在整理草稿` : '正在接收模型输出');
         setAgentProgress(items => items.map(item => item.id === 'draft'
@@ -3356,19 +3383,22 @@ function App() {
     }
     setAgentError('');
     setOutlineGenerating(true);
+    const runId = `outline-${Date.now()}`; outlineRunRef.current = runId; setOutlineStreamContent('');
+    setOutlineChatMessages(current => [...current, { role: 'user', content: outlineAgentInstruction.trim(), createdAt: new Date().toISOString() }]);
     try {
       await invoke<string>('start_agent_runtime');
       const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
       const result = await invoke<{ content?: string; title?: string }>('call_agent_rpc', {
         method: 'outline.write',
         params: {
+          runId,
           projectId: String(editingProject.id),
           projectTitle: editingProject.title,
           kind: outline.kind,
           existingContent: outline.content,
           instruction: activeStyle ? `${outlineAgentInstruction.trim()}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : outlineAgentInstruction.trim(),
           synopsis: editingProject.synopsis,
-          cards: editingProject.cards,
+          cards: editingProject.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: selectedAgentSkillNames,
@@ -3383,6 +3413,7 @@ function App() {
         },
       });
       updateActiveOutline({ content: result.content || outline.content });
+      setOutlineChatMessages(current => [...current, { role: 'assistant', content: result.content || outline.content, createdAt: new Date().toISOString() }]);
       setNotice({ title: '大纲已生成', content: `${outline.kind} 已由智能体生成，可继续手动编辑。` });
     } catch (error) {
       setAgentError(String(error));
@@ -3409,11 +3440,14 @@ function App() {
       return;
     }
     setCardGenerating(true);
+    const runId = `card-${Date.now()}`; cardRunRef.current = runId; setCardStreamContent('');
+    setCardChatMessages(current => [...current, { role: 'user', content: cardAgentInstruction.trim(), createdAt: new Date().toISOString() }]);
     try {
       await invoke<string>('start_agent_runtime');
       const result = await invoke<{ title?: string; content?: string }>('call_agent_rpc', {
         method: 'card.write',
         params: {
+          runId,
           projectTitle: editingProject.title,
           synopsis: editingProject.synopsis,
           cardType: cardDraft.type,
@@ -3440,6 +3474,7 @@ function App() {
         title: result.title?.trim() || current.title || `${current.type}设定`,
         content: result.content.trim(),
       }));
+      setCardChatMessages(current => [...current, { role: 'assistant', content: result.content?.trim() || '', createdAt: new Date().toISOString() }]);
       setNotice({ title: '卡片草稿已生成', content: '内容已填入左侧编辑器，请检查后点击“保存卡片”。' });
     } catch (error) {
       setNotice({ title: '卡片生成失败', content: String(error) });
@@ -3559,6 +3594,7 @@ function App() {
     activeAgentRunRef.current = runId;
     setAgentError('');
     setAgentDraft(null);
+    setAgentDisplayContent('');
     setAgentStage('starting');
     setAgentProgress(createAgentProgressItems().map((item, index) => index === 0
       ? { ...item, status: 'active', progress: 1, message: '正在启动 Agent Runtime' }
@@ -3632,6 +3668,8 @@ function App() {
         },
       });
       setAgentDraft(result);
+      // A provider may decline SSE; then reveal the completed response smoothly.
+      if (!generated && agentTypewriterRef.current) window.clearInterval(agentTypewriterRef.current);
       await syncRuntimeUsage();
       setAgentStage('done');
       setAgentProgressPercent(100);
@@ -3669,6 +3707,7 @@ function App() {
       setProjects(current => current.map(project => project.id === updated.id ? updated : project));
     }
     setAgentDraft(null);
+    setAgentDisplayContent('');
     setAgentStage('idle');
     setAgentProgress([]);
     setAgentProgressPercent(0);
@@ -3684,6 +3723,7 @@ function App() {
     setModelListMessage('');
     setSettingsServiceExpanded(true);
     setShowSettingsModal(true);
+    setSettingsSection('model');
   };
 
   const pullModels = async () => {
@@ -4042,24 +4082,19 @@ function App() {
   const outlineMode = editingProject !== null && editorSidebarTab === 'outline';
   const cardMode = editingProject !== null && editorSidebarTab === 'cards';
   const styleMode = editingProject !== null && editorSidebarTab === 'style';
+  const usageRows = usageDays.filter(day => {
+    if (usageStartDate || usageEndDate) return (!usageStartDate || day.date >= usageStartDate) && (!usageEndDate || day.date <= usageEndDate);
+    return usageDateFilter === 'all' || (usageDateFilter === 'today' ? day.date === new Date().toISOString().slice(0, 10) : Date.now() - new Date(day.date).getTime() < Number(usageDateFilter) * 86400000);
+  });
+  const usageView = usageDateFilter === 'all' ? runtimeUsage : usageRows.reduce((total, day) => ({ ...total, inputTokens: total.inputTokens + day.inputTokens, outputTokens: total.outputTokens + day.outputTokens, totalTokens: total.totalTokens + day.totalTokens, cachedInputTokens: total.cachedInputTokens + day.cachedInputTokens, cacheWriteTokens: total.cacheWriteTokens + day.cacheWriteTokens, reasoningTokens: total.reasoningTokens + day.reasoningTokens, requests: total.requests + day.requests }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: '' });
 
   return (
     <div className="app">
-      <div className="global-usage-topbar" title="本机运行期间中转站实际返回 usage 的累计统计">
-        <span>总消耗 <b>{runtimeUsage.totalTokens.toLocaleString()}</b> tokens</span>
-        <span>缓存命中 <b>{runtimeUsage.cachedInputTokens.toLocaleString()}</b></span>
-        <span>命中率 <b>{runtimeUsage.inputTokens ? `${((runtimeUsage.cachedInputTokens / runtimeUsage.inputTokens) * 100).toFixed(1)}%` : '--'}</b></span>
-      </div>
       {editingProject ? (
         <div className="editor-view">
           <header className="editor-header">
             <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
             <h2>{editingProject.title}</h2>
-            <div className="runtime-usage-summary" title="仅统计中转站实际返回 usage 的请求；未返回 usage 的请求不会计入">
-              <span>总用量 <b>{runtimeUsage.totalTokens.toLocaleString()}</b> tokens</span>
-              <span>缓存命中 <b>{runtimeUsage.cachedInputTokens.toLocaleString()}</b></span>
-              <span>命中率 <b>{runtimeUsage.inputTokens ? `${((runtimeUsage.cachedInputTokens / runtimeUsage.inputTokens) * 100).toFixed(1)}%` : '--'}</b></span>
-            </div>
             {!outlineMode && !cardMode && !styleMode && <>
               <button className="editor-tool-button" title="搜索章节与全文" onClick={() => { setShowSearchPanel(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
@@ -4528,6 +4563,9 @@ function App() {
                     <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={outlineAgentInstruction} onChange={event => setOutlineAgentInstruction(event.target.value)} placeholder="描述要补全的结构、节奏、冲突和章节安排" />
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择大纲技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><p>不选时由智能体按大纲创作意图自动选择技能。</p><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
+                    <div className="agent-card-picker"><div className="agent-card-picker-title">大纲带入卡片 <small>{selectedOutlineCardIds.length} 张</small></div>{editingProject.cards.length === 0 ? <p className="empty-hint compact">没有可带入的知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineCardIds.includes(card.id)} onChange={() => setSelectedOutlineCardIds(current => current.includes(card.id) ? current.filter(id => id !== card.id) : [...current, card.id])} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>
+                    {outlineChatMessages.length > 0 && <div className="agent-chat-history">{outlineChatMessages.map((message, index) => <article key={`${message.createdAt}-${index}`} className={`agent-chat-bubble ${message.role}`}><small>{message.role === 'user' ? '你' : '大纲智能体'}</small><p>{message.content}</p></article>)}</div>}
+                    {outlineGenerating && <article className="agent-chat-bubble assistant"><small>大纲智能体正在回复</small><p>{outlineStreamContent || '正在连接模型...'}</p></article>}
                     <div className="outline-agent-actions"><button className="btn-primary" disabled={outlineGenerating || !activeOutline} onClick={() => void generateOutline()}>{outlineGenerating ? '生成大纲中...' : '生成当前大纲'}</button></div>
                     {outlineGenerating && <div className="outline-agent-progress"><span className="agent-progress-dot active" /><span>正在分析作品设定、卡片和知识图谱...</span></div>}
                     {agentError && <div className="agent-error">{agentError}</div>}
@@ -4541,6 +4579,8 @@ function App() {
                     <textarea value={cardAgentInstruction} onChange={event => setCardAgentInstruction(event.target.value)} placeholder="描述要补充的身份、能力、关系、限制或状态变化" />
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择卡片技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
                     <div className="card-agent-context"><span>当前卡片</span><strong>{activeCard?.title || cardDraft.title || '新建卡片'}</strong><small>{cardDraft.type} · {countNovelCharacters(cardDraft.content)} 字</small></div>
+                    {cardChatMessages.length > 0 && <div className="agent-chat-history">{cardChatMessages.map((message, index) => <article key={`${message.createdAt}-${index}`} className={`agent-chat-bubble ${message.role}`}><small>{message.role === 'user' ? '你' : '卡片智能体'}</small><p>{message.content}</p></article>)}</div>}
+                    {cardGenerating && <article className="agent-chat-bubble assistant"><small>卡片智能体正在回复</small><p>{cardStreamContent || '正在连接模型...'}</p></article>}
                     <button className="agent-run-button" disabled={!cardDraft.title.trim() && !cardDraft.content.trim() || cardGenerating} onClick={() => void generateCardWithAI()}>{cardGenerating ? '卡片生成中...' : '运行卡片创建智能体'}</button>
                     {cardGenerating && <div className="outline-agent-progress"><span className="agent-progress-dot active" /><span>正在分析作品设定、章节和已有卡片...</span></div>}
                     <p className="outline-agent-hint">卡片智能体会读取作品简介、大纲、当前章节和已有知识卡，生成结果会直接回填中间卡片编辑区。</p>
@@ -4649,7 +4689,7 @@ function App() {
                       {agentDraft.contextReport.estimatedInputTokens ? <span>估算输入 {agentDraft.contextReport.estimatedInputTokens.toLocaleString()} tokens</span> : null}
                       {agentDraft.contextReport.upstreamUsage?.requests ? <><span>中转输入 {agentDraft.contextReport.upstreamUsage.inputTokens.toLocaleString()} tokens</span><span>中转输出 {agentDraft.contextReport.upstreamUsage.outputTokens.toLocaleString()} tokens</span><span>中转总计 {agentDraft.contextReport.upstreamUsage.totalTokens.toLocaleString()} tokens</span><span>上游缓存命中 {agentDraft.contextReport.upstreamUsage.cachedInputTokens.toLocaleString()} tokens</span><span>上游缓存命中率 {agentDraft.contextReport.upstreamUsage.inputTokens ? `${((agentDraft.contextReport.upstreamUsage.cachedInputTokens / agentDraft.contextReport.upstreamUsage.inputTokens) * 100).toFixed(1)}%` : '未返回输入用量'}</span></> : <span>中转站未返回用量与缓存字段</span>}
                     </div>}
-                    <textarea className="agent-draft-preview" value={agentDraft.draftContent} onChange={(event) => setAgentDraft({ ...agentDraft, draftContent: event.target.value })} />
+                    <textarea className="agent-draft-preview" value={agentDisplayContent || agentDraft.draftContent} onChange={(event) => { setAgentDisplayContent(event.target.value); setAgentDraft({ ...agentDraft, draftContent: event.target.value }); }} />
                     {agentDraft.summary && <p className="agent-summary">{agentDraft.summary}</p>}
                     {agentDraft.reviewResult && (
                       <div className={`agent-review ${agentDraft.reviewResult.consistent ? 'passed' : 'warning'}`}>
@@ -4867,7 +4907,14 @@ function App() {
               <h3 id="settings-title">设置</h3>
               <button className="modal-close" aria-label="关闭" onClick={() => setShowSettingsModal(false)}>×</button>
             </div>
-            <div className="modal-body">
+            <div className="settings-layout">
+              <nav className="settings-sidebar" aria-label="设置分类">
+                <button className={settingsSection === 'model' ? 'active' : ''} onClick={() => setSettingsSection('model')}><strong>AI 模型配置</strong><small>服务、接口、密钥与模型参数</small></button>
+                <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
+                <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>总计与按天统计</small></button>
+              </nav>
+            <div className="modal-body settings-content">
+              {settingsSection === 'model' && <>
               <section className="settings-service-card">
                 <div className="settings-service-header">
                   <button className="settings-collapse-button" aria-label={settingsServiceExpanded ? '收起服务配置' : '展开服务配置'} onClick={() => setSettingsServiceExpanded(current => !current)}>{settingsServiceExpanded ? '⌄' : '›'}</button>
@@ -4924,13 +4971,22 @@ function App() {
                   </div>
                 </div>}
               </section>
-              <section className="settings-network-card settings-network-panel">
+              </>}
+              {settingsSection === 'network' && <section className="settings-network-card settings-network-panel">
                 <div className="settings-network-header"><div><strong>网络设置</strong><small>为模型请求配置代理连接</small></div><label className="settings-toggle" title="启用网络代理"><input type="checkbox" checked={settingsDraft.proxyEnabled} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyEnabled: event.target.checked })} /><span /></label></div>
                 <div className="settings-network-address"><input className="input" value={settingsDraft.proxyURL} disabled={!settingsDraft.proxyEnabled} placeholder="http://127.0.0.1:7897" onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyURL: event.target.value })} /><button className="btn-secondary" onClick={useSystemProxy}>读取系统代理</button></div>
                 <label className="settings-network-check"><input type="checkbox" checked={settingsDraft.proxyBypassLocal} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyBypassLocal: event.target.checked })} /> 本地地址不走代理（推荐）</label>
-                <small className="settings-network-note">支持 HTTP/HTTPS 代理，例如 Clash、Surge、V2Ray 的本地 HTTP 端口；SOCKS 地址请先转换为 HTTP 端口。</small>
-              </section>
+                <small className="settings-network-note">支持 HTTP/HTTPS 代理，例如 Clash、Surge、V2Ray 的本地 HTTP 端口。</small>
+              </section>}
+              {settingsSection === 'usage' && <section className="usage-dashboard">
+                <div className="usage-toolbar"><span>时间范围</span><div className="usage-range-checks">{[['all', '全部'], ['today', '今天'], ['1', '1 天'], ['7', '7 天'], ['14', '14 天'], ['30', '30 天']].map(([value, label]) => <label key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''}><input type="checkbox" checked={!usageStartDate && !usageEndDate && usageDateFilter === value} onChange={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }} />{label}</label>)}</div></div>
+                <div className="usage-date-controls"><label>开始日期<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束日期<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>清除日期</button></div>
+                <div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间真实消耗 Tokens' : '筛选时间真实消耗 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div>
+                <div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div>
+                <div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div>
+              </section>}
               <p className="settings-hint">保存后，编辑器中的 AI 智能体会使用模型与网络配置。密钥仅保存到本机。</p>
+            </div>
             </div>
             <div className="modal-footer">
               <button className="btn-secondary" onClick={() => setShowSettingsModal(false)}>取消</button>

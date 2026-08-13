@@ -117,6 +117,7 @@ export const ChapterState = Annotation.Root({
   draftContent: Annotation<string | undefined>,
   summary: Annotation<string | undefined>,
   contextReport: Annotation<ContextReport | undefined>,
+  sessionContext: Annotation<string | undefined>,
   upstreamUsage: Annotation<UsageTotals | undefined>({ reducer: (_prev, next) => next, default: () => undefined }),
   reviewResult: Annotation<{
     consistent: boolean;
@@ -302,25 +303,20 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const planSection = state.chapterPlan ? `\n## 下一章计划（必须执行）\n${state.chapterPlan}\n` : "";
       // Keep project facts first and byte-stable; only the dynamic turn changes after it.
       const stablePacket = stableProjectPacket(state);
-      const dynamicPacket = [continuitySection, planSection, contextSection].filter(Boolean).join("");
+      const sessionSection = state.sessionContext ? `\n## 本小说追加式会话交接\n${compactText(state.sessionContext, 2200)}\n` : "";
+      const dynamicPacket = [sessionSection, continuitySection, planSection, contextSection].filter(Boolean).join("");
       const taskPrompt = `## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：先承接上一章最后的动作、位置和情绪，再推进计划中的事件；不要复述计划或解释过程。`;
       const draftInputBytes = byteLength(chapterWriterSystemPrompt) + byteLength(stablePacket) + byteLength(dynamicPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
 
       // 流式生成文本
-      const accumulator = new StreamAccumulator((chunk) => {
-        emitter?.chunk(chunk);
-      });
-
       emitter?.progress("draft", 38, "已提交模型请求，正在生成正文");
-      const response = await client.chat([
+      const response = await client.chatStream([
         { role: "system", content: chapterWriterSystemPrompt },
         { role: "user", content: `## 稳定作品资料\n${stablePacket || "（暂无稳定资料）"}` },
         { role: "user", content: `## 本章动态资料\n${dynamicPacket || "（暂无动态资料）"}` },
         { role: "user", content: taskPrompt },
-      ], { response_format: { type: "json_object" } });
-      
-      accumulator.append(response.content);
+      ], { response_format: { type: "json_object" } }, chunk => emitter?.chunk(chunk));
       emitter?.progress("draft", 70, "章节生成完成");
 
       try {

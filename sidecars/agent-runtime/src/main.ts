@@ -27,6 +27,7 @@ interface RPCResponse {
 // normal editor actions without persisting any novel material outside memory.
 const chapterPreparationCache = new LruCache<PreparedChapterInput>(48);
 const chapterMemoryCache = new LruCache<Record<string, unknown>>(96);
+const novelSessionCache = new LruCache<string>(128);
 
 const memoryEditorSystemPrompt = `你是长篇小说的记忆编辑。只从章节正文与给定的相关资料抽取明确事实，不补写未发生的剧情。
 
@@ -1328,7 +1329,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         { role: "system", content: memoryEditorSystemPrompt },
         { role: "user", content: compactMemoryPrompt },
       ], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 1300, retryAttempts: 4 });
-      const contextReport: ContextReport = {
+        const contextReport: ContextReport = {
         cache: "miss",
         sourceBytes: byteLength(JSON.stringify({ content, cards: rawCards, knowledgeGraph })),
         packedBytes: byteLength(chapterContent) + byteLength(compactCardContext) + byteLength(compactGraphContext),
@@ -1676,6 +1677,10 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
+      const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
+      const emitter = new StreamEmitter();
+      emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
+      emitter.progress("draft", 20, "正在整理卡片资料");
       const outlineContext = Array.isArray(outlines) && outlines.length
         ? `\n## 作品大纲片段\n${outlines.map(outline => { const item = outline as Record<string, unknown>; return `### ${String(item.kind || "大纲")}\n${String(item.content || "").slice(0, 3000)}`; }).join("\n\n")}`
         : "";
@@ -1686,7 +1691,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         ? `\n## 当前章节片段（用于提取事实）\n${String(chapterTitle || "当前章节")}\n${String(chapterContent)}`
         : "";
       const prompt = `你是长篇小说的知识设定编辑。请为《${String(projectTitle)}》生成一张${String(cardType)}，供章节智能体长期检索。\n\n作者指令：${String(instruction || "补全卡片知识，保持设定一致") }\n\n作品简介：${String(synopsis || "暂无")}${outlineContext}${chapterContext}${cardContext}\n\n${cardTitle ? `用户给出的卡片名称：${String(cardTitle)}` : "请根据上下文拟定一个准确、简洁的卡片名称。"}\n${existingContent ? `\n用户已有草稿，请在不违背正文事实的前提下补全：\n${String(existingContent)}` : ""}\n\n只返回 JSON：\n{\n  "title": "卡片名称",\n  "content": "详细 Markdown 内容"\n}\n\n内容请按卡片类型组织：角色卡写身份、性格、目标、能力、关系、当前状态和秘密；物品卡写来源、外观、能力、代价和持有者；地点卡写环境、势力、规则、资源和危险；势力卡写目标、组织结构、成员、资源和敌对关系；金手指卡写触发条件、能力、限制、升级路径和代价。只记录上下文能够支持的事实，未知部分明确标为待揭示。`;
-      const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" } });
+      const response = await client.chatStream([{ role: "user", content: prompt }], { response_format: { type: "json_object" } }, chunk => emitter.chunk(chunk));
+      emitter.complete("卡片内容生成完成");
       try {
         const result = JSON.parse(response.content) as Record<string, unknown>;
         return {
@@ -1715,17 +1721,29 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
+      const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
+      const emitter = new StreamEmitter();
+      emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
+      emitter.progress("plan", 20, "正在整理大纲资料");
       const cardSection = Array.isArray(cards) && cards.length > 0
-        ? `\n## 相关知识卡片\n${cards.map(card => { const item = card as Record<string, unknown>; return `### ${String(item.title || "卡片")}\n${String(item.content || "")}`; }).join("\n\n")}`
+        ? `\n## 相关知识卡片\n${cards.slice(0, 8).map(card => { const item = card as Record<string, unknown>; return `### ${compactText(item.title || "卡片", 80)}\n${compactText(item.content || "", 700)}`; }).join("\n\n")}`
         : "";
       const graphSection = knowledgeGraph && typeof knowledgeGraph === "object"
-        ? `\n## 知识图谱约束\n${JSON.stringify(knowledgeGraph).slice(0, 12000)}\n请保持已有实体和关系一致，新增关系标注为“待揭示”。`
+        ? `\n## 知识图谱约束\n${compactKnowledgeGraph(knowledgeGraph, `${String(projectTitle)} ${String(kind)} ${String(instruction || "")}`, 2800)}\n请保持已有实体和关系一致，新增关系标注为“待揭示”。`
         : "";
-      const skillSection = Array.isArray(skills) && skills.length
-        ? `\n## 可用大纲技能\n${skills.map(skill => { const item = skill as Record<string, unknown>; return `### ${String(item.displayName || item.name || "技能")}\n${String(item.content || item.description || "")}`; }).join("\n\n")}\n优先使用技能：${Array.isArray(preferredSkillNames) && preferredSkillNames.length ? preferredSkillNames.join("、") : "由你按意图选择"}`
+      const requestedSkills = Array.isArray(preferredSkillNames) ? preferredSkillNames.map(String) : [];
+      const query = `${String(kind)} ${String(instruction || "")}`.toLowerCase();
+      const outlineSkillName = kind === "总纲" ? "outline-total-planner" : kind === "章纲" ? "fanqie-chapter-outline" : "world-setting-planner";
+      const matchedSkills = Array.isArray(skills) ? skills
+        .map(skill => ({ item: skill as Record<string, unknown>, score: (() => { const item = skill as Record<string, unknown>; const terms = `${item.name || ""} ${item.displayName || ""} ${item.category || ""} ${item.description || ""} ${(Array.isArray(item.tags) ? item.tags : []).join(" ")}`.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(term => term.length > 1); return requestedSkills.includes(String(item.name || "")) ? 100 : terms.reduce((total, term) => total + (query.includes(term) ? 1 : 0), 0); })() }))
+        .filter(entry => entry.score > 0 || String(entry.item.name || "") === outlineSkillName).sort((a, b) => (String(b.item.name || "") === outlineSkillName ? 1000 : b.score) - (String(a.item.name || "") === outlineSkillName ? 1000 : a.score)).slice(0, 3).map(entry => entry.item)
+        : [];
+      const skillSection = matchedSkills.length
+        ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 700)}`).join("\n\n")}`
         : "";
       const prompt = `你是长篇网络小说总策划与章节规划 Agent。请为《${String(projectTitle)}》编写或完善一份${String(kind)}，供后续章节 Agent 使用。\n\n作者本次指令：${String(instruction || "补全结构并强化可执行性") }\n\n作品简介：${String(synopsis || "暂无")}\n\n现有大纲内容：${String(existingContent || "暂无")}${cardSection}${graphSection}${skillSection}\n\n要求：保持已有设定一致；把模糊想法整理成可执行的 Markdown；明确人物动机、冲突升级、章节目标、关键事件、伏笔与结尾钩子；不要输出解释性前言，只输出大纲文档正文。`;
-      const response = await client.chat([{ role: "user", content: prompt }]);
+      const response = await client.chatStream([{ role: "user", content: compactText(prompt, 18000) }], { max_tokens: kind === "章纲" ? 2200 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+      emitter.complete("大纲内容生成完成");
       return { id: req.id, result: { content: response.content } };
     }
     if (req.method === "chapter.write") {
@@ -1778,6 +1796,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         cache: cachedPreparation ? "hit" : "miss",
         sections: { ...prepared.report.sections },
       };
+      const sessionKey = stableHash({ projectId: String(projectId), model: String(model || ""), apiMode: String(apiMode || "openai") });
+      const sessionContext = novelSessionCache.get(sessionKey) || "";
       streamEmitter.progress("starting", 6, `${cachedPreparation ? "上下文缓存命中" : "上下文缓存未命中"}；已将 ${Math.max(0, contextReport.prunedBytes / 1024).toFixed(1)} KB 无关资料移出本次请求`);
       try {
         const normalizedProjectId = String(projectId);
@@ -1873,7 +1893,11 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           skillCatalog: prepared.skills,
           preferredSkillNames: stringList(preferredSkillNames, 8),
           contextReport,
+          sessionContext,
         });
+        const resultRecord = result as Record<string, unknown>;
+        const handoff = [resultRecord.chapterPlan, resultRecord.summary, resultRecord.reviewResult && JSON.stringify(resultRecord.reviewResult)].filter(Boolean).join("\n");
+        if (handoff) novelSessionCache.set(sessionKey, compactText(handoff, 5000));
         const resultWithUsage = {
           ...result,
           contextReport: {

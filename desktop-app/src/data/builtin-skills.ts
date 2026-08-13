@@ -4,6 +4,21 @@ import { advancedBuiltinSkills } from './advanced-skills';
 const builtinSkillDefinitions: Skill[] = [
   ...advancedBuiltinSkills,
   {
+    id: 'builtin-outline-total', name: 'outline-total-planner', displayName: '番茄小说总纲生成器', category: 'setup',
+    description: '生成总纲、主线、人物弧光、分卷推进和长期伏笔。', tags: ['总纲', '番茄', '主线'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 番茄小说总纲生成器\n\n输出题材卖点、主线目标、人物动机与成长弧、分卷推进、冲突升级、伏笔布局和结局回收。每卷明确目标、阻力、转折和阶段钩子。',
+  },
+  {
+    id: 'builtin-outline-chapter', name: 'fanqie-chapter-outline', displayName: '番茄小说章纲生成器', category: 'setup',
+    description: '按番茄快节奏爽文结构生成章纲。', tags: ['章纲', '爽点', '情绪曲线', '章末钩子'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 番茄小说章纲生成器\n\n每章包含：章节序号、核心爽点主副类型、压抑—爆发—余韵—新危机四段情绪曲线、1-3 个场景的地点人物目标冲突转折、人物功能、信息揭示、伏笔和强章末钩子。情绪占比通常 20/50/20/10，必须有释放点和追读钩子。',
+  },
+  {
+    id: 'builtin-outline-world', name: 'world-setting-planner', displayName: '世界观与作品设定生成器', category: 'setup',
+    description: '建立世界规则、力量体系、势力结构、地图和设定边界。', tags: ['世界观', '设定', '力量体系'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 世界观与作品设定生成器\n\n输出时代背景、世界规则、力量/职业体系、资源与代价、势力结构、地理地图、社会秩序、关键名词和设定边界；标记已确认与待揭示内容，避免与知识图谱和卡片冲突。',
+  },
+  {
     id: 'builtin-story-setup', name: 'story-setup', category: 'setup',
     description: '搭建小说写作工程，检查章节、大纲、卡片与记忆目录。',
     tags: ['项目初始化', '目录', '工作流'], rating: 5, usageCount: 0, builtin: true,

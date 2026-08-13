@@ -31,7 +31,7 @@ const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolv
 
 function apiErrorMessage(status: number, detail: string, statusText: string, attempts: number, routeHint = ""): string {
   const retrySuffix = attempts > 1 ? `，已自动重试 ${attempts - 1} 次` : "";
-  if ([502, 503, 504].includes(status)) {
+  if ([502, 503, 504, 524].includes(status)) {
     return `API 中转服务当前返回 ${status}（可能来自代理或 API 上游网关）${routeHint}${retrySuffix}，请稍后再试、测试模型，或在设置中切换模型。`;
   }
   if (status === 429) return `API 中转服务请求过于频繁${routeHint}${retrySuffix}，请稍后再试。`;
@@ -344,7 +344,7 @@ export class ApiSaverClient {
         }
 
         const detail = await response.text();
-        const retryable = [408, 429, 500, 502, 503, 504].includes(response.status);
+        const retryable = [408, 429, 500, 502, 503, 504, 524].includes(response.status);
         if (retryable && attempt < maxAttempts) {
           await sleep(800 * 2 ** (attempt - 1));
           continue;
@@ -361,5 +361,59 @@ export class ApiSaverClient {
       }
     }
     throw new Error(`无法连接 API 中转服务，已自动重试 ${maxAttempts - 1} 次：${lastNetworkError || "网络连接失败"}`);
+  }
+
+  async chatStream(messages: ChatMessage[], options: ChatOptions = {}, onChunk?: (chunk: string) => void): Promise<{ content: string; model: string; usage?: ApiUsage }> {
+    // OpenAI-compatible SSE gives the UI genuine incremental text. Other modes
+    // retain the same response contract and degrade to one final chunk.
+    if ((this.config.apiMode || "openai") !== "openai") {
+      const response = await this.chat(messages, options);
+      onChunk?.(response.content);
+      return response;
+    }
+    const model = options.model || this.config.defaultModel || "gpt-4o-mini";
+    const rawBaseURL = trimTrailingSlash(this.config.baseURL || "https://api.apisaver.com/v1").replace(/\/chat\/completions$/i, "");
+    const baseURL = rawBaseURL.endsWith("/v1") ? rawBaseURL : `${rawBaseURL}/v1`;
+    const endpoint = `${baseURL}/chat/completions`;
+    const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
+    const dispatcher = proxyDispatcherFor(endpoint, this.config);
+    const response = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.config.apiKey}` },
+      body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: options.response_format, stream: true, stream_options: { include_usage: true } }),
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit);
+    if (!response.ok || !response.body) throw new Error(apiErrorMessage(response.status, await response.text(), response.statusText, 1, proxyRouteHint(endpoint, this.config)));
+    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
+    try {
+      while (true) {
+        const next = await Promise.race([
+          reader.read(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("SSE 首个响应超时")), content ? 45000 : 30000)),
+        ]); if (next.done) break;
+        buffer += decoder.decode(next.value, { stream: true });
+        const lines = buffer.split("\n"); buffer = lines.pop() || "";
+        for (const line of lines) {
+          const text = line.trim().replace(/^data:\s*/, ""); if (!text || text === "[DONE]") continue;
+          try { const event = JSON.parse(text) as Record<string, unknown>; const choice = Array.isArray(event.choices) ? event.choices[0] as Record<string, unknown> : undefined; const delta = choice?.delta as Record<string, unknown> | undefined; const chunk = typeof delta?.content === "string" ? delta.content : ""; if (chunk) { content += chunk; onChunk?.(chunk); } usage = parseUsage(event.usage) || usage; } catch { /* Ignore proxy keep-alives. */ }
+        }
+      }
+    } catch (error) {
+      if (!content) {
+        const fallback = await this.chat(messages, options);
+        onChunk?.(fallback.content);
+        return fallback;
+      }
+      throw new Error(`API Saver 流式连接中断：${error instanceof Error ? error.message : String(error)}`);
+    }
+    recordRuntimeUsage(usage);
+    // Some OpenAI-compatible gateways accept stream=true but answer with one
+    // ordinary JSON response. Preserve compatibility and still update UI once.
+    if (!content) {
+      const fallback = await this.chat(messages, options);
+      onChunk?.(fallback.content);
+      return fallback;
+    }
+    return { content, model, usage };
   }
 }
