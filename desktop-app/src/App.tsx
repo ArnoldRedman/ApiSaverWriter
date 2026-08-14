@@ -3394,13 +3394,29 @@ function App() {
   const handleCreateOutline = (kind: OutlineKind) => {
     if (!editingProject) return;
     const now = new Date().toISOString();
-    const chapterId = kind === '章纲' ? activeChapter?.id : undefined;
-    const chapterTitle = chapterId ? editingProject.chapters.find(chapter => chapter.id === chapterId)?.title : undefined;
+    // 章纲按项目内已有章节/章纲的最大序号递增，避免新建时重复落在当前选中章节。
+    const chapterNumberFromText = (value: string) => {
+      const match = value.match(/第\s*(\d+)\s*章/u);
+      return match ? Number(match[1]) : 0;
+    };
+    const nextChapterNumber = kind === '章纲'
+      ? Math.max(
+        0,
+        ...editingProject.chapters.map(chapter => chapterNumberFromText(chapter.title)),
+        ...editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => chapterNumberFromText(`${outline.title}\n${outline.content}`)),
+      ) + 1
+      : 0;
+    const nextChapter = kind === '章纲'
+      ? editingProject.chapters.find(chapter => chapterNumberFromText(chapter.title) === nextChapterNumber)
+      : undefined;
+    const chapterId = nextChapter?.id;
+    const chapterTitle = kind === '章纲' ? (nextChapter?.title || `第 ${nextChapterNumber} 章`) : undefined;
+    const outlineTitle = kind === '章纲' ? `章纲｜${chapterTitle}` : kind;
     const outline: OutlineDocument = {
       id: Date.now(),
       kind,
       chapterId,
-      title: kind === '章纲' ? (chapterTitle ? `章纲｜${chapterTitle}` : '章纲') : kind,
+      title: outlineTitle,
       content: `# ${kind}${chapterTitle ? `｜${chapterTitle}` : ''}\n\n`,
       createdAt: now,
       updatedAt: now,
@@ -4947,7 +4963,7 @@ function App() {
             <header className="page-header"><div><span className="page-eyebrow">市场观察</span><h2>扫榜管理</h2><p>聚合番茄小说网、起点和飞卢榜单，选书后可下载或进入拆书流程。</p></div><div className="ranking-header-actions"><button className="btn-secondary" onClick={() => void runRankingAnalysis()} disabled={rankingAnalysisRunning || !rankingBooks.length}>{rankingAnalysisRunning ? '盘点中...' : 'AI 趋势盘点'}</button><button className="btn-primary" onClick={() => void fetchRankingBooks()} disabled={rankingLoading}>{rankingLoading ? '拉取中...' : '刷新榜单'}</button></div></header>
             <div className="ranking-toolbar"><select className="select" aria-label="榜单平台" value={rankingPlatform} onChange={event => { const nextPlatform = event.target.value as RankingPlatform; setRankingPlatform(nextPlatform); setRankingBooks([]); if (nextPlatform === 'fanqie') { setFanqieSection('male-read'); setFanqieCategoryId('all'); setRankingType('read'); } else { setRankingType(rankingTypeOptions(nextPlatform)[0].value); } }}><option value="fanqie">番茄小说网</option><option value="qidian">起点中文网</option><option value="faloo">飞卢中文网</option></select>{rankingPlatform === 'fanqie' ? <><select className="select" aria-label="番茄榜单分类" value={fanqieSection} onChange={event => { setFanqieSection(event.target.value as FanqieSection); setFanqieCategoryId('all'); }} >{fanqieSectionOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select className="select" aria-label="番茄题材分类" value={fanqieCategoryId} onChange={event => setFanqieCategoryId(event.target.value)} disabled={fanqieCategoriesLoading}><option value="all">{fanqieCategoriesLoading ? '分类加载中...' : '总榜'}</option>{(fanqieCategories[fanqieSection] || []).filter(category => category.id !== 'all').map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></> : <select className="select" value={rankingType} onChange={event => setRankingType(event.target.value as RankingType)}>{rankingTypeOptions(rankingPlatform).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>}<input className="input" value={rankingQuery} onChange={event => setRankingQuery(event.target.value)} placeholder="筛选书名、作者、分类" />{rankingSourceName && <span className="ranking-source-label">数据来源：{rankingSourceName}</span>}</div>
             {rankingAnalysis && <section className="ranking-analysis"><div className="panel-section-title">story-long-scan 市场盘点 <button className="link-button" onClick={() => setRankingAnalysis('')}>收起</button></div><pre>{rankingAnalysis}</pre></section>}
-            {visibleRankingBooks.length === 0 ? <div className="empty-state"><p>选择平台后点击“刷新榜单”。</p></div> : <div className="ranking-grid">{visibleRankingBooks.map(book => <article className="ranking-book-card" key={book.id}><div className="ranking-book-rank">{book.rank}</div><div className="ranking-book-copy"><h3>{book.title}</h3><span>{book.author} · {book.category || '未分类'}</span><p>{book.intro || '暂无简介'}</p><small>{book.wordCount ? `${book.wordCount.toLocaleString()} 字` : '字数未知'}{book.readCount ? ` · ${book.readCount.toLocaleString()} 热度` : ''}</small><div className="ranking-book-actions"><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : '一键下载 TXT'}</button><button className="link-button" onClick={async () => { const downloaded = libraryBooks.find(item => item.title === book.title); const ready = downloaded || await downloadLibraryBook(book); if (ready) createDismantleFromLibrary(ready); }}>{bookDownloadRunningId === book.id ? '处理中...' : '一键拆书'}</button></div></div></article>)}</div>}
+            {visibleRankingBooks.length === 0 ? <div className="empty-state"><p>选择平台后点击“刷新榜单”。</p></div> : <div className="ranking-grid">{visibleRankingBooks.map(book => <article className="ranking-book-card" key={book.id}><div className="ranking-book-rank">{book.rank}</div><div className={`ranking-book-cover ${book.cover ? 'has-image' : ''}`}><span>{book.title.trim().slice(0, 1) || '书'}</span>{book.cover && <img src={book.cover} alt={`${book.title}封面`} loading="lazy" onError={event => event.currentTarget.parentElement?.classList.remove('has-image')} />}</div><div className="ranking-book-copy"><h3>{book.title}</h3><span>{book.author} · {book.category || '未分类'}</span><p>{book.intro || '暂无简介'}</p><small>{book.wordCount ? `${book.wordCount.toLocaleString()} 字` : '字数未知'}{book.readCount ? ` · ${book.readCount.toLocaleString()} 热度` : ''}</small><div className="ranking-book-actions"><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : '一键下载 TXT'}</button><button className="link-button" onClick={async () => { const downloaded = libraryBooks.find(item => item.title === book.title); const ready = downloaded || await downloadLibraryBook(book); if (ready) createDismantleFromLibrary(ready); }}>{bookDownloadRunningId === book.id ? '处理中...' : '一键拆书'}</button></div></div></article>)}</div>}
           </div>
         )}
         {activeTab === 'dismantles' && (

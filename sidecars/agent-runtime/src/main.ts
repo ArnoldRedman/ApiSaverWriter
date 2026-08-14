@@ -1130,7 +1130,7 @@ const parseNovelCatchRanking = (html: string, rankType: string, gender: string):
       title,
       author: infoParts[0] || '未知作者',
       intro: card.find('p.line-clamp-2').first().text().replace(/\s+/gu, ' ').trim(),
-      cover: card.find('img').first().attr('src') || undefined,
+      cover: resolveBookUrl('https://novelcatch.com/rank', card.find('img').first().attr('src') || '') || undefined,
       category: card.find('a[href^="/category/"]').first().text().trim() || undefined,
       rank,
       rankType,
@@ -1193,9 +1193,15 @@ const fetchQidianRanking = async (rankType: string, gender: string, params?: Rec
   const basePath = rankType === "new" ? "signnewbook" : rankType === "read" ? "readindex" : "yuepiao";
   // 起点榜单统一使用官网默认榜单，不再区分男频/女频频道。
   const pageUrl = `https://www.qidian.com/rank/${basePath}/`;
-  const html = await fetchWebText(pageUrl, params);
+  const html = await fetchWebText(pageUrl, params, { headers: { Referer: 'https://www.qidian.com/rank/' } });
   const $ = loadHtml(html);
-  return $('li[data-rid]').toArray().slice(0, 60).map((element, index) => {
+  // 页面顶部也可能带 data-rid 的导航项；先筛出真实书籍行再截取，避免
+  // 前置无关元素占满 slice 后造成“返回 0 本书”。
+  const rankRows = $('li[data-rid]').toArray().filter(element => {
+    const titleNode = $(element).find('.book-mid-info h2 a').first();
+    return Boolean(titleNode.text().trim() && titleNode.attr('href'));
+  }).slice(0, 60);
+  const books = rankRows.map((element, index) => {
     const item = $(element);
     const titleNode = item.find('.book-mid-info h2 a').first();
     const href = resolveBookUrl(pageUrl, titleNode.attr('href') || '');
@@ -1209,6 +1215,8 @@ const fetchQidianRanking = async (rankType: string, gender: string, params?: Rec
       rankType, gender: 'all', platform: 'qidian', url: href,
     };
   }).filter(book => book.title && book.url);
+  if (!books.length) throw new Error(`起点中文网${basePath}榜单未返回可解析书籍，官网页面可能正在校验或已更新结构`);
+  return books;
 };
 
 const fetchFalooRanking = async (rankType: string, gender: string, params?: Record<string, unknown>): Promise<Array<Record<string, unknown>>> => {
