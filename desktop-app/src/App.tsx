@@ -71,6 +71,7 @@ interface ChapterMemory {
   characterStateChanges: string[];
   knowledgeChanges: string[];
   foreshadowingChanges: string[];
+  foreshadowingItems?: Array<{ text: string; status: 'active' | 'progressing' | 'resolved' | 'overdue'; priority: 'high' | 'normal' | 'low'; plantedChapter?: number; targetChapter?: number }>;
   timelineEvents: string[];
   canonFacts: string[];
   conflicts: string[];
@@ -267,6 +268,7 @@ interface Project {
   chapterTargetWords?: number;
   styleProfileId?: string;
   sourceDismantleBookId?: string;
+  authorPreferences?: string[];
 }
 
 type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten';
@@ -415,6 +417,7 @@ interface AgentDraftResult {
   draftContent?: string;
   summary?: string;
   chapterPlan?: string;
+  prewriteCheck?: { blockers: string[]; warnings: string[]; summary: string };
   reviewResult?: AgentReviewResult;
   retrievedContext?: string[];
   recognizedIntent?: string;
@@ -429,6 +432,7 @@ interface AgentDraftResult {
     draftInputBytes?: number;
     reviewInputBytes?: number;
     estimatedInputTokens?: number;
+    contextProfile?: '剧情' | '战斗' | '情感' | '转场';
     sections?: Record<string, number>;
     upstreamUsage?: {
       inputTokens: number;
@@ -461,6 +465,7 @@ interface AgentMemoryResult {
   characterStateChanges?: string[];
   knowledgeChanges?: string[];
   foreshadowingChanges?: string[];
+  foreshadowingItems?: ChapterMemory['foreshadowingItems'];
   timelineEvents?: string[];
   canonFacts?: string[];
   conflicts?: string[];
@@ -468,6 +473,7 @@ interface AgentMemoryResult {
   entities?: Array<{ name?: string; type?: string }>;
   relations?: Array<{ source?: string; target?: string; label?: string; weight?: number }>;
   cardUpdates?: Array<{ cardId?: number | string; cardTitle?: string; status?: string; changes?: string }>;
+  authorPreferences?: string[];
   contextReport?: AgentDraftResult['contextReport'];
 }
 
@@ -475,6 +481,11 @@ type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'plan' | 'draft'
 type ApiMode = 'openai' | 'responses' | 'anthropic';
 type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max' | 'custom';
 type AgentProgressStatus = 'pending' | 'active' | 'complete' | 'error';
+
+const skillCategoryLabels: Record<string, string> = {
+  setup: '项目设置', write: '写作', review: '审查', polish: '润色',
+  import: '导入', analyze: '分析', tool: '工具', creator: '创建器',
+};
 
 interface AgentConfig {
   serviceName: string;
@@ -532,7 +543,25 @@ interface AgentProgressEvent {
     text?: string;
     message?: string;
     error?: string;
+    context?: {
+      action: string;
+      source?: string;
+      status?: 'searching' | 'selected' | 'pruned' | 'loaded' | 'cached';
+      bytes?: number;
+      items?: number;
+    };
   };
+}
+
+interface ContextTraceEvent {
+  id: string;
+  step: string;
+  action: string;
+  source?: string;
+  status?: 'searching' | 'selected' | 'pruned' | 'loaded' | 'cached';
+  bytes?: number;
+  items?: number;
+  timestamp: number;
 }
 
 const createAgentProgressItems = (): AgentProgressItem[] => agentWorkflowSteps.map(step => ({
@@ -805,6 +834,7 @@ const normalizeChapterMemory = (memory: Partial<ChapterMemory>, fallbackChapter?
     characterStateChanges: asTextList(memory.characterStateChanges),
     knowledgeChanges: asTextList(memory.knowledgeChanges),
     foreshadowingChanges: asTextList(memory.foreshadowingChanges),
+    foreshadowingItems: Array.isArray(memory.foreshadowingItems) ? memory.foreshadowingItems.filter(item => item && typeof item.text === 'string').map(item => ({ ...item, status: item.status || 'active', priority: item.priority || 'normal' })) : [],
     timelineEvents: asTextList(memory.timelineEvents),
     canonFacts: asTextList(memory.canonFacts),
     conflicts: asTextList(memory.conflicts),
@@ -1226,13 +1256,15 @@ function App() {
   const [selectedOutlineIds, setSelectedOutlineIds] = useState<number[]>([]);
   const [selectedAgentSkillNames, setSelectedAgentSkillNames] = useState<string[]>([]);
   const [showAgentSkillPicker, setShowAgentSkillPicker] = useState(false);
+  const [showChapterOutlinePicker, setShowChapterOutlinePicker] = useState(false);
+  const [showChapterCardPicker, setShowChapterCardPicker] = useState(false);
   const [cardTypeFilter, setCardTypeFilter] = useState<CardType | '全部'>('全部');
   const [cardDraft, setCardDraft] = useState<{ type: CardType; title: string; content: string }>({ type: '角色卡', title: '', content: '' });
-  useEffect(() => {
-    if (!activeChapter || !editingProject) return;
-    const linked = editingProject.outlines.filter(outline => outline.kind === '章纲' && outline.chapterId === activeChapter.id).map(outline => outline.id);
-    if (linked.length) setSelectedOutlineIds(current => Array.from(new Set([...current, ...linked])));
-  }, [activeChapter?.id, editingProject?.id, editingProject?.outlines]);
+  const getChapterOutline = (project: Project | null, chapter: Chapter | null) => {
+    if (!project || !chapter) return undefined;
+    return project.outlines.find(outline => outline.kind === '章纲' && String(outline.chapterId ?? '') === String(chapter.id))
+      || project.outlines.find(outline => outline.kind === '章纲' && outline.title === `章纲｜${chapter.title}`);
+  };
   const [cardGenerating, setCardGenerating] = useState(false);
   const [agentConfig, setAgentConfig] = useState<AgentConfig>(() => {
     const saved = localStorage.getItem('agent-config');
@@ -1285,6 +1317,13 @@ function App() {
   const [agentDisplayContent, setAgentDisplayContent] = useState('');
   const [outlineChatMessages, setOutlineChatMessages] = useState<AgentChatMessage[]>([]);
   const [cardChatMessages, setCardChatMessages] = useState<AgentChatMessage[]>([]);
+  const [chapterSessionId, setChapterSessionId] = useState(() => `chapter-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const [outlineSessionId, setOutlineSessionId] = useState(() => `outline-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const [cardSessionId, setCardSessionId] = useState(() => `card-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+  const [chapterPreviousSessionId, setChapterPreviousSessionId] = useState('');
+  const [outlinePreviousSessionId, setOutlinePreviousSessionId] = useState('');
+  const [cardPreviousSessionId, setCardPreviousSessionId] = useState('');
+  const newAgentSessionId = (kind: string) => `${kind}-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const [outlineStreamContent, setOutlineStreamContent] = useState('');
   const [cardStreamContent, setCardStreamContent] = useState('');
   const outlineRunRef = useRef('');
@@ -1294,6 +1333,7 @@ function App() {
   const [agentProgress, setAgentProgress] = useState<AgentProgressItem[]>([]);
   const [agentProgressPercent, setAgentProgressPercent] = useState(0);
   const [agentProgressMessage, setAgentProgressMessage] = useState('');
+  const [contextTrace, setContextTrace] = useState<ContextTraceEvent[]>([]);
   const [runtimeUsage, setRuntimeUsage] = useState<RuntimeUsageSummary>(() => {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
@@ -1320,7 +1360,8 @@ function App() {
       setRuntimeUsage(current => {
         const next = { ...current, inputTokens: current.inputTokens + delta.inputTokens, outputTokens: current.outputTokens + delta.outputTokens, totalTokens: current.totalTokens + delta.totalTokens, cachedInputTokens: current.cachedInputTokens + delta.cachedInputTokens, cacheWriteTokens: current.cacheWriteTokens + delta.cacheWriteTokens, reasoningTokens: current.reasoningTokens + delta.reasoningTokens, requests: current.requests + delta.requests };
         localStorage.setItem('writer-runtime-usage', JSON.stringify(next));
-        const date = new Date().toISOString().slice(0, 10);
+        const now = new Date();
+        const date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
         setUsageDays(days => {
           const existing = days.find(day => day.date === date);
           const updated = existing ? days.map(day => day.date === date ? { ...day, inputTokens: day.inputTokens + delta.inputTokens, outputTokens: day.outputTokens + delta.outputTokens, totalTokens: day.totalTokens + delta.totalTokens, cachedInputTokens: day.cachedInputTokens + delta.cachedInputTokens, cacheWriteTokens: day.cacheWriteTokens + delta.cacheWriteTokens, reasoningTokens: day.reasoningTokens + delta.reasoningTokens, requests: day.requests + delta.requests } : day) : [...days, { ...delta, date, startedAt: new Date().toISOString() }];
@@ -1422,6 +1463,19 @@ function App() {
       if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
       if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
       if (payload.runId !== activeAgentRunRef.current) return;
+      if (payload.type === 'context' && data.context) {
+        setContextTrace(current => [...current, {
+          id: `${Date.now()}-${current.length}`,
+          step: String(data.step || 'context'),
+          action: data.context?.action || data.message || '更新上下文',
+          source: data.context?.source,
+          status: data.context?.status,
+          bytes: data.context?.bytes,
+          items: data.context?.items,
+          timestamp: Date.now(),
+        }].slice(-40));
+        return;
+      }
       if (payload.type === 'chunk' && data.text) {
         setAgentDisplayContent(current => current + String(data.text));
         const characters = countNovelCharacters(data.text);
@@ -1673,7 +1727,15 @@ function App() {
       }));
       const mergedBuiltins = builtinSkills.map(skill => {
         const override = builtinOverrides.find(item => String(item.id) === String(skill.id));
-        return override ? { ...skill, ...override, displayName: override.displayName || skill.displayName, builtin: true } : skill;
+        // Built-in routing IDs remain stable, while the canonical Chinese
+        // display name always comes from the bundled definition. This also
+        // repairs older localStorage records that stored English labels.
+        if (!override) return skill;
+        const isLegacyWorldSetting = skill.name === 'world-setting-planner'
+          && /标记已确认与待揭示内容/u.test(String(override.content || ''));
+        return isLegacyWorldSetting
+          ? { ...skill, builtin: true }
+          : { ...skill, ...override, displayName: skill.displayName, builtin: true };
       });
       setSkills([...mergedBuiltins, ...customSkills]);
     } finally {
@@ -3292,6 +3354,7 @@ function App() {
           characterStateChanges: asTextList(result.characterStateChanges),
           knowledgeChanges: asTextList(result.knowledgeChanges),
           foreshadowingChanges: asTextList(result.foreshadowingChanges),
+          foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems : [],
           timelineEvents: asTextList(result.timelineEvents),
           canonFacts: asTextList(result.canonFacts),
           conflicts: asTextList(result.conflicts),
@@ -3303,7 +3366,7 @@ function App() {
           const latestChapter = latestProject?.chapters.find(item => item.id === chapter.id);
           if (!latestProject || !latestChapter || latestChapter.updatedAt !== chapter.updatedAt) return currentProjects;
           const memoryProject = buildProjectWithChapterMemory(latestProject, latestChapter, memoryPatch);
-          const merged = mergeKnowledgeGraph(memoryProject, latestChapter, result);
+          const merged = { ...mergeKnowledgeGraph(memoryProject, latestChapter, result), authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20) };
           setEditingProject(current => current?.id === merged.id ? merged : current);
           setActiveChapter(current => current?.id === latestChapter.id ? latestChapter : current);
           const nextProjects = currentProjects.map(project => project.id === merged.id ? merged : project);
@@ -3392,6 +3455,8 @@ function App() {
         method: 'outline.write',
         params: {
           runId,
+          sessionId: outlineSessionId,
+          previousSessionId: outlinePreviousSessionId,
           projectId: String(editingProject.id),
           projectTitle: editingProject.title,
           kind: outline.kind,
@@ -3400,6 +3465,8 @@ function App() {
           synopsis: editingProject.synopsis,
           cards: editingProject.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
+          authorPreferences: editingProject.authorPreferences || [],
+          writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
           skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: selectedAgentSkillNames,
           apiKey: agentConfig.apiKey.trim(),
@@ -3448,6 +3515,8 @@ function App() {
         method: 'card.write',
         params: {
           runId,
+          sessionId: cardSessionId,
+          previousSessionId: cardPreviousSessionId,
           projectTitle: editingProject.title,
           synopsis: editingProject.synopsis,
           cardType: cardDraft.type,
@@ -3596,6 +3665,7 @@ function App() {
     setAgentDraft(null);
     setAgentDisplayContent('');
     setAgentStage('starting');
+    setContextTrace([]);
     setAgentProgress(createAgentProgressItems().map((item, index) => index === 0
       ? { ...item, status: 'active', progress: 1, message: '正在启动 Agent Runtime' }
       : item));
@@ -3615,7 +3685,12 @@ function App() {
     const activeChapterIndex = editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id);
     const continuityChapter = activeChapterIndex > 0 ? editingProject.chapters[activeChapterIndex - 1] : null;
     const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
-    const selectedOutlines = editingProject.outlines.filter(outline => selectedOutlineIds.includes(outline.id) || outline.kind !== '章纲');
+    // 世界观与作品设定 is fixed canon and always available. 总纲 is never
+    // exposed to the chapter writer, preventing future-plot leakage.
+    const selectedChapterOutlines = editingProject.outlines.filter(outline => outline.kind === '章纲' && selectedOutlineIds.includes(outline.id));
+    const currentChapterOutline = selectedChapterOutlines.find(outline => String(outline.chapterId ?? '') === String(activeChapter.id)) || selectedChapterOutlines[0];
+    const selectedOutlines = editingProject.outlines.filter(outline => outline.kind === '世界观与作品设定' || selectedOutlineIds.includes(outline.id));
+    const previousMemory = continuityChapter ? editingProject.memories.find(memory => memory.chapterId === continuityChapter.id) : undefined;
     try {
       await invoke<string>('start_agent_runtime');
       setAgentProgress(items => items.map(item => item.id === 'starting'
@@ -3627,15 +3702,15 @@ function App() {
         method: 'chapter.write',
         params: {
           runId,
+          sessionId: chapterSessionId,
+          previousSessionId: chapterPreviousSessionId,
           projectId: String(editingProject.id),
           projectTitle: editingProject.title,
           chapterId: String(activeChapter.id),
           instruction: activeStyle ? `${agentInstruction}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : agentInstruction,
           outlines: selectedOutlines.map(outline => ({ id: outline.id, kind: outline.kind, title: outline.title, chapterId: outline.chapterId, content: outline.content })),
-          activeOutlineId,
-          outline: editingProject.outlines.length
-            ? editingProject.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n')
-            : (editingProject.outline.length ? JSON.stringify(editingProject.outline) : ''),
+          activeOutlineId: currentChapterOutline?.id,
+          outline: selectedOutlineIds.includes(currentChapterOutline?.id ?? -1) ? currentChapterOutline?.content || '' : '',
           cards: editingProject.cards.filter(card => selectedCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
@@ -3643,7 +3718,7 @@ function App() {
           preferredSkillNames: prioritizedSkillNames,
           // 章节承接只传入紧邻上一章正文；更早章节只通过用户勾选的结构化记忆进入。
           previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
-          memories: editingProject.memories.filter(memory => selectedMemoryIds.includes(memory.id)).map(memory => ({
+          memories: (previousMemory ? [previousMemory] : []).map(memory => ({
             id: memory.id,
             title: memory.chapterTitle,
             summary: memory.summary,
@@ -3668,8 +3743,13 @@ function App() {
         },
       });
       setAgentDraft(result);
-      // A provider may decline SSE; then reveal the completed response smoothly.
-      if (!generated && agentTypewriterRef.current) window.clearInterval(agentTypewriterRef.current);
+      // SSE chunks are already rendered by the shared stream listener. The
+      // completed result is authoritative when the provider falls back to a
+      // non-streaming response.
+      if (agentTypewriterRef.current) {
+        window.clearInterval(agentTypewriterRef.current);
+        agentTypewriterRef.current = null;
+      }
       await syncRuntimeUsage();
       setAgentStage('done');
       setAgentProgressPercent(100);
@@ -4082,11 +4162,16 @@ function App() {
   const outlineMode = editingProject !== null && editorSidebarTab === 'outline';
   const cardMode = editingProject !== null && editorSidebarTab === 'cards';
   const styleMode = editingProject !== null && editorSidebarTab === 'style';
+  const localToday = (() => { const date = new Date(); return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`; })();
   const usageRows = usageDays.filter(day => {
     if (usageStartDate || usageEndDate) return (!usageStartDate || day.date >= usageStartDate) && (!usageEndDate || day.date <= usageEndDate);
-    return usageDateFilter === 'all' || (usageDateFilter === 'today' ? day.date === new Date().toISOString().slice(0, 10) : Date.now() - new Date(day.date).getTime() < Number(usageDateFilter) * 86400000);
+    if (usageDateFilter === 'all') return true;
+    if (usageDateFilter === 'today') return day.date === localToday;
+    const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() - Number(usageDateFilter) + 1);
+    return new Date(`${day.date}T00:00:00`).getTime() >= from.getTime();
   });
-  const usageView = usageDateFilter === 'all' ? runtimeUsage : usageRows.reduce((total, day) => ({ ...total, inputTokens: total.inputTokens + day.inputTokens, outputTokens: total.outputTokens + day.outputTokens, totalTokens: total.totalTokens + day.totalTokens, cachedInputTokens: total.cachedInputTokens + day.cachedInputTokens, cacheWriteTokens: total.cacheWriteTokens + day.cacheWriteTokens, reasoningTokens: total.reasoningTokens + day.reasoningTokens, requests: total.requests + day.requests }), { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: '' });
+  const emptyUsage: RuntimeUsageSummary = { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: '' };
+  const usageView = (usageStartDate || usageEndDate || usageDateFilter !== 'all') ? usageRows.reduce((total, day) => ({ ...total, inputTokens: total.inputTokens + day.inputTokens, outputTokens: total.outputTokens + day.outputTokens, totalTokens: total.totalTokens + day.totalTokens, cachedInputTokens: total.cachedInputTokens + day.cachedInputTokens, cacheWriteTokens: total.cacheWriteTokens + day.cacheWriteTokens, reasoningTokens: total.reasoningTokens + day.reasoningTokens, requests: total.requests + day.requests }), emptyUsage) : runtimeUsage;
 
   return (
     <div className="app">
@@ -4560,7 +4645,7 @@ function App() {
               {outlineMode ? (
                 <div className="agent-panel-scroll outline-agent-panel">
                   <section className="agent-task-section">
-                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlinePreviousSessionId(outlineSessionId); setOutlineSessionId(newAgentSessionId('outline')); setOutlineChatMessages([]); setOutlineStreamContent(''); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={outlineAgentInstruction} onChange={event => setOutlineAgentInstruction(event.target.value)} placeholder="描述要补全的结构、节奏、冲突和章节安排" />
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择大纲技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><p>不选时由智能体按大纲创作意图自动选择技能。</p><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
                     <div className="agent-card-picker"><div className="agent-card-picker-title">大纲带入卡片 <small>{selectedOutlineCardIds.length} 张</small></div>{editingProject.cards.length === 0 ? <p className="empty-hint compact">没有可带入的知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineCardIds.includes(card.id)} onChange={() => setSelectedOutlineCardIds(current => current.includes(card.id) ? current.filter(id => id !== card.id) : [...current, card.id])} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>
@@ -4575,7 +4660,7 @@ function App() {
               ) : cardMode ? (
                 <div className="agent-panel-scroll card-agent-panel">
                   <section className="agent-task-section">
-                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="link-button" onClick={() => { setCardPreviousSessionId(cardSessionId); setCardSessionId(newAgentSessionId('card')); setCardChatMessages([]); setCardStreamContent(''); }}>新建会话</button><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={cardAgentInstruction} onChange={event => setCardAgentInstruction(event.target.value)} placeholder="描述要补充的身份、能力、关系、限制或状态变化" />
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择卡片技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
                     <div className="card-agent-context"><span>当前卡片</span><strong>{activeCard?.title || cardDraft.title || '新建卡片'}</strong><small>{cardDraft.type} · {countNovelCharacters(cardDraft.content)} 字</small></div>
@@ -4599,7 +4684,7 @@ function App() {
               ) : (
               <div className="agent-panel-scroll">
                 <section className="agent-task-section">
-                  <div className="agent-instruction-heading"><label>创作指令</label><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                  <div className="agent-instruction-heading"><label>创作指令</label><button type="button" className="link-button" onClick={() => { setChapterPreviousSessionId(chapterSessionId); setChapterSessionId(newAgentSessionId('chapter')); setAgentDraft(null); setAgentDisplayContent(''); setAgentProgress([]); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                   <textarea value={agentInstruction} onChange={(event) => setAgentInstruction(event.target.value)} />
                   {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择本次写作技能">
                     <div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div>
@@ -4621,31 +4706,19 @@ function App() {
                     </div>}
                   </div>
                   <div className="agent-card-picker">
-                    <div className="agent-card-picker-title">本章带入章纲 <small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
-                    {editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => (
-                      <label key={outline.id} className="agent-card-option">
-                        <input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} />
-                        <span><strong>{outline.title || '未命名章纲'}</strong><small>{outline.chapterId === activeChapter?.id ? '当前章节' : '其他章纲'}</small></span>
-                      </label>
-                    ))}
+                    <div className="agent-card-picker-title"><span>本次带入章纲</span><small>{selectedOutlineIds.filter(id => editingProject.outlines.some(outline => outline.id === id && outline.kind === '章纲')).length} 份</small></div>
+                    <button type="button" className={`agent-context-select ${showChapterOutlinePicker ? 'active' : ''}`} onClick={() => setShowChapterOutlinePicker(current => !current)}>选择章纲</button>
+                    {showChapterOutlinePicker && <div className="agent-context-dropdown">{editingProject.outlines.filter(outline => outline.kind === '章纲').length === 0 ? <p className="empty-hint compact">先在大纲页创建章纲</p> : editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => <label key={outline.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineIds.includes(outline.id)} onChange={() => setSelectedOutlineIds(current => current.includes(outline.id) ? current.filter(id => id !== outline.id) : [...current, outline.id])} /><span><strong>{outline.title || '未命名章纲'}</strong><small>{String(outline.chapterId ?? '') === String(activeChapter?.id ?? '') ? '当前章节' : '其他章节'}</small></span></label>)}</div>}
+                    <p className="empty-hint compact">世界观与作品设定固定自动带入；总纲不会传入章节智能体。</p>
                   </div>
                   <div className="agent-card-picker">
                     <div className="agent-card-picker-title">本章带入卡片 <small>{selectedCardIds.length} 张</small></div>
-                    {editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => (
-                      <label key={card.id} className="agent-card-option">
-                        <input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} />
-                        <span><strong>{card.title}</strong><small>{card.type}</small></span>
-                      </label>
-                    ))}
+                    <button type="button" className={`agent-context-select ${showChapterCardPicker ? 'active' : ''}`} onClick={() => setShowChapterCardPicker(current => !current)}>选择卡片</button>
+                    {showChapterCardPicker && <div className="agent-context-dropdown">{editingProject.cards.length === 0 ? <p className="empty-hint compact">先在卡片页创建知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedCardIds.includes(card.id)} onChange={() => toggleCardForChapter(card.id)} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>}
                   </div>
                   <div className="agent-memory-picker">
-                    <div className="agent-card-picker-title">本章带入记忆 <small>{selectedMemoryIds.length} 章</small></div>
-                    {editingProject.memories.length === 0 ? <p className="empty-hint compact">保存章节后会出现逐章记忆，可按需勾选。</p> : [...editingProject.memories].sort((left, right) => chapterOrder(right) - chapterOrder(left)).map(memory => (
-                      <label key={memory.id} className="agent-memory-option">
-                        <input type="checkbox" checked={selectedMemoryIds.includes(memory.id)} onChange={() => setSelectedMemoryIds(current => current.includes(memory.id) ? current.filter(id => id !== memory.id) : [...current, memory.id])} />
-                        <span><strong>{memory.sourceChapterNumber ? `第 ${memory.sourceChapterNumber} 章` : memory.chapterTitle}</strong><small>{memory.chapterTitle} · {memory.keywords.slice(0, 3).join('、') || '暂无关键词'}</small></span>
-                      </label>
-                    ))}
+                    <div className="agent-card-picker-title">上一章记忆 <small>自动加载</small></div>
+                    {(() => { const previous = activeChapter ? editingProject.chapters[editingProject.chapters.findIndex(chapter => chapter.id === activeChapter.id) - 1] : undefined; const memory = previous ? editingProject.memories.find(item => item.chapterId === previous.id) : undefined; return memory ? <div className="agent-context-fixed-item"><strong>{memory.sourceChapterNumber ? `第 ${memory.sourceChapterNumber} 章` : memory.chapterTitle}</strong><small>{memory.summary || '已自动加载上一章结构化记忆'}</small></div> : <p className="empty-hint compact">上一章暂无结构化记忆。</p>; })()}
                   </div>
                   <button className={`agent-run-button ${agentRunning(agentStage) ? 'running' : ''}`} aria-busy={agentRunning(agentStage)} onClick={runChapterAgent}>
                     {agentRunning(agentStage) ? `智能体执行中 · ${agentProgressPercent}%` : '运行章节智能体'}
@@ -4671,12 +4744,28 @@ function App() {
                   </section>
                 )}
 
+                {contextTrace.length > 0 && (
+                  <details className="context-trace-panel" open>
+                    <summary><strong>上下文追逐</strong><span>{contextTrace.length} 个步骤 · 实时追踪资料如何被检索与装载</span></summary>
+                    <ol className="context-trace-list">
+                      {contextTrace.map(item => (
+                        <li key={item.id} className={`context-trace-item ${item.status || ''}`}>
+                          <span className="context-trace-marker" />
+                          <div><strong>{item.action}</strong><small>{item.source || item.step}{item.items !== undefined ? ` · ${item.items} 项` : ''}{item.bytes ? ` · ${(item.bytes / 1024).toFixed(1)} KB` : ''}</small></div>
+                          <b>{item.status === 'cached' ? '命中缓存' : item.status === 'pruned' ? '已裁剪' : item.status === 'searching' ? '检索中' : item.status === 'selected' ? '已选择' : '已装载'}</b>
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                )}
+
                 {agentError && <div className="agent-error">{agentError}</div>}
 
                 {agentDraft?.draftContent && (
                   <section className="agent-result-section">
                     <div className="agent-result-title"><strong>章节草稿</strong><span>{countNovelCharacters(agentDraft.draftContent)} 字</span></div>
                     {(agentDraft.recognizedIntent || agentDraft.selectedSkills?.length) && <div className="agent-intent-result"><span>识别意图：{agentDraft.recognizedIntent || '章节创作与续写'}</span>{agentDraft.selectedSkills?.map(skill => <b key={skill}>{skills.find(item => item.name === skill)?.displayName || skill}</b>)}</div>}
+                    {agentDraft.prewriteCheck && <div className={`agent-prewrite-check ${agentDraft.prewriteCheck.blockers.length ? 'warning' : 'passed'}`}><strong>{agentDraft.prewriteCheck.summary}</strong>{agentDraft.prewriteCheck.blockers.map(item => <span key={`block-${item}`}>阻断：{item}</span>)}{agentDraft.prewriteCheck.warnings.map(item => <span key={`warn-${item}`}>提醒：{item}</span>)}</div>}
                     {agentDraft.chapterPlan && <details className="agent-chapter-plan" open>
                       <summary>下一章执行计划</summary>
                       <div className="agent-plan-meta">已交给正文节点执行，接受草稿前可先核对承接与钩子。</div>
@@ -4684,6 +4773,7 @@ function App() {
                     </details>}
                     {agentDraft.contextReport && <div className="agent-context-report">
                       <span>本地上下文包{agentDraft.contextReport.cache === 'hit' ? '缓存命中' : '缓存未命中'}</span>
+                      {agentDraft.contextReport.contextProfile && <span>动态档案：{agentDraft.contextReport.contextProfile}</span>}
                       <span>发送上下文 {((agentDraft.contextReport.draftInputBytes || agentDraft.contextReport.packedBytes || 0) / 1024).toFixed(1)} KB</span>
                       {agentDraft.contextReport.prunedBytes ? <span>已裁剪 {(agentDraft.contextReport.prunedBytes / 1024).toFixed(1)} KB</span> : null}
                       {agentDraft.contextReport.estimatedInputTokens ? <span>估算输入 {agentDraft.contextReport.estimatedInputTokens.toLocaleString()} tokens</span> : null}
@@ -4803,7 +4893,7 @@ function App() {
             </div>
             <div className="global-skill-grid">
               {visibleSkills.map(skill => <article className="global-skill-card" key={skill.id}>
-                <div className="global-skill-card-header"><div><strong>{skill.displayName || skill.name}</strong><small>{skill.builtin ? '内置' : '自定义'} · {skill.category}</small></div><span>{skill.tags.slice(0, 3).join(' · ') || '未分类'}</span></div>
+                <div className="global-skill-card-header"><div><strong>{skill.displayName || skill.name}</strong><small>{skill.builtin ? '内置' : '自定义'} · {skillCategoryLabels[skill.category] || '未分类'}</small></div><span>{skill.tags.slice(0, 3).join(' · ') || '未分类'}</span></div>
                 <p>{skill.description || '暂无描述'}</p>
                 <details><summary>查看技能内容</summary><pre>{skill.content}</pre></details>
                 <div className="global-card-actions"><button className="btn-secondary" onClick={() => openSkillEditor(skill)}>查看 / 编辑</button><button className="link-button danger-link" onClick={() => deleteSkill(skill)}>{skill.builtin ? '恢复默认' : '删除'}</button></div>
@@ -4979,8 +5069,7 @@ function App() {
                 <small className="settings-network-note">支持 HTTP/HTTPS 代理，例如 Clash、Surge、V2Ray 的本地 HTTP 端口。</small>
               </section>}
               {settingsSection === 'usage' && <section className="usage-dashboard">
-                <div className="usage-toolbar"><span>时间范围</span><div className="usage-range-checks">{[['all', '全部'], ['today', '今天'], ['1', '1 天'], ['7', '7 天'], ['14', '14 天'], ['30', '30 天']].map(([value, label]) => <label key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''}><input type="checkbox" checked={!usageStartDate && !usageEndDate && usageDateFilter === value} onChange={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }} />{label}</label>)}</div></div>
-                <div className="usage-date-controls"><label>开始日期<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束日期<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>清除日期</button></div>
+                <div className="usage-filter-bar"><div className="usage-range-checks">{[['all', '全部时间'], ['today', '今天'], ['1', '近 1 天'], ['7', '近 7 天'], ['14', '近 14 天'], ['30', '近 30 天']].map(([value, label]) => <button type="button" key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''} onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }}>{label}</button>)}</div><div className="usage-date-controls"><label>开始<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>重置</button></div></div>
                 <div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间真实消耗 Tokens' : '筛选时间真实消耗 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div>
                 <div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div>
                 <div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div>

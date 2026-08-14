@@ -5,18 +5,18 @@ const builtinSkillDefinitions: Skill[] = [
   ...advancedBuiltinSkills,
   {
     id: 'builtin-outline-total', name: 'outline-total-planner', displayName: '番茄小说总纲生成器', category: 'setup',
-    description: '生成总纲、主线、人物弧光、分卷推进和长期伏笔。', tags: ['总纲', '番茄', '主线'], rating: 5, usageCount: 0, builtin: true,
-    content: '# 番茄小说总纲生成器\n\n输出题材卖点、主线目标、人物动机与成长弧、分卷推进、冲突升级、伏笔布局和结局回收。每卷明确目标、阻力、转折和阶段钩子。',
+    description: '生成具备差异化卖点、分卷爽点、冲突升级和伏笔回收的番茄小说总纲。', tags: ['总纲', '番茄', '卖点', '分卷', '伏笔'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 番茄小说总纲生成器\n\n## 输出内容\n\n1. **题材卖点与差异化钩子**：明确目标读者、核心爽感、市场常见套路，以及本书在设定、人物、冲突或叙事上的独特记忆点；用一句话写出可用于简介的核心钩子。\n2. **主线目标**：写清主角最终目标、阶段目标、必须完成的关键节点、失败代价和倒计时压力。\n3. **人物动机与成长弧**：分别说明主角和关键配角的初始欲望、隐藏需求、核心矛盾、关键选择、阶段变化与最终成长；每名关键配角都必须有独立作用，不能只是工具人。\n4. **分卷推进**：逐卷列出卷名、卷目标、主要阻力、核心转折、阶段钩子、爽点主类型（打脸/升级/得宝/揭秘/装逼/复仇/收女等）。每卷必须有独立爽点和明确追读钩子。\n5. **冲突升级**：按“个人 → 小团体/势力 → 世界/时代”逐级扩大对手、代价、影响范围与 stakes，说明每次升级由什么事件触发。\n6. **伏笔布局与回收清单**：列出伏笔编号、首次埋设位置、表层信息、真实指向、计划回收卷/节点、回收方式和当前状态；区分已埋、待推进、已回收。\n7. **结局方向**：说明最终对决、主线目标的达成方式、人物关系落点、世界状态变化、主要伏笔如何回收，以及是否保留续作空间。\n\n## 硬性要求\n\n- 每卷都要有独立爽点、阶段性成果和章末/卷末追读钩子。\n- 主线、人物动机、冲突升级和伏笔回收必须互相因果关联，不能各写各的。\n- 先给出总览，再按分卷展开；信息具体到可直接继续生成章纲。\n- 不擅自引入与作品设定冲突的新规则；未知信息标记为“待确认”。',
   },
   {
-    id: 'builtin-outline-chapter', name: 'fanqie-chapter-outline', displayName: '番茄小说章纲生成器', category: 'setup',
-    description: '按番茄快节奏爽文结构生成章纲。', tags: ['章纲', '爽点', '情绪曲线', '章末钩子'], rating: 5, usageCount: 0, builtin: true,
-    content: '# 番茄小说章纲生成器\n\n每章包含：章节序号、核心爽点主副类型、压抑—爆发—余韵—新危机四段情绪曲线、1-3 个场景的地点人物目标冲突转折、人物功能、信息揭示、伏笔和强章末钩子。情绪占比通常 20/50/20/10，必须有释放点和追读钩子。',
+    id: 'builtin-outline-chapter', name: '小说章纲生成器', displayName: '小说章纲生成器', category: 'setup',
+    description: '生成 1000 字以内、具备爽点、情绪闭环和追读钩子的小说章纲。', tags: ['章纲', '爽点', '情绪曲线', '章末钩子'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 小说章纲生成器\n\n每章章纲包含：章节序号、核心爽点主副类型（打脸/升级/得宝/揭秘/装逼/复仇/收女）、压抑—爆发—余韵—新危机四段情绪曲线（占比约20/50/20/10）、1-3个场景（地点/人物/目标/冲突/转折）、人物功能分配（每人独立作用，避免工具人）、信息揭示与伏笔（至少1个新信息+1个可回收伏笔）、强章末钩子。\n\n硬性要求：每章必须有释放点（情绪闭环），章末必须有追读钩子（悬念/反转/新危机/惊人之语）。章纲总字数控制在1000字以内。\n\n输出格式：\n第X章：章节标题\n\n核心爽点类型：____（主）+ ____（副）\n\n情绪曲线：\n压抑：____\n爆发：____\n余韵：____\n新危机：____\n\n场景一（必要时补充场景二、三）：\n地点：____\n人物：____\n目标：____\n冲突：____\n转折：____\n\n人物功能分配：____\n本章信息揭示：____\n本章埋下伏笔：____\n章末钩子：____',
   },
   {
     id: 'builtin-outline-world', name: 'world-setting-planner', displayName: '世界观与作品设定生成器', category: 'setup',
     description: '建立世界规则、力量体系、势力结构、地图和设定边界。', tags: ['世界观', '设定', '力量体系'], rating: 5, usageCount: 0, builtin: true,
-    content: '# 世界观与作品设定生成器\n\n输出时代背景、世界规则、力量/职业体系、资源与代价、势力结构、地理地图、社会秩序、关键名词和设定边界；标记已确认与待揭示内容，避免与知识图谱和卡片冲突。',
+    content: '# 世界观与作品设定生成器\n\n仅在创建世界规则文件时使用一次：输出时代背景、世界规则、力量/职业体系、资源与代价、势力结构、地理地图、社会秩序、关键名词和设定边界。创建完成后，该文件是作者确认的固定规则，后续章节、大纲、卡片和知识图谱只可引用，不自动梳理、改写、补全或推断其中的内容变化。\n\n所有未确定内容在首次创建时标记为“待作者确认”；作者确认保存后视为固定设定。若正文与世界规则冲突，标记冲突并交给作者手动修改世界规则文件，不自动覆盖。',
   },
   {
     id: 'builtin-story-setup', name: 'story-setup', category: 'setup',
@@ -124,6 +124,14 @@ const builtinSkillDefinitions: Skill[] = [
 // Keep the English names as stable routing keys while presenting every built-in
 // skill in Chinese throughout the application.
 const builtinSkillDisplayNames: Record<string, string> = {
+  'natural-fiction-writing': '自然人感小说写作',
+  'writing-framework': '长篇小说写作框架',
+  'fanqie-writing': '番茄爆款写作',
+  'qidian-writing': '起点精品写作',
+  'novel-improver': '小说质量改良',
+  'strategy-writing': '智斗与博弈写作',
+  'outline-total-planner': '小说总纲生成器',
+  'world-setting-planner': '世界观与作品设定生成器',
   'next-chapter-plan': '下一章计划',
   'mainline-check': '主线检查',
   'character-motivation': '人物动机',
@@ -160,7 +168,7 @@ const builtinSkillDisplayNames: Record<string, string> = {
 
 export const builtinSkills: Skill[] = builtinSkillDefinitions.map(skill => ({
   ...skill,
-  displayName: builtinSkillDisplayNames[skill.name] || skill.name,
+  displayName: builtinSkillDisplayNames[skill.name] || skill.displayName || skill.name,
   // The first Markdown heading is also user-visible in the skill editor.
-  content: skill.content.replace(new RegExp(`^#\\s*${skill.name}\\b`, 'm'), `# ${builtinSkillDisplayNames[skill.name] || skill.name}`),
+  content: skill.content.replace(new RegExp(`^#\\s*${skill.name}\\b`, 'm'), `# ${builtinSkillDisplayNames[skill.name] || skill.displayName || skill.name}`),
 }));

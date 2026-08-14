@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { byteLength, compactKnowledgeGraph, compactText, LruCache, prepareChapterInput, stableHash } from "../src/context/context-optimizer.js";
+import { byteLength, compactKnowledgeGraph, compactText, LruCache, normalizePromptWhitespace, prepareChapterInput, stableHash } from "../src/context/context-optimizer.js";
 
 describe("context optimizer", () => {
   it("keeps both ends of oversized chapter material", () => {
@@ -8,6 +8,12 @@ describe("context optimizer", () => {
     expect(byteLength(result)).toBeLessThanOrEqual(120);
     expect(result).toContain("开场事实");
     expect(result).toContain("章末钩子");
+  });
+
+  it("normalizes token-wasting document whitespace without changing Markdown structure", () => {
+    const source = "  # 标题  \r\n\r\n\r\n段落   之间   空格\n\n```txt\n  保留   代码缩进  \n```\n";
+    expect(normalizePromptWhitespace(source)).toBe("# 标题\n\n段落 之间 空格\n\n```txt\n  保留   代码缩进\n```");
+    expect(compactText(source, 500)).not.toContain("\r");
   });
 
   it("packs only a relevant graph neighborhood", () => {

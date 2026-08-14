@@ -5,6 +5,7 @@
 
 export type StreamEventType = 
   | "progress"      // 进度更新
+  | "context"       // 上下文追逐/装载明细
   | "chunk"         // 文本片段
   | "complete"      // 完成
   | "error";        // 错误
@@ -17,6 +18,13 @@ export interface StreamEvent {
     text?: string;           // 生成的文本片段
     message?: string;        // 状态消息
     error?: string;          // 错误信息
+    context?: {
+      action: string;
+      source?: string;
+      status?: "searching" | "selected" | "pruned" | "loaded" | "cached";
+      bytes?: number;
+      items?: number;
+    };
   };
   timestamp: number;
 }
@@ -58,6 +66,10 @@ export class StreamEmitter {
 
   progress(step: string, progress: number, message?: string): void {
     this.emit("progress", { step, progress, message });
+  }
+
+  context(step: string, action: string, context: Omit<NonNullable<StreamEvent["data"]["context"]>, "action"> = {}): void {
+    this.emit("context", { step, message: action, context: { action, ...context } });
   }
 
   chunk(text: string): void {

@@ -10,6 +10,7 @@ export interface ContextReport {
   draftInputBytes?: number;
   reviewInputBytes?: number;
   estimatedInputTokens?: number;
+  contextProfile?: "剧情" | "战斗" | "情感" | "转场";
   sections: Record<string, number>;
   upstreamUsage?: {
     inputTokens: number;
@@ -20,6 +21,27 @@ export interface ContextReport {
     reasoningTokens: number;
     requests: number;
   };
+}
+
+type ContextProfile = "剧情" | "战斗" | "情感" | "转场";
+
+type ContextWeights = Pick<Record<"outline" | "cards" | "memories" | "previousChapters" | "knowledgeGraph" | "skills", number>, "outline" | "cards" | "memories" | "previousChapters" | "knowledgeGraph" | "skills">;
+
+// These weights apply only to the per-chapter dynamic pack. The stable prompt
+// prefix remains byte-for-byte ordered for upstream prompt-cache reuse.
+const CONTEXT_PROFILE_WEIGHTS: Record<ContextProfile, ContextWeights> = {
+  剧情: { outline: 0.20, cards: 0.12, memories: 0.22, previousChapters: 0.30, knowledgeGraph: 0.09, skills: 0.07 },
+  战斗: { outline: 0.16, cards: 0.21, memories: 0.16, previousChapters: 0.31, knowledgeGraph: 0.09, skills: 0.07 },
+  情感: { outline: 0.18, cards: 0.16, memories: 0.28, previousChapters: 0.26, knowledgeGraph: 0.06, skills: 0.06 },
+  转场: { outline: 0.23, cards: 0.10, memories: 0.17, previousChapters: 0.36, knowledgeGraph: 0.08, skills: 0.06 },
+};
+
+export function resolveContextProfile(instruction: string): ContextProfile {
+  const text = instruction.toLowerCase();
+  if (/战斗|打斗|厮杀|对决|追杀|战场|boss|副本|碾压/u.test(text)) return "战斗";
+  if (/感情|情感|恋爱|暧昧|告白|关系|和解|亲情|心动/u.test(text)) return "情感";
+  if (/转场|过渡|赶路|抵达|离开|时间跳跃|数日后|次日|场景切换/u.test(text)) return "转场";
+  return "剧情";
 }
 
 export interface ContextCard {
@@ -44,6 +66,7 @@ export interface ContextGraph {
 }
 
 export interface PreparedChapterInput {
+  worldSetting?: string;
   outline?: string;
   cards: Array<{ type: string; title: string; content: string }>;
   previousChapters: Array<{ id?: string | number; title: string; content: string }>;
@@ -57,6 +80,40 @@ export interface PreparedChapterInput {
 const truncationMarker = "\n...[已按相关性与预算裁剪]...\n";
 
 export const byteLength = (value: string): number => Buffer.byteLength(value, "utf8");
+
+/**
+ * Normalize document whitespace only for model-bound context. This preserves
+ * Markdown paragraph/code-fence semantics while removing editor-introduced
+ * indentation, trailing whitespace and redundant empty lines that consume
+ * tokens without adding meaning. Local files keep their original formatting.
+ */
+export function normalizePromptWhitespace(value: unknown): string {
+  const lines = String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u00a0\u2007\u202f]/g, " ")
+    .split("\n");
+  let inCodeFence = false;
+  let emptyLines = 0;
+  const normalized: string[] = [];
+
+  for (const rawLine of lines) {
+    const fence = /^\s*```/.test(rawLine);
+    const line = inCodeFence
+      ? rawLine.replace(/[ \t]+$/g, "")
+      : rawLine
+        .replace(/^[ \t]+|[ \t]+$/g, "")
+        .replace(/[ \t]{2,}/g, " ");
+    if (!line) {
+      emptyLines += 1;
+      if (emptyLines <= 1) normalized.push("");
+    } else {
+      emptyLines = 0;
+      normalized.push(line);
+    }
+    if (fence) inCodeFence = !inCodeFence;
+  }
+  return normalized.join("\n").trim();
+}
 
 function sliceToBytes(value: string, maxBytes: number): string {
   if (maxBytes <= 0 || !value) return "";
@@ -73,7 +130,7 @@ function sliceToBytes(value: string, maxBytes: number): string {
 
 /** Preserve both the premise and the most recent state when a source is oversized. */
 export function compactText(value: unknown, maxBytes: number): string {
-  const text = String(value ?? "").trim();
+  const text = normalizePromptWhitespace(value);
   if (!text || maxBytes <= 0) return "";
   if (byteLength(text) <= maxBytes) return text;
   if (maxBytes <= byteLength(truncationMarker) + 24) return sliceToBytes(text, maxBytes);
@@ -337,12 +394,22 @@ export function prepareChapterInput(input: {
   contextWindowKB?: number;
 }): PreparedChapterInput {
   const budgetBytes = contextBudgetBytes(input.contextWindowKB);
-  const outlines = Array.isArray(input.outlines)
+  const contextProfile = resolveContextProfile(input.instruction);
+  const weights = CONTEXT_PROFILE_WEIGHTS[contextProfile];
+  const allOutlines = Array.isArray(input.outlines)
     ? input.outlines.filter(item => item && typeof item === "object") as ContextOutline[]
     : input.outline ? [{ kind: "作品大纲", title: "作品大纲", content: String(input.outline) }] : [];
+  // Canon is fixed by the author and must stay outside relevance sorting so it
+  // remains a stable upstream prompt-cache prefix across chapter requests.
+  const worldSetting = allOutlines
+    .filter(item => item.kind === "世界观与作品设定" && String(item.content || "").trim())
+    .sort((left, right) => String(left.id ?? left.title ?? "").localeCompare(String(right.id ?? right.title ?? ""), "zh-CN"))
+    .map(item => `## ${compactText(item.kind || "世界观与作品设定", 80)}\n${compactText(item.content, 6000)}`)
+    .join("\n\n");
+  const outlines = allOutlines.filter(item => item.kind !== "世界观与作品设定");
   const cards = Array.isArray(input.cards) ? input.cards.filter(item => item && typeof item === "object") as ContextCard[] : [];
   const raw = {
-    outline: outlines,
+    outline: allOutlines,
     cards,
     previousChapters: input.previousChapters,
     memories: input.memories,
@@ -352,12 +419,12 @@ export function prepareChapterInput(input: {
   };
   const sourceBytes = byteLength(JSON.stringify(raw));
   const text = queryText(input.instruction, outlines, Array.isArray(input.memories) ? input.memories as Array<Record<string, unknown>> : [], cards);
-  const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * 0.18));
-  const packedCards = compactCards(cards, text, Math.floor(budgetBytes * 0.12));
-  const memories = compactMemories(input.memories, Math.floor(budgetBytes * 0.20));
-  const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * 0.28));
-  const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * 0.10));
-  const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * 0.10));
+  const outline = compactOutlines(outlines, input.activeOutlineId, text, Math.floor(budgetBytes * weights.outline));
+  const packedCards = compactCards(cards, text, Math.floor(budgetBytes * weights.cards));
+  const memories = compactMemories(input.memories, Math.floor(budgetBytes * weights.memories));
+  const previousChapters = compactPreviousChapters(input.previousChapters, Math.floor(budgetBytes * weights.previousChapters));
+  const knowledgeGraph = compactKnowledgeGraph(input.knowledgeGraph, text, Math.floor(budgetBytes * weights.knowledgeGraph));
+  const skills = compactSkills(input.skills, input.instruction, Math.floor(budgetBytes * weights.skills));
   const memoryDocuments = Array.isArray(input.memoryDocuments)
     ? input.memoryDocuments.filter(item => item && typeof item === "object").slice(0, 4).map(item => {
       const document = item as Record<string, unknown>;
@@ -365,6 +432,7 @@ export function prepareChapterInput(input: {
     })
     : [];
   const sections = {
+    worldSetting: byteLength(worldSetting),
     outline: byteLength(outline),
     cards: byteLength(JSON.stringify(packedCards)),
     memories: byteLength(JSON.stringify(memories)),
@@ -375,6 +443,7 @@ export function prepareChapterInput(input: {
   };
   const packedBytes = Object.values(sections).reduce((total, size) => total + size, 0);
   return {
+    worldSetting: worldSetting || undefined,
     outline: outline || undefined,
     cards: packedCards,
     previousChapters,
@@ -388,6 +457,7 @@ export function prepareChapterInput(input: {
       packedBytes,
       prunedBytes: Math.max(0, sourceBytes - packedBytes),
       budgetBytes,
+      contextProfile,
       sections,
     },
   };

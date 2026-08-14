@@ -2,6 +2,7 @@ import { ChatAnthropic } from "@langchain/anthropic";
 import { ChatOpenAI } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ProxyAgent } from "undici";
+import { normalizePromptWhitespace } from "../context/context-optimizer.js";
 
 export type ApiSaverProvider = "openai" | "claude";
 
@@ -208,10 +209,16 @@ const proxyRouteHint = (targetURL: string, config: Pick<ApiSaverClientConfig, "p
 };
 
 function limitMessagesToKB(messages: ChatMessage[], contextWindowKB?: number): ChatMessage[] {
+  // Final transport-level pass catches raw document fields that bypassed the
+  // context packer. It affects only the request payload, never local files.
+  const normalizedMessages = messages.map(message => ({
+    ...message,
+    content: normalizePromptWhitespace(message.content),
+  }));
   const budget = Math.floor(Number(contextWindowKB || 0) * 1024);
-  if (!budget || messages.reduce((sum, message) => sum + message.content.length, 0) <= budget) return messages;
+  if (!budget || normalizedMessages.reduce((sum, message) => sum + message.content.length, 0) <= budget) return normalizedMessages;
   let remaining = budget;
-  return messages.map(message => {
+  return normalizedMessages.map(message => {
     if (remaining <= 0) return { ...message, content: "" };
     const content = message.content.length <= remaining
       ? message.content

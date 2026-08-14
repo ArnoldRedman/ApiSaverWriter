@@ -4,6 +4,7 @@ import { StoryStore } from "./storage/story-store.js";
 import { ApiSaverClient, getRuntimeUsageSummary } from "./models/api-saver.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, LruCache, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
+import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { ProxyAgent } from "undici";
 import { load as loadHtml } from "cheerio";
 import iconv from "iconv-lite";
@@ -27,7 +28,116 @@ interface RPCResponse {
 // normal editor actions without persisting any novel material outside memory.
 const chapterPreparationCache = new LruCache<PreparedChapterInput>(48);
 const chapterMemoryCache = new LruCache<Record<string, unknown>>(96);
-const novelSessionCache = new LruCache<string>(128);
+type AgentSessionTurn = {
+  instruction: string;
+  conclusion: string;
+  createdAt: string;
+};
+
+type AgentSessionState = {
+  version: 1;
+  summary: string;
+  recentTurns: AgentSessionTurn[];
+  compressedAt?: string;
+};
+
+const novelSessionCache = new LruCache<AgentSessionState>(128);
+const outlineSessionCache = new LruCache<AgentSessionState>(96);
+const cardSessionCache = new LruCache<AgentSessionState>(96);
+
+const SESSION_KEEP_TURNS = 2;
+
+function normalizeAgentSession(value: unknown): AgentSessionState {
+  if (typeof value === "string") {
+    return { version: 1, summary: compactText(value, 5000), recentTurns: [] };
+  }
+  if (!value || typeof value !== "object") return { version: 1, summary: "", recentTurns: [] };
+  const source = value as Record<string, unknown>;
+  return {
+    version: 1,
+    summary: compactText(source.summary || "", 7000),
+    recentTurns: Array.isArray(source.recentTurns)
+      ? source.recentTurns.slice(-6).flatMap(turn => {
+        if (!turn || typeof turn !== "object") return [];
+        const item = turn as Record<string, unknown>;
+        const instruction = compactText(item.instruction || "", 2200);
+        const conclusion = compactText(item.conclusion || "", 6000);
+        return instruction || conclusion ? [{ instruction, conclusion, createdAt: String(item.createdAt || "") }] : [];
+      })
+      : [],
+    compressedAt: typeof source.compressedAt === "string" ? source.compressedAt : undefined,
+  };
+}
+
+function renderAgentSession(state: AgentSessionState): string {
+  const parts = [
+    state.summary ? `## 已压缩的会话摘要\n${state.summary}` : "",
+    state.recentTurns.length ? `## 最近会话轮次\n${state.recentTurns.map((turn, index) => `### 轮次 ${index + 1}\n作者请求：${turn.instruction || "延续上一轮"}\n已确认结论：${turn.conclusion || "暂无"}`).join("\n\n")}` : "",
+  ].filter(Boolean);
+  return parts.join("\n\n");
+}
+
+function renderSessionSummary(state: AgentSessionState): string {
+  return state.summary ? `## 历史会话摘要\n${state.summary}` : "";
+}
+
+function renderRecentTurns(state: AgentSessionState): string {
+  return state.recentTurns.length
+    ? `## 最近两轮请求与结论\n${state.recentTurns.map((turn, index) => `### 轮次 ${index + 1}\n作者请求：${turn.instruction || "延续上一轮"}\n已确认结论：${turn.conclusion || "暂无"}`).join("\n\n")}`
+    : "";
+}
+
+function compactAgentSession(state: AgentSessionState, contextWindowKB: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
+  const threshold = Math.floor(Math.max(16, Number(contextWindowKB) || 128) * 1024 * 0.8);
+  const rendered = renderAgentSession(state);
+  if (baseBytes + byteLength(rendered) < threshold) return { state, compressed: false };
+
+  const historicTurns = state.recentTurns.slice(0, -SESSION_KEEP_TURNS);
+  const historicDigest = historicTurns.map(turn => `请求：${compactText(turn.instruction, 500)}\n结论：${compactText(turn.conclusion, 1200)}`).join("\n\n");
+  const availableBytes = Math.max(4096, threshold - baseBytes);
+  const recentTurnBudget = Math.max(1000, Math.floor(availableBytes * 0.32));
+  const recentTurns = state.recentTurns.slice(-SESSION_KEEP_TURNS).map(turn => ({
+    instruction: compactText(turn.instruction, Math.max(300, Math.floor(recentTurnBudget * 0.25))),
+    conclusion: compactText(turn.conclusion, Math.max(700, Math.floor(recentTurnBudget * 0.75))),
+    createdAt: turn.createdAt,
+  }));
+  // The response itself already contains a model-produced plan/conclusion. Keep
+  // that semantic material while collapsing older turns into one durable handoff.
+  const summary = compactText([state.summary, historicDigest].filter(Boolean).join("\n\n"), Math.max(1200, Math.floor(availableBytes * 0.3)));
+  return {
+    compressed: true,
+    state: {
+      version: 1,
+      summary: summary || "此前会话已压缩；后续以最近已确认结论继续。",
+      recentTurns,
+      compressedAt: new Date().toISOString(),
+    },
+  };
+}
+
+function appendAgentSession(state: AgentSessionState, instruction: string, conclusion: string, contextWindowKB: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
+  const next: AgentSessionState = {
+    version: 1,
+    summary: state.summary,
+    recentTurns: [...state.recentTurns, {
+      instruction: compactText(instruction, 2200),
+      conclusion: compactText(conclusion, 6500),
+      createdAt: new Date().toISOString(),
+    }],
+    compressedAt: state.compressedAt,
+  };
+  return compactAgentSession(next, contextWindowKB, baseBytes);
+}
+
+// Byte-stable prompt for compatible upstream prefix caches. Dynamic chapter
+// instructions and the editable outline are deliberately sent afterwards.
+const outlineWriterSystemPrompt = `你是长篇网络小说总策划与章节规划 Agent。根据作品资料编写可直接执行的 Markdown 大纲。
+世界观与作品设定是作者确认的只读固定规则，只能引用，不得自动改写、补全或推断变化；保持人物、时间线、设定和知识图谱一致。不要输出解释性前言。未知信息标记为待揭示，不能编造为既定事实。`;
+
+// Kept byte-stable and paired with a separately sent project packet so card
+// requests for the same novel can reuse compatible upstream prompt caches.
+      const cardWriterSystemPrompt = `你是长篇小说的知识设定编辑。只根据提供的作品资料生成可长期检索的知识卡，不把推测写成既定事实。
+输出必须是严格 JSON 对象，不要代码围栏或额外说明：{"title":"卡片名称","content":"详细 Markdown 内容"}。`;
 
 const memoryEditorSystemPrompt = `你是长篇小说的记忆编辑。只从章节正文与给定的相关资料抽取明确事实，不补写未发生的剧情。
 
@@ -67,6 +177,16 @@ const normalizeMemoryResult = (content: string): Record<string, unknown> => {
       characterStateChanges: stringList(result.characterStateChanges),
       knowledgeChanges: stringList(result.knowledgeChanges),
       foreshadowingChanges: stringList(result.foreshadowingChanges),
+      foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems.filter(item => item && typeof item === "object").slice(0, 20).map(item => {
+        const entry = item as Record<string, unknown>;
+        return {
+          text: compactText(entry.text || entry.content || entry.name || "", 260),
+          status: String(entry.status || "active").trim(),
+          priority: String(entry.priority || "normal").trim(),
+          plantedChapter: Number.isFinite(Number(entry.plantedChapter)) ? Number(entry.plantedChapter) : undefined,
+          targetChapter: Number.isFinite(Number(entry.targetChapter)) ? Number(entry.targetChapter) : undefined,
+        };
+      }).filter(item => item.text) : [],
       timelineEvents: stringList(result.timelineEvents),
       canonFacts: stringList(result.canonFacts),
       conflicts: stringList(result.conflicts),
@@ -92,7 +212,7 @@ const normalizeMemoryResult = (content: string): Record<string, unknown> => {
   } catch {
     return {
       summary: content.slice(0, 220), keywords: [], characterStateChanges: [], knowledgeChanges: [],
-      foreshadowingChanges: [], timelineEvents: [], canonFacts: [], conflicts: [], endingHook: "", entities: [], relations: [], cardUpdates: [],
+      foreshadowingChanges: [], foreshadowingItems: [], timelineEvents: [], canonFacts: [], conflicts: [], endingHook: "", entities: [], relations: [], cardUpdates: [],
     };
   }
 };
@@ -1265,8 +1385,9 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         cards: relevantCards.map(card => ({ id: card.id, title: card.title, state: card.currentState, updatedAt: card.updatedAt })),
         graphSummary, model: String(model || "gpt-5.5"), apiMode: String(apiMode || "openai"),
       });
-      const cachedMemory = chapterMemoryCache.get(memoryCacheKey);
+      const cachedMemory = chapterMemoryCache.get(memoryCacheKey) || await readPersistentContext<Record<string, unknown>>(`memory-${memoryCacheKey}`);
       if (cachedMemory) {
+        chapterMemoryCache.set(memoryCacheKey, cachedMemory);
         const cachedReport: ContextReport = {
           cache: "hit",
           sourceBytes: byteLength(JSON.stringify({ content, cards: rawCards, knowledgeGraph })),
@@ -1315,6 +1436,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
   "characterStateChanges": ["角色名：持续状态变化"],
   "knowledgeChanges": ["角色名：得知或隐瞒的信息"],
   "foreshadowingChanges": ["伏笔进展"],
+  "foreshadowingItems": [{"text":"伏笔内容","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
   "timelineEvents": ["可排序事件"],
   "canonFacts": ["后续必须遵守的事实"],
   "conflicts": ["冲突和结果"],
@@ -1338,6 +1460,8 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         sections: { chapter: byteLength(chapterContent), cards: byteLength(compactCardContext), knowledgeGraph: byteLength(compactGraphContext) },
       };
       const memoryResult = normalizeMemoryResult(optimizedResponse.content);
+      chapterMemoryCache.set(memoryCacheKey, memoryResult);
+      void writePersistentContext(`memory-${memoryCacheKey}`, memoryResult);
       chapterMemoryCache.set(memoryCacheKey, memoryResult);
       return { id: req.id, result: { ...memoryResult, contextReport } };
     }
@@ -1663,7 +1787,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       return { id: req.id, result: { content: result } };
     }
     if (req.method === "card.write") {
-      const { projectTitle, synopsis, cardType, cardTitle, existingContent, instruction, chapterTitle, chapterContent, outlines, cards, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, synopsis, cardType, cardTitle, existingContent, instruction, chapterTitle, chapterContent, outlines, cards, sessionId, previousSessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !cardType || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "缺少生成卡片所需参数" } };
       }
@@ -1682,17 +1806,41 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
       emitter.progress("draft", 20, "正在整理卡片资料");
       const outlineContext = Array.isArray(outlines) && outlines.length
-        ? `\n## 作品大纲片段\n${outlines.map(outline => { const item = outline as Record<string, unknown>; return `### ${String(item.kind || "大纲")}\n${String(item.content || "").slice(0, 3000)}`; }).join("\n\n")}`
+        ? `## 作品大纲片段\n${outlines.map(outline => outline as Record<string, unknown>).sort((a, b) => String(a.id || a.title || "").localeCompare(String(b.id || b.title || ""), "zh-CN")).map(item => `### ${compactText(item.kind || "大纲", 80)}｜${compactText(item.title || "未命名", 100)}\n${compactText(item.content || "", 3000)}`).join("\n\n")}`
         : "";
       const cardContext = Array.isArray(cards) && cards.length
-        ? `\n## 已有卡片（用于避免重复）\n${cards.map(card => { const item = card as Record<string, unknown>; return `${String(item.title || "卡片")}：${String(item.content || "").slice(0, 600)}`; }).join("\n")}`
+        ? `## 已有卡片（用于避免重复）\n${cards.map(card => card as Record<string, unknown>).sort((a, b) => String(a.id || a.title || "").localeCompare(String(b.id || b.title || ""), "zh-CN")).map(item => `${compactText(item.title || "卡片", 100)}：${compactText(item.content || "", 600)}`).join("\n")}`
         : "";
       const chapterContext = chapterContent
-        ? `\n## 当前章节片段（用于提取事实）\n${String(chapterTitle || "当前章节")}\n${String(chapterContent)}`
+        ? `## 当前章节片段（用于提取事实）\n${compactText(chapterTitle || "当前章节", 120)}\n${compactText(chapterContent, 10000)}`
         : "";
-      const prompt = `你是长篇小说的知识设定编辑。请为《${String(projectTitle)}》生成一张${String(cardType)}，供章节智能体长期检索。\n\n作者指令：${String(instruction || "补全卡片知识，保持设定一致") }\n\n作品简介：${String(synopsis || "暂无")}${outlineContext}${chapterContext}${cardContext}\n\n${cardTitle ? `用户给出的卡片名称：${String(cardTitle)}` : "请根据上下文拟定一个准确、简洁的卡片名称。"}\n${existingContent ? `\n用户已有草稿，请在不违背正文事实的前提下补全：\n${String(existingContent)}` : ""}\n\n只返回 JSON：\n{\n  "title": "卡片名称",\n  "content": "详细 Markdown 内容"\n}\n\n内容请按卡片类型组织：角色卡写身份、性格、目标、能力、关系、当前状态和秘密；物品卡写来源、外观、能力、代价和持有者；地点卡写环境、势力、规则、资源和危险；势力卡写目标、组织结构、成员、资源和敌对关系；金手指卡写触发条件、能力、限制、升级路径和代价。只记录上下文能够支持的事实，未知部分明确标为待揭示。`;
-      const response = await client.chatStream([{ role: "user", content: prompt }], { response_format: { type: "json_object" } }, chunk => emitter.chunk(chunk));
+      const stableProjectPacket = `## 作品资料\n书名：${compactText(projectTitle, 180)}\n作品简介：${compactText(synopsis || "暂无", 1400)}\n\n${[outlineContext, cardContext].filter(Boolean).join("\n\n") || "（暂无已确认大纲或卡片）"}`;
+      const cardSessionKey = stableHash({ scope: "card", sessionId: String(sessionId || "default"), projectTitle, cardType, model, apiMode, stableProjectPacket });
+      const storedCardSession = await readPersistentContext<unknown>(`card-session-${cardSessionKey}`);
+      const inheritedCardSession = cardSessionCache.get(cardSessionKey)
+        || (storedCardSession !== undefined ? normalizeAgentSession(storedCardSession) : undefined);
+      const previousCardSessionState = previousSessionId && !inheritedCardSession
+        ? await readPersistentContext<unknown>(`card-session-${stableHash({ scope: "card", sessionId: String(previousSessionId), projectTitle, cardType, model, apiMode, stableProjectPacket })}`)
+        : undefined;
+      const resolvedCardSession = inheritedCardSession || (previousCardSessionState !== undefined ? normalizeAgentSession(previousCardSessionState) : undefined);
+      const cardDocumentSummary = await readPersistentDocument(`card-session-${cardSessionKey}`);
+      const cardSession = compactAgentSession(cardDocumentSummary ? { ...(resolvedCardSession || { version: 1, recentTurns: [] }), summary: cardDocumentSummary } : (resolvedCardSession || { version: 1, summary: "", recentTurns: [] }), contextWindow, byteLength(stableProjectPacket)).state;
+      const cardHistorySummary = renderSessionSummary(cardSession);
+      const cardRecentTurns = renderRecentTurns(cardSession);
+      const dynamicTask = `## 本次卡片任务\n类型：${compactText(cardType, 80)}\n作者指令：${compactText(instruction || "补全卡片知识，保持设定一致", 1800)}\n${cardTitle ? `用户给出的卡片名称：${compactText(cardTitle, 120)}` : "请根据上下文拟定一个准确、简洁的卡片名称。"}${existingContent ? `\n\n## 用户已有草稿\n${compactText(existingContent, 6000)}` : ""}${chapterContext ? `\n\n${chapterContext}` : ""}\n\n内容组织：角色卡写身份、性格、目标、能力、关系、当前状态和秘密；物品卡写来源、外观、能力、代价和持有者；地点卡写环境、势力、规则、资源和危险；势力卡写目标、组织结构、成员、资源和敌对关系；金手指卡写触发条件、能力、限制、升级路径和代价。未知部分明确标为待揭示。`;
+      const response = await client.chatStream([
+        { role: "system", content: cardWriterSystemPrompt },
+        { role: "user", content: stableProjectPacket },
+        ...(cardHistorySummary ? [{ role: "user" as const, content: compactText(cardHistorySummary, 7000) }] : []),
+        { role: "user", content: dynamicTask },
+        ...(cardRecentTurns ? [{ role: "user" as const, content: compactText(cardRecentTurns, 7000) }] : []),
+      ], { response_format: { type: "json_object" } }, chunk => emitter.chunk(chunk));
       emitter.complete("卡片内容生成完成");
+      const nextCardSession = appendAgentSession(cardSession, String(instruction || "补全卡片知识，保持设定一致"), response.content, contextWindow, byteLength(stableProjectPacket));
+      cardSessionCache.set(cardSessionKey, nextCardSession.state);
+      void writePersistentContext(`card-session-${cardSessionKey}`, nextCardSession.state);
+      void writePersistentDocument(`card-session-${cardSessionKey}`, `# 卡片会话摘要\n\n${nextCardSession.state.summary || "暂无压缩摘要"}`);
+      if (nextCardSession.compressed) emitter.progress("draft", 90, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
       try {
         const result = JSON.parse(response.content) as Record<string, unknown>;
         return {
@@ -1707,7 +1855,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       }
     }
     if (req.method === "outline.write") {
-      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, skills, preferredSkillNames, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, skills, preferredSkillNames, sessionId, previousSessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !kind || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
@@ -1726,24 +1874,45 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
       emitter.progress("plan", 20, "正在整理大纲资料");
       const cardSection = Array.isArray(cards) && cards.length > 0
-        ? `\n## 相关知识卡片\n${cards.slice(0, 8).map(card => { const item = card as Record<string, unknown>; return `### ${compactText(item.title || "卡片", 80)}\n${compactText(item.content || "", 700)}`; }).join("\n\n")}`
+        ? `\n## 相关知识卡片\n${cards.slice(0, 8).map(card => card as Record<string, unknown>).sort((a, b) => String(a.title || "").localeCompare(String(b.title || ""), "zh-CN")).map(item => `### ${compactText(item.title || "卡片", 80)}\n${compactText(item.content || "", 700)}`).join("\n\n")}`
         : "";
       const graphSection = knowledgeGraph && typeof knowledgeGraph === "object"
-        ? `\n## 知识图谱约束\n${compactKnowledgeGraph(knowledgeGraph, `${String(projectTitle)} ${String(kind)} ${String(instruction || "")}`, 2800)}\n请保持已有实体和关系一致，新增关系标注为“待揭示”。`
+        ? `\n## 知识图谱约束\n${compactKnowledgeGraph(knowledgeGraph, String(projectTitle), 2800)}\n请保持已有实体和关系一致，新增关系标注为“待揭示”。`
         : "";
-      const requestedSkills = Array.isArray(preferredSkillNames) ? preferredSkillNames.map(String) : [];
-      const query = `${String(kind)} ${String(instruction || "")}`.toLowerCase();
-      const outlineSkillName = kind === "总纲" ? "outline-total-planner" : kind === "章纲" ? "fanqie-chapter-outline" : "world-setting-planner";
+      const outlineSkillName = kind === "总纲" ? "outline-total-planner" : kind === "章纲" ? "小说章纲生成器" : "world-setting-planner";
       const matchedSkills = Array.isArray(skills) ? skills
-        .map(skill => ({ item: skill as Record<string, unknown>, score: (() => { const item = skill as Record<string, unknown>; const terms = `${item.name || ""} ${item.displayName || ""} ${item.category || ""} ${item.description || ""} ${(Array.isArray(item.tags) ? item.tags : []).join(" ")}`.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(term => term.length > 1); return requestedSkills.includes(String(item.name || "")) ? 100 : terms.reduce((total, term) => total + (query.includes(term) ? 1 : 0), 0); })() }))
-        .filter(entry => entry.score > 0 || String(entry.item.name || "") === outlineSkillName).sort((a, b) => (String(b.item.name || "") === outlineSkillName ? 1000 : b.score) - (String(a.item.name || "") === outlineSkillName ? 1000 : a.score)).slice(0, 3).map(entry => entry.item)
+        .map(skill => skill as Record<string, unknown>)
+        .filter(item => String(item.name || "") === outlineSkillName)
         : [];
       const skillSection = matchedSkills.length
         ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 700)}`).join("\n\n")}`
         : "";
-      const prompt = `你是长篇网络小说总策划与章节规划 Agent。请为《${String(projectTitle)}》编写或完善一份${String(kind)}，供后续章节 Agent 使用。\n\n作者本次指令：${String(instruction || "补全结构并强化可执行性") }\n\n作品简介：${String(synopsis || "暂无")}\n\n现有大纲内容：${String(existingContent || "暂无")}${cardSection}${graphSection}${skillSection}\n\n要求：保持已有设定一致；把模糊想法整理成可执行的 Markdown；明确人物动机、冲突升级、章节目标、关键事件、伏笔与结尾钩子；不要输出解释性前言，只输出大纲文档正文。`;
-      const response = await client.chatStream([{ role: "user", content: compactText(prompt, 18000) }], { max_tokens: kind === "章纲" ? 2200 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${skillSection}${graphSection}${cardSection}`;
+      const outlineSessionKey = stableHash({ scope: "outline", sessionId: String(sessionId || "default"), projectTitle, kind, model, apiMode, stableProjectPacket });
+      const storedOutlineSession = await readPersistentContext<unknown>(`outline-session-${outlineSessionKey}`);
+      const inheritedOutlineSession = outlineSessionCache.get(outlineSessionKey)
+        || (storedOutlineSession !== undefined ? normalizeAgentSession(storedOutlineSession) : undefined);
+      const previousOutlineSessionState = previousSessionId && !inheritedOutlineSession
+        ? await readPersistentContext<unknown>(`outline-session-${stableHash({ scope: "outline", sessionId: String(previousSessionId), projectTitle, kind, model, apiMode, stableProjectPacket })}`)
+        : undefined;
+      const outlineDocumentSummary = await readPersistentDocument(`outline-session-${outlineSessionKey}`);
+      const outlineSession = compactAgentSession(outlineDocumentSummary ? { ...(inheritedOutlineSession || { version: 1, recentTurns: [] }), summary: outlineDocumentSummary } : (inheritedOutlineSession || (previousOutlineSessionState !== undefined ? normalizeAgentSession(previousOutlineSessionState) : undefined) || { version: 1, summary: "", recentTurns: [] }), contextWindow, byteLength(stableProjectPacket)).state;
+      const outlineHistorySummary = renderSessionSummary(outlineSession);
+      const outlineRecentTurns = renderRecentTurns(outlineSession);
+      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n## 当前待完善文档\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。必须落实人物动机、冲突升级、关键事件、伏笔与结尾钩子。`;
+      const response = await client.chatStream([
+        { role: "system", content: outlineWriterSystemPrompt },
+        { role: "user", content: stableProjectPacket },
+        ...(outlineHistorySummary ? [{ role: "user" as const, content: compactText(outlineHistorySummary, 7000) }] : []),
+        { role: "user", content: dynamicTask },
+        ...(outlineRecentTurns ? [{ role: "user" as const, content: compactText(outlineRecentTurns, 7000) }] : []),
+      ], { max_tokens: kind === "章纲" ? 2200 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
       emitter.complete("大纲内容生成完成");
+      const nextOutlineSession = appendAgentSession(outlineSession, String(instruction || "补全结构并强化可执行性"), response.content, contextWindow, byteLength(stableProjectPacket));
+      outlineSessionCache.set(outlineSessionKey, nextOutlineSession.state);
+      void writePersistentContext(`outline-session-${outlineSessionKey}`, nextOutlineSession.state);
+      void writePersistentDocument(`outline-session-${outlineSessionKey}`, `# 大纲会话摘要\n\n${nextOutlineSession.state.summary || "暂无压缩摘要"}`);
+      if (nextOutlineSession.compressed) emitter.progress("plan", 90, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
       return { id: req.id, result: { content: response.content } };
     }
     if (req.method === "chapter.write") {
@@ -1760,6 +1929,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         memories,
         memoryDocuments,
         knowledgeGraph,
+        writingStyle,
+        authorPreferences,
         preferredSkillNames,
         apiKey,
         apiKeys,
@@ -1768,6 +1939,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         apiMode,
         reasoningMode,
         contextWindow,
+        sessionId,
+        previousSessionId,
       } = req.params ?? {};
       if (!projectId || !chapterId || !instruction || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
@@ -1784,20 +1957,33 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         previousChapters, memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills, preferredSkillNames,
         contextWindow: Number(contextWindow) || 128,
       });
-      const cachedPreparation = chapterPreparationCache.get(preparationKey);
+      const cachedPreparation = chapterPreparationCache.get(preparationKey)
+        || await readPersistentContext<PreparedChapterInput>(`chapter-prep-${preparationKey}`);
       const prepared = cachedPreparation || prepareChapterInput({
         instruction: String(instruction), outline, outlines, activeOutlineId, cards, previousChapters,
         memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills,
         contextWindowKB: Number(contextWindow) || undefined,
       });
-      if (!cachedPreparation) chapterPreparationCache.set(preparationKey, prepared);
+      chapterPreparationCache.set(preparationKey, prepared);
+      if (!cachedPreparation) void writePersistentContext(`chapter-prep-${preparationKey}`, prepared);
       const contextReport: ContextReport = {
         ...prepared.report,
         cache: cachedPreparation ? "hit" : "miss",
         sections: { ...prepared.report.sections },
       };
-      const sessionKey = stableHash({ projectId: String(projectId), model: String(model || ""), apiMode: String(apiMode || "openai") });
-      const sessionContext = novelSessionCache.get(sessionKey) || "";
+      const sessionKey = stableHash({ projectId: String(projectId), sessionId: String(sessionId || "default"), model: String(model || ""), apiMode: String(apiMode || "openai") });
+      const storedChapterSession = await readPersistentContext<unknown>(`chapter-session-${sessionKey}`);
+      const cachedChapterSession = novelSessionCache.get(sessionKey)
+        || (storedChapterSession !== undefined ? normalizeAgentSession(storedChapterSession) : undefined);
+      const previousChapterSession = previousSessionId && !cachedChapterSession
+        ? await readPersistentContext<unknown>(`chapter-session-${stableHash({ projectId: String(projectId), sessionId: String(previousSessionId), model: String(model || ""), apiMode: String(apiMode || "openai") })}`)
+        : undefined;
+      const chapterDocumentSummary = await readPersistentDocument(`chapter-session-${sessionKey}`);
+      const chapterSession = compactAgentSession(chapterDocumentSummary ? { ...(cachedChapterSession || { version: 1, recentTurns: [] }), summary: chapterDocumentSummary } : (cachedChapterSession || (previousChapterSession !== undefined ? normalizeAgentSession(previousChapterSession) : undefined) || { version: 1, summary: "", recentTurns: [] }), contextWindow, prepared.report.packedBytes).state;
+      const sessionContext = renderAgentSession(chapterSession);
+      if (!cachedPreparation && (cachedChapterSession || chapterDocumentSummary || previousChapterSession)) {
+        contextReport.cache = "hit";
+      }
       streamEmitter.progress("starting", 6, `${cachedPreparation ? "上下文缓存命中" : "上下文缓存未命中"}；已将 ${Math.max(0, contextReport.prunedBytes / 1024).toFixed(1)} KB 无关资料移出本次请求`);
       try {
         const normalizedProjectId = String(projectId);
@@ -1886,6 +2072,8 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           projectId: normalizedProjectId,
           chapterId: String(chapterId),
           instruction: String(instruction),
+          worldSetting: prepared.worldSetting,
+          writingStyle: writingStyle && typeof writingStyle === "object" ? { name: String((writingStyle as Record<string, unknown>).name || "绑定文风"), content: compactText((writingStyle as Record<string, unknown>).content || "", 3000) } : undefined,
           outline: prepared.outline,
           previousChapters: prepared.previousChapters,
           knowledgeGraph: prepared.knowledgeGraph,
@@ -1894,10 +2082,17 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           preferredSkillNames: stringList(preferredSkillNames, 8),
           contextReport,
           sessionContext,
+          authorPreferences: stringList(authorPreferences, 20),
         });
         const resultRecord = result as Record<string, unknown>;
         const handoff = [resultRecord.chapterPlan, resultRecord.summary, resultRecord.reviewResult && JSON.stringify(resultRecord.reviewResult)].filter(Boolean).join("\n");
-        if (handoff) novelSessionCache.set(sessionKey, compactText(handoff, 5000));
+        if (handoff) {
+          const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes);
+          novelSessionCache.set(sessionKey, nextChapterSession.state);
+          void writePersistentContext(`chapter-session-${sessionKey}`, nextChapterSession.state);
+          void writePersistentDocument(`chapter-session-${sessionKey}`, `# 章节会话摘要\n\n${nextChapterSession.state.summary || "暂无压缩摘要"}`);
+          if (nextChapterSession.compressed) streamEmitter.progress("review", 96, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
+        }
         const resultWithUsage = {
           ...result,
           contextReport: {

@@ -3,6 +3,36 @@ import type { Skill } from '../App';
 /** QMAI-inspired writing checks. Kept as editable Markdown so users can fork them. */
 export const advancedBuiltinSkills: Skill[] = [
   {
+    id: 'builtin-natural-fiction-writing', name: 'natural-fiction-writing', displayName: '自然人感小说写作', category: 'write',
+    description: '以人物目标、行动、关系变化和自然中文节奏降低模板感。', tags: ['自然表达', '人物行动', '场景', '去 AI 味'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 自然人感小说写作\n\n## 写作原则\n\n- 每个场景先明确人物此刻想得到什么、为何现在必须行动、阻力是什么；场景结束时至少改变信息、关系、计划、风险、权力或情绪中的一项。\n- 性格写在选择里：人物在哪件事上退让、撒谎、坚持或犯错，比直接贴“聪明、冷漠、善良”更有效。配角也要有眼下目标，不能只负责递消息或夸主角。\n- 对白必须在做事，例如试探、遮掩、说服、拖延、靠近、推开或保住面子；不要让角色轮流解释读者已知背景。\n- 细节服从视角与行动。紧张的人会先看出口，心虚的人会记得沉默，动作已经传达情绪时不要追加解释。\n- 设定在人物碰到规则、付出代价或做选择时再出现；新规则、例外和反转必须有前文条件，不能临时救场。\n\n## 语言节奏\n\n- 先写谁做了什么，再补原因、时间和条件；使用具体动作、物件、对话和后果，少用抽象评价与总结腔。\n- 长短句和段落要有自然变化。普通段落普通结束，关键动作或情绪才留短句停顿。\n- 不为显得有文采而堆叠排比、反转句式、概念化比喻或商业黑话；直接给判断，再让行动和因果支撑它。\n- 删除重复解释、机械连接词、套路化升华。故事已经完成情绪或因果时就收住。\n\n## 交付前检查\n\n检查人物知道什么、时间空间、伤势物件与世界规则是否一致；检查每段是否有新动作、信息或关系变化；检查结尾是否留下人物选择、后果或未完成行动。保留作者已有文风、剧情事实、伏笔与章节钩子。\n\n来源：基于 Human Writing Skill（MIT）中虚构写作与改稿原则的适配整理。',
+  },
+  {
+    id: 'builtin-writing-framework', name: 'writing-framework', displayName: '长篇小说写作框架', category: 'write',
+    description: '覆盖总纲、分卷、章纲、正文和复盘的长篇写作流程。', tags: ['长篇', '写作流程', '质量控制'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 长篇小说写作框架\n\n写作前确认题材、读者承诺、主角目标、核心冲突和结局方向；再建立总纲、分卷目标、人物弧光、设定边界与伏笔表。每章写作前读取上一章交接、当前章纲和必要记忆，先确认本章变化，再输出正文。写完检查因果、人物动机、时间线、信息增量、节奏和章末钩子。只保留与当前任务有关的资料，未知信息标记为待确认。',
+  },
+  {
+    id: 'builtin-fanqie-writing', name: 'fanqie-writing', displayName: '番茄爆款写作', category: 'write',
+    description: '面向番茄快节奏网文的冲突、爽点、情绪和追读设计。', tags: ['番茄', '爽点', '快节奏', '追读'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 番茄爆款写作\n\n开篇尽快兑现题材承诺，用可见冲突和明确目标抓住读者。每章至少完成一次有效推进，并安排压抑、反击或释放；爽点来自人物行动和因果，不靠空泛震惊。控制解释段长度，优先用动作、选择和结果传递信息。章末必须留下悬念、反转、危机或惊人之语，下一章开头承接上一章的地点、情绪和未解决事件。',
+  },
+  {
+    id: 'builtin-qidian-writing', name: 'qidian-writing', displayName: '起点精品写作', category: 'write',
+    description: '强调硬设定、人物深度、信息增量和长线伏笔的中长篇写作。', tags: ['起点', '精品', '设定', '群像'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 起点精品写作\n\n设定必须有边界、代价和可验证规则；人物必须有独立目标、选择和成长，不为推进剧情而失智。允许铺垫，但每章都要有信息增量、关系变化或局势变化。长线伏笔分层埋设，回收时给出前文证据；场景切换交代时间、空间和因果，不用说明书式叙述。',
+  },
+  {
+    id: 'builtin-novel-improver', name: 'novel-improver', displayName: '小说质量改良', category: 'review',
+    description: '从结构、人物、节奏、情绪和语言五个维度诊断并改进小说。', tags: ['改稿', '审查', '去 AI 味', '节奏'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 小说质量改良\n\n先指出问题和正文证据，再给最小可执行修改。依次检查：题材承诺是否兑现，主线是否推进，人物行动是否有动机，冲突是否升级，场景是否有变化，情绪是否有释放，伏笔是否可追踪，语言是否自然。保留作者原意、视角、风格和有效细节，不用泛泛评价替代改写。',
+  },
+  {
+    id: 'builtin-strategy-writing', name: 'strategy-writing', displayName: '智斗与博弈写作', category: 'write',
+    description: '用信息差、目标冲突和代价选择构建可信的智斗与权谋场景。', tags: ['智斗', '博弈', '权谋', '信息差'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 智斗与博弈写作\n\n每场博弈先明确各方目标、已知信息、未知信息、可用资源和底线；行动必须有试探、判断、选择与代价。让角色通过证据、误导、谈判或布局改变信息差，避免靠突然降智或作者旁白取胜。关键反转提前埋下可回看的线索，胜负改变关系、资源或风险，并推动主线。',
+  },
+  {
     id: 'builtin-next-chapter-plan', name: 'next-chapter-plan', category: 'write',
     description: '先编写可确认的下一章计划，再据此生成正文，明确承接、事件链、节奏和交接信息。',
     tags: ['下一章计划', '章节规划', '事件链', '四拍节奏'], rating: 5, usageCount: 0, builtin: true,
