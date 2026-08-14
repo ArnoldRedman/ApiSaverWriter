@@ -3785,6 +3785,7 @@ function App() {
       setEditingProject(updated);
       setActiveChapter(updatedChapter);
       setProjects(current => current.map(project => project.id === updated.id ? updated : project));
+      window.setTimeout(() => chapterEditorRef.current?.focus(), 0);
     }
     setAgentDraft(null);
     setAgentDisplayContent('');
@@ -4056,6 +4057,19 @@ function App() {
   const activeMemoryDocument = editingProject?.memoryDocuments.find(document => document.id === activeMemoryDocumentId) ?? null;
   const activeChapterMemory = editingProject?.memories.find(memory => memory.id === activeChapterMemoryId) ?? null;
   const activeGraphNode = editingProject?.graphNodes.find(node => node.id === activeGraphNodeId) ?? null;
+  const focusedGraphRelationIds = new Set(editingProject && activeGraphNodeId
+    ? editingProject.graphEdges
+      .filter(edge => edge.source === activeGraphNodeId || edge.target === activeGraphNodeId)
+      .map(edge => edge.id)
+    : []);
+  const focusedGraphNodeIds = new Set(editingProject && activeGraphNodeId
+    ? [
+      activeGraphNodeId,
+      ...editingProject.graphEdges
+        .filter(edge => edge.source === activeGraphNodeId || edge.target === activeGraphNodeId)
+        .map(edge => edge.source === activeGraphNodeId ? edge.target : edge.source),
+    ]
+    : []);
   const graphDocumentGroups = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeGroup))) : [];
   const activeGraphDocumentGroup = graphDocumentGroups.includes(graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
   const graphDocumentTypeOptions = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeTypeLabel))).sort((left, right) => left.localeCompare(right, 'zh-CN')) : [];
@@ -4512,16 +4526,18 @@ function App() {
                         </article>;
                       })}</div>}
                     </div> : <>
-                      <div className="knowledge-graph-canvas">
+                      <div className={`knowledge-graph-canvas ${activeGraphNodeId ? 'is-focused' : ''}`} onClick={() => setActiveGraphNodeId(null)}>
                         <svg viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">{editingProject.graphEdges.map(edge => {
                           const source = graphLayout.find(item => item.id === edge.source);
                           const target = graphLayout.find(item => item.id === edge.target);
                           const weight = normalizeKnowledgeGraphWeight(edge.weight, edge.label);
-                          return source && target ? <line key={edge.id} x1={source.x} y1={source.y} x2={target.x} y2={target.y} style={{ strokeWidth: `${0.3 + weight * 1.05}px`, opacity: 0.26 + weight * 0.68 }} /> : null;
+                          const edgeFocusClass = !activeGraphNodeId ? '' : focusedGraphRelationIds.has(edge.id) ? 'related' : 'muted';
+                          return source && target ? <line key={edge.id} className={edgeFocusClass} x1={source.x} y1={source.y} x2={target.x} y2={target.y} style={{ strokeWidth: `${0.3 + weight * 1.05}px` }} /> : null;
                         })}</svg>
                         {editingProject.graphNodes.map(node => {
                           const position = graphLayout.find(item => item.id === node.id) ?? { x: 50, y: 50 };
-                          return <button key={node.id} className={`knowledge-graph-vertex ${node.type} ${activeGraphNodeId === node.id ? 'active' : ''}`} style={{ left: `${position.x}%`, top: `${position.y}%` }} onClick={() => setActiveGraphNodeId(node.id)}>{node.label}</button>;
+                          const nodeFocusClass = !activeGraphNodeId ? '' : activeGraphNodeId === node.id ? 'active' : focusedGraphNodeIds.has(node.id) ? 'related' : 'muted';
+                          return <button key={node.id} className={`knowledge-graph-vertex ${node.type} ${nodeFocusClass}`} style={{ left: `${position.x}%`, top: `${position.y}%` }} onClick={event => { event.stopPropagation(); setActiveGraphNodeId(node.id); }}>{node.label}</button>;
                         })}
                       </div>
                       <div className="knowledge-graph-details">

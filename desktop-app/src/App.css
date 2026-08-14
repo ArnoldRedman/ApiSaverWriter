@@ -2312,6 +2312,8 @@ select.input {
 .ai-detection-mark.ai { background: rgba(251, 113, 133, .16); }
 .ai-detection-emphasis { box-shadow: inset 0 -2px 0 #FB7185; }
 .chapter-editor-wrap .chapter-content-editor { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; min-height: 0; padding: 32px; resize: none; background: transparent; color: transparent; caret-color: #F8FAFC; -webkit-text-fill-color: transparent; }
+.chapter-editor-wrap:focus-within .chapter-highlight-layer { opacity: 0; }
+.chapter-editor-wrap:focus-within .chapter-content-editor { color: #F8FAFC; -webkit-text-fill-color: #F8FAFC; }
 .chapter-editor-wrap .chapter-content-editor::selection { background: rgba(56, 189, 248, .42); color: transparent; }
 .chapter-editor-wrap .chapter-content-editor::placeholder { color: #334155; -webkit-text-fill-color: #334155; }
 .chapter-live-footer { flex-shrink: 0; display: flex; align-items: center; gap: 14px; padding: 9px 22px; border-top: 1px solid #1E293B; background: #0F172A; color: #64748B; font-size: 11px; }
@@ -2366,15 +2368,21 @@ select.input {
 .graph-document-relations th { color: #64748B; font-weight: 500; }
 .graph-document-events { grid-auto-flow: row; }
 .graph-document-events span { width: fit-content; padding: 4px 7px; border: 1px solid #334155; border-radius: 4px; color: #A5F3FC; font-size: 11px; }
-.knowledge-graph-canvas { position: relative; flex: 1; min-height: 360px; border: 1px solid #1E3A5F; border-radius: 8px; overflow: hidden; background-color: #0B1220; background-image: linear-gradient(#132034 1px, transparent 1px), linear-gradient(90deg, #132034 1px, transparent 1px); background-size: 22px 22px; }
+.knowledge-graph-canvas { position: relative; flex: 1; min-height: 360px; border: 1px solid #1E3A5F; border-radius: 8px; overflow: hidden; background-color: #0B1220; background-image: linear-gradient(#132034 1px, transparent 1px), linear-gradient(90deg, #132034 1px, transparent 1px); background-size: 22px 22px; cursor: default; }
 .knowledge-graph-canvas svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-.knowledge-graph-canvas line { stroke: #31567A; stroke-width: .42; vector-effect: non-scaling-stroke; }
-.knowledge-graph-vertex { position: absolute; z-index: 1; transform: translate(-50%, -50%); max-width: 130px; padding: 7px 10px; overflow: hidden; border: 1px solid #334155; border-radius: 6px; background: #111827; color: #CBD5E1; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.knowledge-graph-canvas line { stroke: #31567A; stroke-width: .42; vector-effect: non-scaling-stroke; opacity: .7; transition: stroke 220ms ease, opacity 220ms ease, stroke-width 220ms ease; }
+.knowledge-graph-canvas.is-focused line.related { stroke: #38BDF8; opacity: .96; }
+.knowledge-graph-canvas.is-focused line.muted { opacity: .08; }
+.knowledge-graph-vertex { position: absolute; z-index: 1; transform: translate(-50%, -50%) scale(1); max-width: 130px; padding: 7px 10px; overflow: hidden; border: 1px solid #334155; border-radius: 6px; background: #111827; color: #CBD5E1; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; transition: transform 220ms ease, opacity 220ms ease, filter 220ms ease, border-color 220ms ease, box-shadow 220ms ease; }
 .knowledge-graph-vertex.card { border-color: #0F766E; color: #99F6E4; }
 .knowledge-graph-vertex.chapter { border-color: #1D4ED8; color: #BFDBFE; }
 .knowledge-graph-vertex.outline { border-color: #7C3AED; color: #DDD6FE; }
 .knowledge-graph-vertex.entity { border-color: #B45309; color: #FDE68A; }
 .knowledge-graph-vertex.active, .knowledge-graph-vertex:hover { border-color: #38BDF8; box-shadow: 0 0 0 2px rgba(56, 189, 248, .15); }
+.knowledge-graph-canvas.is-focused .knowledge-graph-vertex.related { z-index: 2; }
+.knowledge-graph-canvas.is-focused .knowledge-graph-vertex.active { z-index: 3; transform: translate(-50%, -50%) scale(1.16); box-shadow: 0 0 0 3px rgba(56, 189, 248, .22), 0 0 22px rgba(14, 165, 233, .32); }
+.knowledge-graph-canvas.is-focused .knowledge-graph-vertex.muted { z-index: 0; transform: translate(-50%, -50%) scale(.88); opacity: .18; filter: grayscale(.6) blur(.35px); }
+@media (prefers-reduced-motion: reduce) { .knowledge-graph-canvas line, .knowledge-graph-vertex { transition: none; } }
 .knowledge-graph-details { display: grid; gap: 10px; padding: 12px; border: 1px solid #1E293B; border-radius: 7px; background: #0F172A; }
 .knowledge-graph-details > div:first-child { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .knowledge-graph-details strong { color: #E0F2FE; font-size: 13px; }
