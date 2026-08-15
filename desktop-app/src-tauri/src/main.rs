@@ -325,12 +325,12 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
 
 const CLOUD_BACKUP_DIRECTORIES: [&str; 5] = ["projects", "books", "dismantles", "rankings", "styles"];
 
-fn cloud_export_directory() -> PathBuf {
-    std::env::temp_dir().join("apisaverwriter-cloud-export")
+fn cloud_export_directory(app_data: &Path) -> PathBuf {
+    app_data.join("cloud-export")
 }
 
 fn create_cloud_export(app_data: &Path, client_state: &Value) -> Result<PathBuf, String> {
-    let export_root = cloud_export_directory();
+    let export_root = cloud_export_directory(app_data);
     if export_root.exists() {
         fs::remove_dir_all(&export_root).map_err(|error| format!("清理旧备份缓存失败: {error}"))?;
     }
