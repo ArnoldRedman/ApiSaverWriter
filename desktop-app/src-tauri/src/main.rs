@@ -1,6 +1,7 @@
 // Prevents additional console window on Windows in release
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -395,7 +396,8 @@ fn write_cloud_backup_bundle(export_root: &Path, bundle_path: &Path) -> Result<u
     collect_cloud_backup_files(export_root, export_root, &mut files)?;
     files.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut bundle = fs::File::create(bundle_path).map_err(|error| format!("创建完整备份包失败: {error}"))?;
+    let bundle_file = fs::File::create(bundle_path).map_err(|error| format!("创建完整备份包失败: {error}"))?;
+    let mut bundle = GzEncoder::new(bundle_file, Compression::best());
     bundle.write_all(CLOUD_BACKUP_MAGIC).map_err(|error| format!("写入备份包标识失败: {error}"))?;
     bundle.write_all(&(files.len() as u64).to_le_bytes()).map_err(|error| format!("写入备份包索引失败: {error}"))?;
 
@@ -411,10 +413,12 @@ fn write_cloud_backup_bundle(export_root: &Path, bundle_path: &Path) -> Result<u
         std::io::copy(&mut input, &mut bundle).map_err(|error| format!("写入备份文件内容失败: {error}"))?;
     }
     bundle.flush().map_err(|error| format!("保存完整备份包失败: {error}"))?;
+    let bundle_file = bundle.finish().map_err(|error| format!("完成备份包压缩失败: {error}"))?;
+    bundle_file.sync_all().map_err(|error| format!("保存压缩备份包失败: {error}"))?;
     fs::metadata(bundle_path).map(|metadata| metadata.len()).map_err(|error| format!("读取完整备份包失败: {error}"))
 }
 
-fn read_bundle_number<const N: usize>(bundle: &mut fs::File, label: &str) -> Result<[u8; N], String> {
+fn read_bundle_number<const N: usize>(bundle: &mut dyn Read, label: &str) -> Result<[u8; N], String> {
     let mut bytes = [0_u8; N];
     bundle.read_exact(&mut bytes).map_err(|error| format!("读取备份包{label}失败: {error}"))?;
     Ok(bytes)
@@ -433,20 +437,28 @@ fn extract_cloud_backup_bundle(bundle_path: &Path, export_root: &Path) -> Result
         fs::remove_dir_all(export_root).map_err(|error| format!("清理恢复解包目录失败: {error}"))?;
     }
     fs::create_dir_all(export_root).map_err(|error| format!("创建恢复解包目录失败: {error}"))?;
-    let mut bundle = fs::File::open(bundle_path).map_err(|error| format!("打开云端备份包失败: {error}"))?;
+    let mut preview = fs::File::open(bundle_path).map_err(|error| format!("打开云端备份包失败: {error}"))?;
+    let mut signature = [0_u8; 2];
+    preview.read_exact(&mut signature).map_err(|error| format!("读取云端备份包格式失败: {error}"))?;
+    let input = fs::File::open(bundle_path).map_err(|error| format!("重新打开云端备份包失败: {error}"))?;
+    let mut bundle: Box<dyn Read> = if signature == [0x1f, 0x8b] {
+        Box::new(GzDecoder::new(input))
+    } else {
+        Box::new(input)
+    };
     let mut magic = vec![0_u8; CLOUD_BACKUP_MAGIC.len()];
     bundle.read_exact(&mut magic).map_err(|error| format!("读取云端备份包标识失败: {error}"))?;
     if magic != CLOUD_BACKUP_MAGIC {
         return Err("云端文件不是有效的 ApiSaverWriter 完整备份包".to_string());
     }
-    let file_count = u64::from_le_bytes(read_bundle_number::<8>(&mut bundle, "文件数量")?);
+    let file_count = u64::from_le_bytes(read_bundle_number::<8>(&mut *bundle, "文件数量")?);
     if file_count > 1_000_000 {
         return Err("云端备份包文件数量异常".to_string());
     }
 
     for _ in 0..file_count {
-        let path_length = u32::from_le_bytes(read_bundle_number::<4>(&mut bundle, "路径长度")?) as usize;
-        let file_size = u64::from_le_bytes(read_bundle_number::<8>(&mut bundle, "文件大小")?);
+        let path_length = u32::from_le_bytes(read_bundle_number::<4>(&mut *bundle, "路径长度")?) as usize;
+        let file_size = u64::from_le_bytes(read_bundle_number::<8>(&mut *bundle, "文件大小")?);
         if path_length == 0 || path_length > 1_048_576 {
             return Err("云端备份包路径长度异常".to_string());
         }
@@ -459,7 +471,7 @@ fn extract_cloud_backup_bundle(bundle_path: &Path, export_root: &Path) -> Result
             fs::create_dir_all(parent).map_err(|error| format!("创建恢复文件目录失败: {error}"))?;
         }
         let mut output = fs::File::create(&destination).map_err(|error| format!("创建恢复文件失败: {error}"))?;
-        let copied = std::io::copy(&mut (&mut bundle).take(file_size), &mut output).map_err(|error| format!("解包恢复文件失败: {error}"))?;
+        let copied = std::io::copy(&mut (&mut *bundle).take(file_size), &mut output).map_err(|error| format!("解包恢复文件失败: {error}"))?;
         if copied != file_size {
             return Err(format!("云端备份包内容不完整: {relative_text}"));
         }
@@ -1726,9 +1738,35 @@ mod tests {
         let count = extract_cloud_backup_bundle(&bundle, &restored).unwrap();
 
         assert!(size > CLOUD_BACKUP_MAGIC.len() as u64);
+        assert_eq!(&fs::read(&bundle).unwrap()[..2], &[0x1f, 0x8b]);
         assert_eq!(count, 2);
         assert_eq!(fs::read_to_string(restored.join(chapter.strip_prefix(&source).unwrap())).unwrap(), "第一章正文\n完整内容");
         assert_eq!(fs::read_to_string(restored.join("client-state.json")).unwrap(), "{\"theme\":\"light\"}");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cloud_backup_restore_accepts_legacy_uncompressed_bundle() {
+        let root = std::env::temp_dir().join(format!(
+            "apisaverwriter-legacy-backup-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let bundle_path = root.join("legacy.aswbackup");
+        let restored = root.join("restored");
+        let relative = "projects/旧版小说/章节/第一章.md";
+        let content = "旧版备份正文".as_bytes();
+        let mut bundle = fs::File::create(&bundle_path).unwrap();
+        bundle.write_all(CLOUD_BACKUP_MAGIC).unwrap();
+        bundle.write_all(&1_u64.to_le_bytes()).unwrap();
+        bundle.write_all(&(relative.len() as u32).to_le_bytes()).unwrap();
+        bundle.write_all(&(content.len() as u64).to_le_bytes()).unwrap();
+        bundle.write_all(relative.as_bytes()).unwrap();
+        bundle.write_all(content).unwrap();
+        bundle.flush().unwrap();
+
+        assert_eq!(extract_cloud_backup_bundle(&bundle_path, &restored).unwrap(), 1);
+        assert_eq!(fs::read_to_string(restored.join(relative)).unwrap(), "旧版备份正文");
         fs::remove_dir_all(root).ok();
     }
 
