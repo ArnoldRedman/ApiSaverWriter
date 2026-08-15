@@ -3175,25 +3175,31 @@ function App() {
 
   const cardSearchTerms = (card: KnowledgeCard) => {
     const generic = new Set(['角色', '物品', '地点', '势力', '金手指', '身份', '性格', '目标', '能力', '关系', '当前状态', '详细信息', '暂无', '设定']);
-    const terms = new Set<string>();
-    const add = (value: string) => {
-      const normalized = value.trim();
-      if (normalized.length >= 2 && !generic.has(normalized)) terms.add(normalized);
+    const primaryTerms: string[] = [];
+    const secondaryTerms = new Set<string>();
+    const addPrimary = (value: string) => {
+      const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').trim();
+      if (normalized.length >= 2 && !primaryTerms.includes(normalized)) primaryTerms.push(normalized);
     };
-    add(card.title);
-    add(card.title.replace(/^(主角|角色|人物|本命|关键|核心)/u, ''));
-    for (let size = 2; size <= Math.min(6, card.title.length); size += 1) {
-      for (let start = 0; start <= card.title.length - size; start += 1) add(card.title.slice(start, start + size));
+    const addSecondary = (value: string) => {
+      const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').trim();
+      if (normalized.length >= 2 && normalized.length <= 12 && !generic.has(normalized) && !primaryTerms.includes(normalized)) secondaryTerms.add(normalized);
+    };
+    addPrimary(card.title);
+    const canonicalTitle = card.title.replace(/^(主角|角色|人物|本命|关键|核心)/u, '').trim();
+    addPrimary(canonicalTitle);
+    if (/^[\u3400-\u9fff]{3,}$/u.test(canonicalTitle)) {
+      addPrimary(canonicalTitle.slice(-2));
+      if (canonicalTitle.length > 3) addPrimary(canonicalTitle.slice(-3));
+    }
+    const identityPattern = /^\s*(?:[-*]\s*)?(?:姓名|名称|本名|别名|称号|代号|简称|天赋名称|能力名称)\s*[：:]\s*(.+)$/gmu;
+    for (const match of card.content.matchAll(identityPattern)) {
+      for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
     }
     for (const segment of `${card.title}\n${card.content}`.match(/[\u3400-\u9fff]{2,10}|[A-Za-z][A-Za-z0-9_-]{1,24}/g) || []) {
-      add(segment);
-      if (/^[\u3400-\u9fff]+$/u.test(segment)) {
-        for (let size = 2; size <= Math.min(4, segment.length); size += 1) {
-          for (let start = 0; start <= segment.length - size; start += 1) add(segment.slice(start, start + size));
-        }
-      }
+      addSecondary(segment);
     }
-    return [...terms].sort((left, right) => right.length - left.length).slice(0, 30);
+    return [...primaryTerms, ...[...secondaryTerms].sort((left, right) => right.length - left.length)].slice(0, 40);
   };
 
   const findCardRecentMentions = (project: Project, card: KnowledgeCard, limit = 3) => {
