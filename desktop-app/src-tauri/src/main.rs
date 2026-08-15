@@ -288,7 +288,14 @@ fn validate_cloud_path(path: &str) -> Result<String, String> {
 }
 
 fn run_bdpan(args: &[&str]) -> Result<String, String> {
+    run_bdpan_at(args, None)
+}
+
+fn run_bdpan_at(args: &[&str], working_directory: Option<&Path>) -> Result<String, String> {
     let mut command = bdpan_command()?;
+    if let Some(directory) = working_directory {
+        command.current_dir(directory);
+    }
     let output = command
         .args(args)
         .output()
@@ -423,9 +430,11 @@ fn backup_projects_to_baidu_blocking(app: tauri::AppHandle, remote_path: String,
     let remote_path = validate_cloud_path(&remote_path)?;
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "prepare", "message": "正在整理小说、书籍、拆书、扫榜与本机设置..." }));
     let export_root = create_cloud_export(&app_data_directory(&app)?, &client_state)?;
-    let local = export_root.to_string_lossy().into_owned();
+    let export_parent = export_root.parent().ok_or_else(|| "无法确定备份工作目录".to_string())?;
+    let export_name = export_root.file_name().and_then(|name| name.to_str()).ok_or_else(|| "备份目录名称无效".to_string())?;
+    let remote_target = format!("{remote_path}/");
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "upload", "message": "资料已整理，正在后台上传到百度网盘..." }));
-    let output = run_bdpan(&["upload", &local, &format!("{remote_path}/")])?;
+    let output = run_bdpan_at(&["upload", export_name, &remote_target], Some(export_parent))?;
     fs::remove_dir_all(&export_root).ok();
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "done", "message": "完整备份已上传到百度网盘。" }));
     Ok(serde_json::json!({ "remotePath": remote_path, "message": output, "scope": "projects, books, dismantles, rankings, styles, client-state" }))
@@ -448,8 +457,7 @@ fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: Stri
         fs::remove_dir_all(&restore_root).map_err(|error| format!("清理上次恢复缓存失败: {error}"))?;
     }
     fs::create_dir_all(&restore_root).map_err(|error| format!("创建恢复缓存失败: {error}"))?;
-    let local = restore_root.to_string_lossy().into_owned();
-    let output = run_bdpan(&["download", &remote_path, &local])?;
+    let output = run_bdpan_at(&["download", &remote_path, "cloud-restore"], Some(&app_data))?;
     let export_root = find_cloud_export(&restore_root, 4)
         .ok_or_else(|| "云端下载完成，但没有找到完整应用备份。请确认选择的是新版备份目录。".to_string())?;
     let client_state: Value = serde_json::from_str(&fs::read_to_string(export_root.join("client-state.json")).map_err(|error| format!("读取云端设置失败: {error}"))?)
