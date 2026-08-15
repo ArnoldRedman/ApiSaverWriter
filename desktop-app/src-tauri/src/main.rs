@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
@@ -323,7 +323,32 @@ fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn copy_cloud_backup_contents(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| format!("创建备份目录失败: {error}"))?;
+    let entries = fs::read_dir(source).map_err(|error| format!("读取待备份目录失败: {error}"))?;
+    for entry in entries.filter_map(Result::ok) {
+        let file_name = entry.file_name();
+        if file_name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| format!("读取备份文件类型失败: {error}"))?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let source_path = entry.path();
+        let target_path = target.join(file_name);
+        if file_type.is_dir() {
+            copy_cloud_backup_contents(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &target_path).map_err(|error| format!("备份文件失败: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 const CLOUD_BACKUP_DIRECTORIES: [&str; 5] = ["projects", "books", "dismantles", "rankings", "styles"];
+const CLOUD_BACKUP_BUNDLE_NAME: &str = "ApiSaverWriter-backup.aswbackup";
+const CLOUD_BACKUP_MAGIC: &[u8] = b"ASWBACKUP\x01";
 
 fn cloud_export_directory(app_data: &Path) -> PathBuf {
     app_data.join("cloud-export")
@@ -338,7 +363,7 @@ fn create_cloud_export(app_data: &Path, client_state: &Value) -> Result<PathBuf,
     for directory in CLOUD_BACKUP_DIRECTORIES {
         let source = app_data.join(directory);
         if source.exists() {
-            copy_directory_contents(&source, &export_root.join(directory))?;
+            copy_cloud_backup_contents(&source, &export_root.join(directory))?;
         }
     }
     let legacy_projects = app_data.join("projects.json");
@@ -348,6 +373,98 @@ fn create_cloud_export(app_data: &Path, client_state: &Value) -> Result<PathBuf,
     let state = serde_json::to_vec_pretty(client_state).map_err(|error| format!("序列化本地设置失败: {error}"))?;
     fs::write(export_root.join("client-state.json"), state).map_err(|error| format!("写入本地设置备份失败: {error}"))?;
     Ok(export_root)
+}
+
+fn collect_cloud_backup_files(root: &Path, current: &Path, files: &mut Vec<(PathBuf, PathBuf)>) -> Result<(), String> {
+    let entries = fs::read_dir(current).map_err(|error| format!("读取备份包目录失败: {error}"))?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| format!("读取备份包文件类型失败: {error}"))?;
+        if file_type.is_dir() {
+            collect_cloud_backup_files(root, &path, files)?;
+        } else if file_type.is_file() {
+            let relative = path.strip_prefix(root).map_err(|error| format!("计算备份相对路径失败: {error}"))?.to_path_buf();
+            files.push((relative, path));
+        }
+    }
+    Ok(())
+}
+
+fn write_cloud_backup_bundle(export_root: &Path, bundle_path: &Path) -> Result<u64, String> {
+    let mut files = Vec::new();
+    collect_cloud_backup_files(export_root, export_root, &mut files)?;
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut bundle = fs::File::create(bundle_path).map_err(|error| format!("创建完整备份包失败: {error}"))?;
+    bundle.write_all(CLOUD_BACKUP_MAGIC).map_err(|error| format!("写入备份包标识失败: {error}"))?;
+    bundle.write_all(&(files.len() as u64).to_le_bytes()).map_err(|error| format!("写入备份包索引失败: {error}"))?;
+
+    for (relative, source) in files {
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        let path_bytes = relative.as_bytes();
+        let path_length = u32::try_from(path_bytes.len()).map_err(|_| "备份文件路径过长".to_string())?;
+        let file_size = fs::metadata(&source).map_err(|error| format!("读取备份文件大小失败: {error}"))?.len();
+        bundle.write_all(&path_length.to_le_bytes()).map_err(|error| format!("写入备份路径失败: {error}"))?;
+        bundle.write_all(&file_size.to_le_bytes()).map_err(|error| format!("写入备份文件索引失败: {error}"))?;
+        bundle.write_all(path_bytes).map_err(|error| format!("写入备份路径内容失败: {error}"))?;
+        let mut input = fs::File::open(&source).map_err(|error| format!("打开备份文件失败: {error}"))?;
+        std::io::copy(&mut input, &mut bundle).map_err(|error| format!("写入备份文件内容失败: {error}"))?;
+    }
+    bundle.flush().map_err(|error| format!("保存完整备份包失败: {error}"))?;
+    fs::metadata(bundle_path).map(|metadata| metadata.len()).map_err(|error| format!("读取完整备份包失败: {error}"))
+}
+
+fn read_bundle_number<const N: usize>(bundle: &mut fs::File, label: &str) -> Result<[u8; N], String> {
+    let mut bytes = [0_u8; N];
+    bundle.read_exact(&mut bytes).map_err(|error| format!("读取备份包{label}失败: {error}"))?;
+    Ok(bytes)
+}
+
+fn safe_bundle_relative_path(value: &str) -> Result<PathBuf, String> {
+    let path = Path::new(value);
+    if value.is_empty() || path.is_absolute() || path.components().any(|component| !matches!(component, Component::Normal(_))) {
+        return Err(format!("备份包包含不安全路径: {value}"));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn extract_cloud_backup_bundle(bundle_path: &Path, export_root: &Path) -> Result<u64, String> {
+    if export_root.exists() {
+        fs::remove_dir_all(export_root).map_err(|error| format!("清理恢复解包目录失败: {error}"))?;
+    }
+    fs::create_dir_all(export_root).map_err(|error| format!("创建恢复解包目录失败: {error}"))?;
+    let mut bundle = fs::File::open(bundle_path).map_err(|error| format!("打开云端备份包失败: {error}"))?;
+    let mut magic = vec![0_u8; CLOUD_BACKUP_MAGIC.len()];
+    bundle.read_exact(&mut magic).map_err(|error| format!("读取云端备份包标识失败: {error}"))?;
+    if magic != CLOUD_BACKUP_MAGIC {
+        return Err("云端文件不是有效的 ApiSaverWriter 完整备份包".to_string());
+    }
+    let file_count = u64::from_le_bytes(read_bundle_number::<8>(&mut bundle, "文件数量")?);
+    if file_count > 1_000_000 {
+        return Err("云端备份包文件数量异常".to_string());
+    }
+
+    for _ in 0..file_count {
+        let path_length = u32::from_le_bytes(read_bundle_number::<4>(&mut bundle, "路径长度")?) as usize;
+        let file_size = u64::from_le_bytes(read_bundle_number::<8>(&mut bundle, "文件大小")?);
+        if path_length == 0 || path_length > 1_048_576 {
+            return Err("云端备份包路径长度异常".to_string());
+        }
+        let mut path_bytes = vec![0_u8; path_length];
+        bundle.read_exact(&mut path_bytes).map_err(|error| format!("读取备份文件路径失败: {error}"))?;
+        let relative_text = String::from_utf8(path_bytes).map_err(|error| format!("备份文件路径编码错误: {error}"))?;
+        let relative = safe_bundle_relative_path(&relative_text)?;
+        let destination = export_root.join(relative);
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("创建恢复文件目录失败: {error}"))?;
+        }
+        let mut output = fs::File::create(&destination).map_err(|error| format!("创建恢复文件失败: {error}"))?;
+        let copied = std::io::copy(&mut (&mut bundle).take(file_size), &mut output).map_err(|error| format!("解包恢复文件失败: {error}"))?;
+        if copied != file_size {
+            return Err(format!("云端备份包内容不完整: {relative_text}"));
+        }
+    }
+    Ok(file_count)
 }
 
 fn find_cloud_export(root: &Path, depth: usize) -> Option<PathBuf> {
@@ -429,15 +546,21 @@ async fn backup_projects_to_baidu(app: tauri::AppHandle, remote_path: String, cl
 fn backup_projects_to_baidu_blocking(app: tauri::AppHandle, remote_path: String, client_state: Value) -> Result<Value, String> {
     let remote_path = validate_cloud_path(&remote_path)?;
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "prepare", "message": "正在整理小说、书籍、拆书、扫榜与本机设置..." }));
-    let export_root = create_cloud_export(&app_data_directory(&app)?, &client_state)?;
-    let export_parent = export_root.parent().ok_or_else(|| "无法确定备份工作目录".to_string())?;
-    let export_name = export_root.file_name().and_then(|name| name.to_str()).ok_or_else(|| "备份目录名称无效".to_string())?;
-    let remote_target = format!("{remote_path}/");
-    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "upload", "message": "资料已整理，正在后台上传到百度网盘..." }));
-    let output = run_bdpan_at(&["upload", export_name, &remote_target], Some(export_parent))?;
+    let app_data = app_data_directory(&app)?;
+    let export_root = create_cloud_export(&app_data, &client_state)?;
+    let bundle_path = app_data.join(CLOUD_BACKUP_BUNDLE_NAME);
+    if bundle_path.exists() {
+        fs::remove_file(&bundle_path).map_err(|error| format!("清理旧完整备份包失败: {error}"))?;
+    }
+    let bundle_size = write_cloud_backup_bundle(&export_root, &bundle_path)?;
+    let remote_target = format!("{remote_path}/{CLOUD_BACKUP_BUNDLE_NAME}");
+    let _ = run_bdpan(&["mkdir", &remote_path]);
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "upload", "message": format!("完整备份包已生成（{:.1} MB），正在后台上传到百度网盘...", bundle_size as f64 / 1_048_576.0) }));
+    let output = run_bdpan_at(&["upload", CLOUD_BACKUP_BUNDLE_NAME, &remote_target], Some(&app_data))?;
     fs::remove_dir_all(&export_root).ok();
+    fs::remove_file(&bundle_path).ok();
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "done", "message": "完整备份已上传到百度网盘。" }));
-    Ok(serde_json::json!({ "remotePath": remote_path, "message": output, "scope": "projects, books, dismantles, rankings, styles, client-state" }))
+    Ok(serde_json::json!({ "remotePath": remote_path, "remoteFile": remote_target, "message": output, "size": bundle_size, "scope": "projects, books, dismantles, rankings, styles, client-state" }))
 }
 
 #[tauri::command]
@@ -457,9 +580,23 @@ fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: Stri
         fs::remove_dir_all(&restore_root).map_err(|error| format!("清理上次恢复缓存失败: {error}"))?;
     }
     fs::create_dir_all(&restore_root).map_err(|error| format!("创建恢复缓存失败: {error}"))?;
-    let output = run_bdpan_at(&["download", &remote_path, "cloud-restore"], Some(&app_data))?;
-    let export_root = find_cloud_export(&restore_root, 4)
-        .ok_or_else(|| "云端下载完成，但没有找到完整应用备份。请确认选择的是新版备份目录。".to_string())?;
+    let remote_bundle = format!("{remote_path}/{CLOUD_BACKUP_BUNDLE_NAME}");
+    let local_bundle = restore_root.join(CLOUD_BACKUP_BUNDLE_NAME);
+    let local_bundle_text = format!(".cloud-restore/{CLOUD_BACKUP_BUNDLE_NAME}");
+    let (output, export_root) = match run_bdpan_at(&["download", &remote_bundle, &local_bundle_text], Some(&app_data)) {
+        Ok(output) => {
+            let export_root = restore_root.join("cloud-export");
+            extract_cloud_backup_bundle(&local_bundle, &export_root)?;
+            (output, export_root)
+        }
+        Err(bundle_error) => {
+            let output = run_bdpan_at(&["download", &remote_path, "cloud-restore"], Some(&app_data))
+                .map_err(|legacy_error| format!("下载完整备份包失败: {bundle_error}\n兼容旧版目录备份也失败: {legacy_error}"))?;
+            let export_root = find_cloud_export(&restore_root, 4)
+                .ok_or_else(|| "云端下载完成，但没有找到完整应用备份。请确认云端目录包含有效备份。".to_string())?;
+            (output, export_root)
+        }
+    };
     let client_state: Value = serde_json::from_str(&fs::read_to_string(export_root.join("client-state.json")).map_err(|error| format!("读取云端设置失败: {error}"))?)
         .map_err(|error| format!("云端设置格式错误: {error}"))?;
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "apply", "message": "下载完成，正在恢复小说与本机配置..." }));
@@ -1570,6 +1707,30 @@ fn detect_system_proxy() -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cloud_backup_bundle_round_trip_supports_novel_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "apisaverwriter-backup-test-{}",
+            std::process::id()
+        ));
+        let source = root.join("source");
+        let restored = root.join("restored");
+        let chapter = source.join("projects/测试小说/章节/第 1 章 F级？可我隐藏天赋是SSS啊？.md");
+        fs::create_dir_all(chapter.parent().unwrap()).unwrap();
+        fs::write(&chapter, "第一章正文\n完整内容").unwrap();
+        fs::write(source.join("client-state.json"), "{\"theme\":\"light\"}").unwrap();
+        let bundle = root.join(CLOUD_BACKUP_BUNDLE_NAME);
+
+        let size = write_cloud_backup_bundle(&source, &bundle).unwrap();
+        let count = extract_cloud_backup_bundle(&bundle, &restored).unwrap();
+
+        assert!(size > CLOUD_BACKUP_MAGIC.len() as u64);
+        assert_eq!(count, 2);
+        assert_eq!(fs::read_to_string(restored.join(chapter.strip_prefix(&source).unwrap())).unwrap(), "第一章正文\n完整内容");
+        assert_eq!(fs::read_to_string(restored.join("client-state.json")).unwrap(), "{\"theme\":\"light\"}");
+        fs::remove_dir_all(root).ok();
+    }
 
     #[test]
     fn graph_node_document_preserves_profile_and_relationships() {
