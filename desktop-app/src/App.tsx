@@ -948,6 +948,16 @@ const countOccurrences = (content: string, query: string) => {
   return count;
 };
 
+const formatNovelChapterContent = (content: string) => content
+  .replace(/^\uFEFF/u, '')
+  .replace(/\r\n?/gu, '\n')
+  .replace(/[\u00A0\u2007\u202F]/gu, ' ')
+  .split('\n')
+  .map(line => line.trim())
+  .join('\n')
+  .replace(/\n{3,}/gu, '\n\n')
+  .trim();
+
 type TabType = 'projects' | 'books' | 'dismantles' | 'rankings' | 'skills' | 'styles';
 type TagTab = '主分类' | '主题' | '角色' | '情节';
 type Channel = '男频' | '女频';
@@ -2824,6 +2834,23 @@ function App() {
       goalNoticeChapterRef.current = activeChapter.id;
       setNotice({ title: '已达到本章目标字数', content: `本章已写 ${wordCount} 字，建议保存并创建下一章。` });
     }
+  };
+
+  const formatActiveChapter = () => {
+    if (!activeChapter) return;
+    const formatted = formatNovelChapterContent(activeChapter.content);
+    if (formatted === activeChapter.content) {
+      setNotice({ title: '正文格式已规范', content: '没有发现需要清理的空格、换行或首尾空白。' });
+      return;
+    }
+    handleUpdateChapterContent(formatted);
+    setNotice({ title: '正文格式化完成', content: '已统一换行、清理行首尾空格并合并多余空行，内容会自动保存。' });
+    window.requestAnimationFrame(() => {
+      const editor = chapterEditorRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.setSelectionRange(formatted.length, formatted.length);
+    });
   };
 
   const captureChapterSelection = () => {
@@ -4795,6 +4822,7 @@ function App() {
                       <button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button>
                       <span className="search-shortcut">⌘/Ctrl F</span>
                     </div>
+                    <button className="editor-tool-button" title="统一换行、清理多余空格和空行" onClick={formatActiveChapter} disabled={!activeChapter.content.trim()}>格式化正文</button>
                     <span className="chapter-goal-status">目标 {Number(editingProject.chapterTargetWords) || 3000} 字 · 上限 {Math.floor((Number(editingProject.chapterTargetWords) || 3000) * 1.2)} 字</span>
                   </div>
                   {showSearchPanel && (
