@@ -3219,48 +3219,49 @@ function App() {
     return mentions.slice(0, limit);
   };
 
+  const refreshCardStatesForProject = (project: Project, cardIds?: Set<number>) => {
+    const now = new Date().toISOString();
+    const targetCards = cardIds ? project.cards.filter(card => cardIds.has(card.id)) : project.cards;
+    if (!targetCards.length) return project;
+    const graphNodes = [...project.graphNodes];
+    const graphEdges = [...project.graphEdges];
+    project.cards.forEach(card => {
+      if (!graphNodes.some(node => node.id === `card:${card.id}`)) {
+        graphNodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type });
+      }
+    });
+    const cards = project.cards.map(card => {
+      if (!targetCards.some(target => target.id === card.id)) return card;
+      const recentMentions = findCardRecentMentions(project, card, 3);
+      const mention = recentMentions[0] ?? null;
+      const status = mention ? '最近出现' : '未在正文中定位';
+      const changes = mention
+        ? recentMentions.map(item => `第 ${project.chapters.findIndex(chapter => chapter.id === item.chapter.id) + 1} 章《${item.chapter.title}》出现“${item.matchedTerm}”：${item.snippet}`).join('\n')
+        : '当前全文未检索到可定位的卡片名称或关键词。';
+      const lastEntry = card.stateHistory?.[card.stateHistory.length - 1];
+      const stateHistory = lastEntry?.changes === changes ? (card.stateHistory || []) : [
+        ...(card.stateHistory || []),
+        { chapterId: mention?.chapter.id ?? 0, chapterTitle: mention?.chapter.title ?? '全文检索', status, changes, updatedAt: now },
+      ].slice(-30);
+      for (const item of recentMentions) {
+        const chapterNodeId = `chapter:${item.chapter.id}`;
+        if (!graphNodes.some(node => node.id === chapterNodeId)) graphNodes.push({ id: chapterNodeId, label: item.chapter.title, type: 'chapter' });
+        const edgeId = `${chapterNodeId}->card:${card.id}:状态引用`;
+        upsertKnowledgeGraphEdge(graphEdges, { id: edgeId, source: chapterNodeId, target: `card:${card.id}`, label: '状态引用', weight: 0.88, updatedAt: now });
+      }
+      return { ...card, currentState: changes, stateHistory, updatedAt: now };
+    });
+    return { ...project, cards, graphNodes, graphEdges, updatedAt: now };
+  };
+
   const updateCardStatesFromBook = (cardId?: number) => {
     if (!editingProject) return;
-    const now = new Date().toISOString();
     const targetCards = cardId === undefined ? editingProject.cards : editingProject.cards.filter(card => card.id === cardId);
     if (!targetCards.length) return;
-    updateEditorProject(project => {
-      const searchProject = activeChapter
-        ? { ...project, chapters: project.chapters.map(chapter => chapter.id === activeChapter.id ? activeChapter : chapter) }
-        : project;
-      const graphNodes = [...project.graphNodes];
-      const graphEdges = [...project.graphEdges];
-      project.cards.forEach(card => {
-        if (!graphNodes.some(node => node.id === `card:${card.id}`)) graphNodes.push({ id: `card:${card.id}`, label: card.title, type: 'card', category: card.type });
-      });
-      const cards = project.cards.map(card => {
-        if (!targetCards.some(target => target.id === card.id)) return card;
-        let recentMentions = findCardRecentMentions(searchProject, card, 3);
-        const fallbackTerm = card.title.slice(-2);
-        if (!recentMentions.length && activeChapter && fallbackTerm.length === 2 && activeChapter.content.includes(fallbackTerm)) {
-          const position = activeChapter.content.lastIndexOf(fallbackTerm);
-          recentMentions = [{ chapter: activeChapter, matchedTerm: fallbackTerm, position, snippet: activeChapter.content.slice(Math.max(0, position - 70), position + fallbackTerm.length + 150).replace(/\s+/gu, ' ').trim() }];
-        }
-        const mention = recentMentions[0] ?? null;
-        const status = mention ? '最近出现' : '未在正文中定位';
-        const changes = mention
-          ? recentMentions.map(item => `第 ${project.chapters.findIndex(chapter => chapter.id === item.chapter.id) + 1} 章《${item.chapter.title}》出现“${item.matchedTerm}”：${item.snippet}`).join('\n')
-          : '当前全文未检索到可定位的卡片名称或关键词。';
-        const lastEntry = card.stateHistory?.[card.stateHistory.length - 1];
-        const stateHistory = lastEntry?.changes === changes ? (card.stateHistory || []) : [
-          ...(card.stateHistory || []),
-          { chapterId: mention?.chapter.id ?? 0, chapterTitle: mention?.chapter.title ?? '全文检索', status, changes, updatedAt: now },
-        ].slice(-30);
-        for (const item of recentMentions) {
-          const chapterNodeId = `chapter:${item.chapter.id}`;
-          if (!graphNodes.some(node => node.id === chapterNodeId)) graphNodes.push({ id: chapterNodeId, label: item.chapter.title, type: 'chapter' });
-          const edgeId = `${chapterNodeId}->card:${card.id}:状态引用`;
-          upsertKnowledgeGraphEdge(graphEdges, { id: edgeId, source: chapterNodeId, target: `card:${card.id}`, label: '状态引用', weight: 0.88, updatedAt: now });
-        }
-        return { ...card, currentState: changes, stateHistory, updatedAt: now };
-      });
-      return { ...project, cards, graphNodes, graphEdges, updatedAt: now };
-    });
+    const searchProject = activeChapter
+      ? { ...editingProject, chapters: editingProject.chapters.map(chapter => chapter.id === activeChapter.id ? activeChapter : chapter) }
+      : editingProject;
+    updateEditorProject(() => refreshCardStatesForProject(searchProject, new Set(targetCards.map(card => card.id))));
     setNotice({ title: cardId === undefined ? '卡片状态已更新' : '卡片状态已更新', content: `已全文检索并更新 ${targetCards.length} 张卡片的最近出现状态。` });
   };
 
@@ -3405,10 +3406,14 @@ function App() {
     const currentMemory = editingProject.memories.find(memory => memory.chapterId === chapter.id);
     const selectedKeywords = editingProject.cards.filter(card => selectedCardIds.includes(card.id)).map(card => card.title);
     const keywords = selectedKeywords.length ? selectedKeywords : (currentMemory?.keywords?.length ? currentMemory.keywords : extractLocalKeywords(chapter.content));
-    const localProject = buildProjectWithChapterMemory(editingProject, chapter, {
+    const localProjectWithMemory = buildProjectWithChapterMemory(editingProject, chapter, {
       summary: buildLocalChapterSummary(chapter.content),
       keywords,
     });
+    const cardsToRefresh = new Set(localProjectWithMemory.cards
+      .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => chapter.content.includes(term)))
+      .map(card => card.id));
+    const localProject = refreshCardStatesForProject(localProjectWithMemory, cardsToRefresh);
     const saveProject = async (project: Project) => {
       const snapshot = projects.map(item => item.id === project.id ? project : item);
       setProjects(snapshot);
@@ -3484,7 +3489,17 @@ function App() {
           const latestChapter = latestProject?.chapters.find(item => item.id === chapter.id);
           if (!latestProject || !latestChapter || latestChapter.updatedAt !== chapter.updatedAt) return currentProjects;
           const memoryProject = buildProjectWithChapterMemory(latestProject, latestChapter, memoryPatch);
-          const merged = { ...mergeKnowledgeGraph(memoryProject, latestChapter, result), authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20) };
+          const refreshedMemoryProject = refreshCardStatesForProject(memoryProject, new Set(memoryProject.cards
+            .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => latestChapter.content.includes(term)))
+            .map(card => card.id)));
+          const mergedBase = mergeKnowledgeGraph(refreshedMemoryProject, latestChapter, result);
+          const resultCardIds = (result.cardUpdates || [])
+            .map(update => mergedBase.cards.find(card => (update.cardId !== undefined && String(card.id) === String(update.cardId)) || (update.cardTitle && card.title === update.cardTitle))?.id)
+            .filter((id): id is number => id !== undefined);
+          const merged = {
+            ...refreshCardStatesForProject(mergedBase, new Set([...resultCardIds, ...selectedCardIds])),
+            authorPreferences: Array.from(new Set([...(latestProject.authorPreferences || []), ...asTextList(result.authorPreferences, 8)])).slice(-20),
+          };
           setEditingProject(current => current?.id === merged.id ? merged : current);
           setActiveChapter(current => current?.id === latestChapter.id ? latestChapter : current);
           const nextProjects = currentProjects.map(project => project.id === merged.id ? merged : project);
@@ -3914,10 +3929,13 @@ function App() {
         updatedAt: now,
       };
       const selectedCards = editingProject.cards.filter(card => selectedCardIds.includes(card.id));
-      const updated = buildProjectWithChapterMemory(editingProject, updatedChapter, {
+      const updatedWithMemory = buildProjectWithChapterMemory(editingProject, updatedChapter, {
         summary: agentDraft.summary || buildLocalChapterSummary(agentDraft.draftContent),
         keywords: selectedCards.map(card => card.title),
       });
+      const updated = refreshCardStatesForProject(updatedWithMemory, new Set(updatedWithMemory.cards
+        .filter(card => selectedCardIds.includes(card.id) || cardSearchTerms(card).some(term => updatedChapter.content.includes(term)))
+        .map(card => card.id)));
       setEditingProject(updated);
       setActiveChapter(updatedChapter);
       setProjects(current => current.map(project => project.id === updated.id ? updated : project));
