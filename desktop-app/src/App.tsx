@@ -706,7 +706,7 @@ const normalizeRankingBook = (book: Partial<RankingBook>, index: number): Rankin
   title: typeof book.title === 'string' ? book.title : '未命名书籍',
   author: typeof book.author === 'string' ? book.author : '未知作者',
   intro: typeof book.intro === 'string' ? book.intro : '',
-  cover: typeof book.cover === 'string' ? book.cover : undefined,
+  cover: typeof book.cover === 'string' ? book.cover.replace(/^http:/iu, 'https:') : undefined,
   category: typeof book.category === 'string' ? book.category : undefined,
   rank: Number(book.rank) || index + 1,
   rankType: book.rankType === 'new' || book.rankType === 'hot' || book.rankType === 'completed' || book.rankType === 'collect' ? book.rankType : 'read',
@@ -1338,7 +1338,15 @@ function App() {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
   const [usageDays, setUsageDays] = useState<UsageDay[]>(() => { try { const value = JSON.parse(localStorage.getItem('writer-runtime-usage-days') || '[]'); return Array.isArray(value) ? value : []; } catch { return []; } });
-  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage'>('model');
+  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync'>('model');
+  const [cloudRemotePath, setCloudRemotePath] = useState(() => {
+    const saved = localStorage.getItem('cloud-remote-path');
+    return !saved || saved === 'ApiSaverWriter/projects' ? 'ApiSaverWriter/backup' : saved;
+  });
+  const [cloudSyncRunning, setCloudSyncRunning] = useState(false);
+  const [cloudSyncMessage, setCloudSyncMessage] = useState('');
+  const [baiduAuthURL, setBaiduAuthURL] = useState('');
+  const [baiduAuthCode, setBaiduAuthCode] = useState('');
   const [usageDateFilter, setUsageDateFilter] = useState('all');
   const [usageStartDate, setUsageStartDate] = useState('');
   const [usageEndDate, setUsageEndDate] = useState('');
@@ -1515,6 +1523,22 @@ function App() {
           return item;
         });
       });
+    }).then(handler => {
+      if (disposed) handler();
+      else unlisten = handler;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<{ message?: string }>('cloud-sync-progress', event => {
+      if (!disposed && event.payload?.message) setCloudSyncMessage(event.payload.message);
     }).then(handler => {
       if (disposed) handler();
       else unlisten = handler;
@@ -2872,6 +2896,73 @@ function App() {
     setNotice({ title: '替换完成', content: `本章已替换 ${count} 处。` });
   };
 
+  const toggleSearchPanel = () => {
+    setShowSearchPanel(current => !current);
+    window.setTimeout(() => searchInputRef.current?.focus(), 0);
+  };
+
+  const moveDocumentSearchMatch = (content: string, label: string, direction: 1 | -1) => {
+    if (!searchQuery) return;
+    const count = countOccurrences(content, searchQuery);
+    if (!count) {
+      setSearchMatchIndex(0);
+      setNotice({ title: '没有找到匹配内容', content: `${label}中没有“${searchQuery}”。` });
+      return;
+    }
+    setSearchMatchIndex(current => (current + direction + count) % count);
+  };
+
+  const replaceDocumentCurrentMatch = (content: string, label: string, update: (next: string) => void) => {
+    if (!searchQuery) return;
+    const matches: number[] = [];
+    let cursor = 0;
+    while (cursor < content.length) {
+      const index = content.indexOf(searchQuery, cursor);
+      if (index < 0) break;
+      matches.push(index);
+      cursor = index + Math.max(1, searchQuery.length);
+    }
+    if (!matches.length) {
+      setNotice({ title: '没有可替换内容', content: `${label}中没有“${searchQuery}”。` });
+      return;
+    }
+    const targetStart = matches[Math.min(searchMatchIndex, matches.length - 1)];
+    update(`${content.slice(0, targetStart)}${replaceQuery}${content.slice(targetStart + searchQuery.length)}`);
+    setSearchMatchIndex(Math.min(searchMatchIndex, Math.max(0, matches.length - 2)));
+    setNotice({ title: '已替换一处', content: `${label}已将“${searchQuery}”替换为“${replaceQuery}”。` });
+  };
+
+  const replaceDocumentAllMatches = (content: string, label: string, update: (next: string) => void) => {
+    if (!searchQuery) return;
+    const count = countOccurrences(content, searchQuery);
+    if (!count) {
+      setNotice({ title: '没有可替换内容', content: `${label}中没有“${searchQuery}”。` });
+      return;
+    }
+    update(content.split(searchQuery).join(replaceQuery));
+    setSearchMatchIndex(0);
+    setNotice({ title: '替换完成', content: `${label}已替换 ${count} 处。` });
+  };
+
+  const renderDocumentSearchPanel = (label: string, content: string, update: (next: string) => void) => {
+    if (!showSearchPanel) return null;
+    const matchCount = searchQuery ? countOccurrences(content, searchQuery) : 0;
+    return <section className="search-panel document-search-panel" aria-label={`${label}搜索与替换`}>
+      <div className="search-panel-row">
+        <input ref={searchInputRef} className="input" value={searchQuery} placeholder={`搜索${label}内容`} onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); }} />
+        <button className="editor-tool-button" onClick={() => moveDocumentSearchMatch(content, label, -1)} disabled={!searchQuery}>上一个</button>
+        <button className="editor-tool-button" onClick={() => moveDocumentSearchMatch(content, label, 1)} disabled={!searchQuery}>下一个</button>
+        <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}>×</button>
+      </div>
+      <div className="search-panel-row replace-row">
+        <input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} />
+        <button className="editor-tool-button" onClick={() => replaceDocumentCurrentMatch(content, label, update)} disabled={!searchQuery}>替换</button>
+        <button className="editor-tool-button" onClick={() => replaceDocumentAllMatches(content, label, update)} disabled={!searchQuery}>全部替换</button>
+        <small>{matchCount ? `${Math.min(searchMatchIndex + 1, matchCount)} / ${matchCount}` : '无匹配'}</small>
+      </div>
+    </section>;
+  };
+
   const saveBannedWords = () => {
     const words = Array.from(new Set(bannedWordsDraft.split(/[\n,，、]+/u).map(word => word.trim()).filter(Boolean))).slice(0, 300);
     setBannedWords(words);
@@ -3629,10 +3720,12 @@ function App() {
       if (!('__TAURI_INTERNALS__' in window)) throw new Error('发布功能需要桌面版浏览器运行时');
       await invoke<string>('save_projects', { projects });
       const result = await invoke<{ status?: PublishRecord['status']; message?: string; url?: string }>('publish_fanqie', {
-        creatorURL: config.creatorURL,
-        bookId: config.bookId,
-        chapterTitle: chapter.title,
-        content: chapter.content,
+        payload: {
+          creatorURL: config.creatorURL,
+          bookId: config.bookId,
+          chapterTitle: chapter.title,
+          content: chapter.content,
+        },
       });
       const status = result.status || 'error';
       const record: PublishRecord = {
@@ -3821,6 +3914,100 @@ function App() {
     setSettingsServiceExpanded(true);
     setShowSettingsModal(true);
     setSettingsSection('model');
+  };
+
+  const checkCloudSyncStatus = async () => {
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在检查百度网盘登录状态...');
+    try {
+      const result = await invoke<{ raw?: string; authenticated?: boolean; is_login?: boolean; logged_in?: boolean; username?: string }>('cloud_sync_status');
+      const loggedIn = result.authenticated === true || result.is_login === true || result.logged_in === true || /已登录|logged.?in|success/iu.test(result.raw || '');
+      setCloudSyncMessage(loggedIn ? `百度网盘已登录${result.username ? `：${result.username}` : ''}` : '百度网盘工具已安装，但当前未登录，请先运行 Skill 的登录脚本。');
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const beginBaiduLogin = async () => {
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在获取百度网盘授权链接...');
+    try {
+      const url = await invoke<string>('baidu_login_url');
+      if (!/^https?:\/\//iu.test(url.trim())) throw new Error('百度网盘没有返回有效授权链接');
+      setBaiduAuthURL(url.trim());
+      setCloudSyncMessage('请在浏览器完成授权，然后将页面显示的 32 位授权码粘贴到下方。');
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const confirmBaiduLogin = async () => {
+    if (!baiduAuthCode.trim()) { setCloudSyncMessage('请先粘贴授权码。'); return; }
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在验证百度网盘授权...');
+    try {
+      await invoke('complete_baidu_login', { code: baiduAuthCode.trim() });
+      setBaiduAuthCode('');
+      setBaiduAuthURL('');
+      setCloudSyncMessage('百度网盘登录成功，可以开始备份与恢复。');
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const backupToCloud = async () => {
+    const remotePath = cloudRemotePath.trim();
+    if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在备份小说目录到百度网盘...');
+    try {
+      const snapshot = editingProject ? projects.map(project => project.id === editingProject.id ? editingProject : project) : projects;
+      await invoke<string>('save_projects', { projects: snapshot });
+      const clientState = Object.fromEntries([
+        'agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
+        'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
+      ].map(key => [key, localStorage.getItem(key)]));
+      clientState['cloud-remote-path'] = remotePath;
+      const result = await invoke<{ message?: string; remotePath?: string }>('backup_projects_to_baidu', { remotePath, clientState });
+      localStorage.setItem('cloud-remote-path', remotePath);
+      setCloudSyncMessage(`完整备份完成：${result.remotePath || remotePath}`);
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const restoreFromCloud = async () => {
+    const remotePath = cloudRemotePath.trim();
+    if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在从百度网盘恢复小说目录...');
+    try {
+      const result = await invoke<{ clientState?: Record<string, string | null> }>('restore_projects_from_baidu', { remotePath });
+      Object.entries(result.clientState || {}).forEach(([key, value]) => {
+        if (typeof value === 'string') localStorage.setItem(key, value);
+        else localStorage.removeItem(key);
+      });
+      const restored = await invoke<Project[] | null>('load_projects');
+      if (restored) {
+        setProjects(restored);
+        if (editingProject) setEditingProject(restored.find(project => project.id === editingProject.id) || null);
+      }
+      localStorage.setItem('cloud-remote-path', remotePath);
+      setCloudSyncMessage(`完整恢复完成：${remotePath}。正在重新载入应用数据...`);
+      window.setTimeout(() => window.location.reload(), 700);
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
   };
 
   const pullModels = async () => {
@@ -4384,10 +4571,7 @@ function App() {
                     ))}
                   </div>
                   {activeOutline ? (
-                    <div className="outline-editor">
-                      <input className="input" value={activeOutline.title} onChange={(event) => updateActiveOutline({ title: event.target.value })} />
-                      <p className="outline-editor-hint">选择大纲后，中间编辑区会显示对应 Markdown 内容。</p>
-                    </div>
+                    <p className="outline-editor-hint">选择大纲后，在中央编辑器顶部修改标题和正文。</p>
                   ) : <p className="empty-hint">点击“新建大纲”，再选择总纲、章纲或设定文档</p>}
                 </div>
               )}
@@ -4485,7 +4669,8 @@ function App() {
               {editorSidebarTab === 'outline' ? (
                 <section className="outline-workspace">
                   {activeOutline ? <>
-                    <div className="outline-workspace-header"><span>{activeOutline.kind}</span><h3>{activeOutline.title || activeOutline.kind}</h3><small>Markdown 大纲文档 · 内容会自动保存</small></div>
+                    <div className="outline-workspace-header"><div><span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题" /><small>Markdown 大纲文档 · 内容会自动保存</small></div><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div>
+                    {renderDocumentSearchPanel('大纲', activeOutline.content, content => updateActiveOutline({ content }))}
                     <textarea className="outline-main-editor" value={activeOutline.content} onChange={event => updateActiveOutline({ content: event.target.value })} placeholder={`编辑${activeOutline.kind}内容...`} />
                   </> : <div className="empty-state"><p>从左侧选择一个大纲开始编辑。</p></div>}
                 </section>
@@ -4493,8 +4678,9 @@ function App() {
                 <section className="card-workspace">
                   <>
                     <div className="card-workspace-header"><span>{cardDraft.type}</span><input className="card-main-title-input" value={cardDraft.title} onChange={event => setCardDraft(current => ({ ...current, title: event.target.value }))} placeholder="卡片名称" /><small>知识卡 Markdown · 内容会自动保存</small></div>
-                    <div className="card-workspace-controls"><select className="select" value={cardDraft.type} onChange={event => setCardDraft(current => ({ ...current, type: event.target.value as CardType }))}><option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option></select><button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>{activeCard && <button className="btn-secondary" onClick={() => void updateCardStatesFromBook(activeCard.id)}>更新状态</button>}</div>
+                    <div className="card-workspace-controls"><select className="select" value={cardDraft.type} onChange={event => setCardDraft(current => ({ ...current, type: event.target.value as CardType }))}><option value="角色卡">角色卡</option><option value="物品卡">物品卡</option><option value="地点卡">地点卡</option><option value="势力卡">势力卡</option><option value="金手指卡">金手指卡</option></select><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button><button className="btn-secondary" disabled={cardGenerating} onClick={generateCardWithAI}>{cardGenerating ? '生成中...' : 'AI 生成卡片'}</button>{activeCard && <button className="btn-secondary" onClick={() => void updateCardStatesFromBook(activeCard.id)}>更新状态</button>}</div>
                     <div className="card-workspace-meta"><span>当前状态：{activeCard?.currentState || '尚未更新'}</span>{activeCard && <button className="link-button" onClick={() => void updateCardStatesFromBook(activeCard.id)}>全文检索并更新状态</button>}</div>
+                    {renderDocumentSearchPanel('卡片', cardDraft.content, content => setCardDraft(current => ({ ...current, content })))}
                     <textarea className="card-main-editor" value={cardDraft.content} onChange={event => setCardDraft(current => ({ ...current, content: event.target.value }))} placeholder="编辑卡片详细信息..." />
                     <div className="card-workspace-footer"><span>{countNovelCharacters(cardDraft.content)} 字</span><button className="btn-primary" onClick={saveCard}>{activeCard ? '保存卡片' : '创建卡片'}</button></div>
                   </>
@@ -4606,7 +4792,7 @@ function App() {
                 <>
                   <div className="chapter-editor-toolbar">
                     <div className="chapter-toolbar-search">
-                      <button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={() => { setShowSearchPanel(current => !current); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索 / 替换</button>
+                      <button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button>
                       <span className="search-shortcut">⌘/Ctrl F</span>
                     </div>
                     <span className="chapter-goal-status">目标 {Number(editingProject.chapterTargetWords) || 3000} 字 · 上限 {Math.floor((Number(editingProject.chapterTargetWords) || 3000) * 1.2)} 字</span>
@@ -4939,7 +5125,7 @@ function App() {
             <header className="page-header"><div><span className="page-eyebrow">全局写作资源</span><h2>文风管理</h2><p>新建或编辑文风 Skill。保存后可在每部小说的章节侧栏绑定使用。</p></div><button className="btn-primary" onClick={openNewWritingStyle}>+ 新建文风</button></header>
             <div className="global-style-workspace">
               <aside className="global-style-list"><div className="panel-section-title">全部文风 <span>{writingStyles.length}</span></div>{writingStyles.map(style => <button type="button" key={style.id} className={`writing-style-item ${styleDraft?.id === style.id ? 'active' : ''}`} onClick={() => setStyleDraft(style)}><strong>{style.name}</strong><small>{style.sourceBookId ? '拆书蒸馏' : '自定义'} · {style.tags.slice(0, 3).join('、') || '未分类'}</small></button>)}{!writingStyles.length && <p className="empty-hint">暂无文风，点击“新建文风”开始。</p>}</aside>
-              <section className="global-style-editor">{styleDraft ? <div className="writing-style-editor"><label>文风名称<input className="input" value={styleDraft.name} onChange={event => setStyleDraft({ ...styleDraft, name: event.target.value })} /></label><label>简短说明<input className="input" value={styleDraft.description} onChange={event => setStyleDraft({ ...styleDraft, description: event.target.value })} /></label><label>Skill 内容<textarea className="style-content-editor" value={styleDraft.content} onChange={event => setStyleDraft({ ...styleDraft, content: event.target.value })} /></label><div className="style-editor-actions"><button className="btn-primary" onClick={saveWritingStyleDraft}>保存文风</button>{writingStyles.some(style => style.id === styleDraft.id) && <button className="link-button danger-link" onClick={() => deleteWritingStyle(styleDraft.id)}>删除</button>}</div></div> : <div className="empty-state"><p>选择一个文风，或新建文风开始编辑。</p></div>}</section>
+              <section className="global-style-editor">{styleDraft ? <div className="writing-style-editor"><div className="style-editor-heading"><div><span>Skill 文档</span><h3>{styleDraft.name || '未命名文风'}</h3></div><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div><label>文风名称<input className="input" value={styleDraft.name} onChange={event => setStyleDraft({ ...styleDraft, name: event.target.value })} /></label><label>简短说明<input className="input" value={styleDraft.description} onChange={event => setStyleDraft({ ...styleDraft, description: event.target.value })} /></label>{renderDocumentSearchPanel('文风', styleDraft.content, content => setStyleDraft({ ...styleDraft, content }))}<label>Skill 内容<textarea className="style-content-editor" value={styleDraft.content} onChange={event => setStyleDraft({ ...styleDraft, content: event.target.value })} /></label><div className="style-editor-actions"><button className="btn-primary" onClick={saveWritingStyleDraft}>保存文风</button>{writingStyles.some(style => style.id === styleDraft.id) && <button className="link-button danger-link" onClick={() => deleteWritingStyle(styleDraft.id)}>删除</button>}</div></div> : <div className="empty-state"><p>选择一个文风，或新建文风开始编辑。</p></div>}</section>
             </div>
           </section>
         )}
@@ -5034,6 +5220,7 @@ function App() {
                 <button className={settingsSection === 'model' ? 'active' : ''} onClick={() => setSettingsSection('model')}><strong>AI 模型配置</strong><small>服务、接口、密钥与模型参数</small></button>
                 <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
                 <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>总计与按天统计</small></button>
+                <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘云端备份与恢复</small></button>
               </nav>
             <div className="modal-body settings-content">
               {settingsSection === 'model' && <>
@@ -5105,6 +5292,14 @@ function App() {
                 <div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间真实消耗 Tokens' : '筛选时间真实消耗 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div>
                 <div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div>
                 <div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div>
+              </section>}
+              {settingsSection === 'sync' && <section className="settings-sync-card">
+                <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
+                <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
+                <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void restoreFromCloud()}>从百度网盘恢复</button></div>
+                {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder="粘贴 32 位授权码" autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
+                {cloudSyncMessage && <p className={`model-list-message ${/失败|错误|未找到|未登录/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
+                <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
               </section>}
               <p className="settings-hint">保存后，编辑器中的 AI 智能体会使用模型与网络配置。密钥仅保存到本机。</p>
             </div>

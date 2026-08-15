@@ -265,6 +265,202 @@ fn app_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
+fn bdpan_command() -> Result<Command, String> {
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(home).join(".local/bin/bdpan"));
+    }
+    candidates.push(PathBuf::from("bdpan"));
+    for candidate in candidates {
+        if candidate.as_os_str() == "bdpan" || candidate.exists() {
+            return Ok(Command::new(candidate));
+        }
+    }
+    Err("未找到 bdpan 命令。请先安装百度网盘 Skill 的 CLI 工具。".to_string())
+}
+
+fn validate_cloud_path(path: &str) -> Result<String, String> {
+    let trimmed = path.trim().trim_matches('/');
+    if trimmed.is_empty() || trimmed.contains("..") || trimmed.starts_with('~') || trimmed.starts_with('.') {
+        return Err("云端路径无效，只能使用 /apps/bdpan/ 下的相对路径".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn run_bdpan(args: &[&str]) -> Result<String, String> {
+    let mut command = bdpan_command()?;
+    let output = command
+        .args(args)
+        .output()
+        .map_err(|error| format!("启动百度网盘工具失败: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("bdpan 退出码 {}", output.status) });
+    }
+    Ok(if !stdout.is_empty() { stdout } else { stderr })
+}
+
+fn copy_directory_contents(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| format!("创建恢复目录失败: {error}"))?;
+    let entries = fs::read_dir(source).map_err(|error| format!("读取云端恢复目录失败: {error}"))?;
+    for entry in entries.filter_map(Result::ok) {
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory_contents(&source_path, &target_path)?;
+        } else {
+            fs::copy(&source_path, &target_path).map_err(|error| format!("恢复文件失败: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+const CLOUD_BACKUP_DIRECTORIES: [&str; 5] = ["projects", "books", "dismantles", "rankings", "styles"];
+
+fn cloud_export_directory() -> PathBuf {
+    std::env::temp_dir().join("apisaverwriter-cloud-export")
+}
+
+fn create_cloud_export(app_data: &Path, client_state: &Value) -> Result<PathBuf, String> {
+    let export_root = cloud_export_directory();
+    if export_root.exists() {
+        fs::remove_dir_all(&export_root).map_err(|error| format!("清理旧备份缓存失败: {error}"))?;
+    }
+    fs::create_dir_all(&export_root).map_err(|error| format!("创建备份缓存失败: {error}"))?;
+    for directory in CLOUD_BACKUP_DIRECTORIES {
+        let source = app_data.join(directory);
+        if source.exists() {
+            copy_directory_contents(&source, &export_root.join(directory))?;
+        }
+    }
+    let legacy_projects = app_data.join("projects.json");
+    if legacy_projects.exists() {
+        fs::copy(&legacy_projects, export_root.join("projects.json")).map_err(|error| format!("备份旧项目数据失败: {error}"))?;
+    }
+    let state = serde_json::to_vec_pretty(client_state).map_err(|error| format!("序列化本地设置失败: {error}"))?;
+    fs::write(export_root.join("client-state.json"), state).map_err(|error| format!("写入本地设置备份失败: {error}"))?;
+    Ok(export_root)
+}
+
+fn find_cloud_export(root: &Path, depth: usize) -> Option<PathBuf> {
+    if root.join("client-state.json").exists() {
+        return Some(root.to_path_buf());
+    }
+    if depth == 0 { return None; }
+    fs::read_dir(root).ok()?.filter_map(Result::ok).find_map(|entry| {
+        let path = entry.path();
+        path.is_dir().then(|| find_cloud_export(&path, depth - 1)).flatten()
+    })
+}
+
+fn replace_cloud_data(app_data: &Path, export_root: &Path) -> Result<(), String> {
+    for directory in CLOUD_BACKUP_DIRECTORIES {
+        let source = export_root.join(directory);
+        let target = app_data.join(directory);
+        if target.exists() {
+            fs::remove_dir_all(&target).map_err(|error| format!("清理本地 {directory} 数据失败: {error}"))?;
+        }
+        if source.exists() {
+            copy_directory_contents(&source, &target)?;
+        }
+    }
+    let source_legacy = export_root.join("projects.json");
+    let target_legacy = app_data.join("projects.json");
+    if source_legacy.exists() {
+        fs::copy(source_legacy, target_legacy).map_err(|error| format!("恢复旧项目数据失败: {error}"))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn cloud_sync_status() -> Result<Value, String> {
+    let output = run_bdpan(&["whoami", "--json"])?;
+    let parsed = serde_json::from_str::<Value>(&output).unwrap_or_else(|_| serde_json::json!({ "raw": output }));
+    Ok(parsed)
+}
+
+#[tauri::command]
+fn baidu_login_url() -> Result<String, String> {
+    run_bdpan(&["login", "--get-auth-url", "--accept-disclaimer"])
+}
+
+#[tauri::command]
+fn complete_baidu_login(code: String) -> Result<Value, String> {
+    let code = code.trim();
+    if code.len() != 32 || !code.chars().all(|character| character.is_ascii_hexdigit()) {
+        return Err("授权码格式无效，请粘贴百度网盘页面返回的 32 位授权码".to_string());
+    }
+    let mut command = bdpan_command()?;
+    let mut child = command
+        .args(["login", "--set-code-stdin", "--accept-disclaimer"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("启动百度网盘登录失败: {error}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(format!("{code}\n").as_bytes()).map_err(|error| format!("提交授权码失败: {error}"))?;
+    }
+    let output = child.wait_with_output().map_err(|error| format!("等待登录结果失败: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(if stderr.trim().is_empty() { "百度网盘授权失败，请重新获取授权链接后再试。".to_string() } else { stderr.trim().to_string() });
+    }
+    let status = cloud_sync_status()?;
+    Ok(status)
+}
+
+#[tauri::command]
+async fn backup_projects_to_baidu(app: tauri::AppHandle, remote_path: String, client_state: Value) -> Result<Value, String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || backup_projects_to_baidu_blocking(handle, remote_path, client_state))
+        .await
+        .map_err(|error| format!("云端备份任务中断: {error}"))?
+}
+
+fn backup_projects_to_baidu_blocking(app: tauri::AppHandle, remote_path: String, client_state: Value) -> Result<Value, String> {
+    let remote_path = validate_cloud_path(&remote_path)?;
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "prepare", "message": "正在整理小说、书籍、拆书、扫榜与本机设置..." }));
+    let export_root = create_cloud_export(&app_data_directory(&app)?, &client_state)?;
+    let local = export_root.to_string_lossy().into_owned();
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "upload", "message": "资料已整理，正在后台上传到百度网盘..." }));
+    let output = run_bdpan(&["upload", &local, &format!("{remote_path}/")])?;
+    fs::remove_dir_all(&export_root).ok();
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "backup", "stage": "done", "message": "完整备份已上传到百度网盘。" }));
+    Ok(serde_json::json!({ "remotePath": remote_path, "message": output, "scope": "projects, books, dismantles, rankings, styles, client-state" }))
+}
+
+#[tauri::command]
+async fn restore_projects_from_baidu(app: tauri::AppHandle, remote_path: String) -> Result<Value, String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || restore_projects_from_baidu_blocking(handle, remote_path))
+        .await
+        .map_err(|error| format!("云端恢复任务中断: {error}"))?
+}
+
+fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: String) -> Result<Value, String> {
+    let remote_path = validate_cloud_path(&remote_path)?;
+    let app_data = app_data_directory(&app)?;
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "download", "message": "正在后台下载完整应用备份..." }));
+    let restore_root = app_data.join(".cloud-restore");
+    if restore_root.exists() {
+        fs::remove_dir_all(&restore_root).map_err(|error| format!("清理上次恢复缓存失败: {error}"))?;
+    }
+    fs::create_dir_all(&restore_root).map_err(|error| format!("创建恢复缓存失败: {error}"))?;
+    let local = restore_root.to_string_lossy().into_owned();
+    let output = run_bdpan(&["download", &remote_path, &local])?;
+    let export_root = find_cloud_export(&restore_root, 4)
+        .ok_or_else(|| "云端下载完成，但没有找到完整应用备份。请确认选择的是新版备份目录。".to_string())?;
+    let client_state: Value = serde_json::from_str(&fs::read_to_string(export_root.join("client-state.json")).map_err(|error| format!("读取云端设置失败: {error}"))?)
+        .map_err(|error| format!("云端设置格式错误: {error}"))?;
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "apply", "message": "下载完成，正在恢复小说与本机配置..." }));
+    replace_cloud_data(&app_data, &export_root)?;
+    fs::remove_dir_all(&restore_root).ok();
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "done", "message": "完整应用数据已恢复，正在重新载入。" }));
+    Ok(serde_json::json!({ "remotePath": remote_path, "message": output, "reloaded": true, "clientState": client_state }))
+}
+
 #[tauri::command]
 fn load_projects(app: tauri::AppHandle) -> Result<Option<Value>, String> {
     let app_data = app_data_directory(&app)?;
@@ -1409,6 +1605,11 @@ fn main() {
             start_agent_runtime,
             call_agent_rpc,
             publish_fanqie,
+            cloud_sync_status,
+            baidu_login_url,
+            complete_baidu_login,
+            backup_projects_to_baidu,
+            restore_projects_from_baidu,
             load_projects,
             save_projects,
             load_dismantle_books,

@@ -119,6 +119,12 @@ const builtinSkillDefinitions: Skill[] = [
     tags: ['自创建', '技能模板', '提示词'], rating: 5, usageCount: 0, builtin: true,
     content: '# skill-creator\n\n输入目标、适用场景、触发词、输入字段、执行步骤和输出格式，生成一份可复用 Markdown 技能；保存前检查名称、边界和失败处理。',
   },
+  {
+    id: 'builtin-baidu-drive', name: 'baidu-drive', displayName: '百度网盘备份与同步', category: 'tool',
+    description: '使用 bdpan CLI 备份、恢复和检查本地小说目录，远端范围固定在 /apps/bdpan/。',
+    tags: ['百度网盘', '备份', '同步', '恢复'], rating: 5, usageCount: 0, builtin: true,
+    content: '# 百度网盘备份与同步\n\n## 适用场景\n作者明确要求备份小说、恢复小说、同步本地项目或检查百度网盘登录状态时使用。\n\n## 操作规范\n1. 只操作应用自己的 `/apps/bdpan/ApiSaverWriter/` 目录，不访问其他云端路径。\n2. 备份前先保存本地小说目录，再上传 `projects` 文件夹；不要删除云端文件。\n3. 恢复前明确提示会覆盖同名本地文件；下载后合并到本地 `projects` 目录并重新加载。\n4. 未登录或 CLI 不存在时，返回登录/安装提示，不伪造成功。\n5. 不读取、输出或记录 access token、密码等凭据。\n\n## 输出格式\n报告操作、远端目录、文件数量或 CLI 返回结果；失败时保留原始错误和下一步处理建议。',
+  },
 ];
 
 // Keep the English names as stable routing keys while presenting every built-in
@@ -164,6 +170,7 @@ const builtinSkillDisplayNames: Record<string, string> = {
   'story-cover': '小说封面',
   'browser-cdp': '浏览器采集',
   'skill-creator': '技能创建器',
+  'baidu-drive': '百度网盘备份与同步',
 };
 
 export const builtinSkills: Skill[] = builtinSkillDefinitions.map(skill => ({

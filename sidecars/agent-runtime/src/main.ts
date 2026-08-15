@@ -1193,28 +1193,36 @@ const fetchQidianRanking = async (rankType: string, gender: string, params?: Rec
   const basePath = rankType === "new" ? "signnewbook" : rankType === "read" ? "readindex" : "yuepiao";
   // 起点榜单统一使用官网默认榜单，不再区分男频/女频频道。
   const pageUrl = `https://www.qidian.com/rank/${basePath}/`;
-  const html = await fetchWebText(pageUrl, params, { headers: { Referer: 'https://www.qidian.com/rank/' } });
-  const $ = loadHtml(html);
-  // 页面顶部也可能带 data-rid 的导航项；先筛出真实书籍行再截取，避免
-  // 前置无关元素占满 slice 后造成“返回 0 本书”。
-  const rankRows = $('li[data-rid]').toArray().filter(element => {
-    const titleNode = $(element).find('.book-mid-info h2 a').first();
-    return Boolean(titleNode.text().trim() && titleNode.attr('href'));
-  }).slice(0, 60);
-  const books = rankRows.map((element, index) => {
-    const item = $(element);
-    const titleNode = item.find('.book-mid-info h2 a').first();
-    const href = resolveBookUrl(pageUrl, titleNode.attr('href') || '');
-    const bookId = titleNode.attr('data-bid') || href.match(/\/book\/(\d+)/u)?.[1] || String(index);
-    const categories = item.find('.book-mid-info .author a').toArray().slice(1).map(node => $(node).text().trim()).filter(Boolean);
-    return {
-      id: `qidian:${bookId}`, sourceBookId: bookId, title: titleNode.text().trim(),
-      author: item.find('.book-mid-info .author a.name').first().text().trim() || '未知作者',
-      intro: item.find('.book-mid-info .intro').text().trim(), cover: resolveBookUrl(pageUrl, item.find('.book-img-box img').attr('src') || '') || undefined,
-      category: categories.join(' · ') || undefined, rank: Number(item.attr('data-rid')) || index + 1,
-      rankType, gender: 'all', platform: 'qidian', url: href,
-    };
-  }).filter(book => book.title && book.url);
+  const parseRankingPage = (html: string) => {
+    const $ = loadHtml(html);
+    // 页面顶部也可能带 data-rid 的导航项；先筛出真实书籍行再截取，避免
+    // 前置无关元素占满 slice 后造成“返回 0 本书”。
+    const rankRows = $('li[data-rid]').toArray().filter(element => {
+      const titleNode = $(element).find('.book-mid-info h2 a').first();
+      return Boolean(titleNode.text().trim() && titleNode.attr('href'));
+    }).slice(0, 60);
+    return rankRows.map((element, index) => {
+      const item = $(element);
+      const titleNode = item.find('.book-mid-info h2 a').first();
+      const href = resolveBookUrl(pageUrl, titleNode.attr('href') || '');
+      const bookId = titleNode.attr('data-bid') || href.match(/\/book\/(\d+)/u)?.[1] || String(index);
+      const categories = item.find('.book-mid-info .author a').toArray().slice(1).map(node => $(node).text().trim()).filter(Boolean);
+      return {
+        id: `qidian:${bookId}`, sourceBookId: bookId, title: titleNode.text().trim(),
+        author: item.find('.book-mid-info .author a.name').first().text().trim() || '未知作者',
+        intro: item.find('.book-mid-info .intro').text().trim(), cover: resolveBookUrl(pageUrl, item.find('.book-img-box img').attr('src') || '') || undefined,
+        category: categories.join(' · ') || undefined, rank: Number(item.attr('data-rid')) || index + 1,
+        rankType, gender: 'all', platform: 'qidian', url: href,
+      };
+    }).filter(book => book.title && book.url);
+  };
+  const requestOptions = { headers: { Referer: 'https://www.qidian.com/rank/' } };
+  let books = parseRankingPage(await fetchWebText(pageUrl, params, requestOptions));
+  // 部分代理出口会被起点的 WAF 直接替换为探针页。榜单是公开页面，解析不到
+  // 书籍时自动直连重试一次，避免把代理校验页误报为“榜单没有书”。
+  if (!books.length && params?.proxyEnabled === true) {
+    books = parseRankingPage(await fetchWebText(pageUrl, { ...params, proxyEnabled: false }, requestOptions));
+  }
   if (!books.length) throw new Error(`起点中文网${basePath}榜单未返回可解析书籍，官网页面可能正在校验或已更新结构`);
   return books;
 };
@@ -1233,7 +1241,7 @@ const fetchFalooRanking = async (rankType: string, gender: string, params?: Reco
     return {
       id: `faloo:${bookId}`, sourceBookId: bookId, title: titleNode.text().trim(),
       author: item.find('.c_td_d_d_author').first().text().trim() || '未知作者',
-      intro: '', cover: resolveBookUrl(pageUrl, item.find('.c_td_d_d_img img').attr('src') || '') || undefined,
+      intro: '', cover: (resolveBookUrl(pageUrl, item.find('.c_td_d_d_img img').attr('src') || '') || '').replace(/^http:/iu, 'https:') || undefined,
       category: item.find('.c_td_d_d_class').first().text().trim() || undefined,
       rank: Number(item.find('[class^="c_td_d_d_number"]').first().text().trim()) || index + 1,
       rankType: 'read', gender: 'all', platform: 'faloo', url: href,
