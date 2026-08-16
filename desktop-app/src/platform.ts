@@ -218,7 +218,10 @@ const mobileBaiduDownload = async (remotePath: string) => {
   const match = searchData.list?.find(item => item.path === `${directory}/${baiduBackupName}`) || searchData.list?.[0];
   const fsId = match?.fs_id;
   if (!match || fsId === undefined || fsId === null) throw new Error('没有找到云端完整备份文件。');
-  const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', access_token: mobileBaiduToken(), fsids: JSON.stringify([String(fsId)]), dlink: '1', extra: '1' }));
+  // filemetas expects a JSON array of numeric IDs. Keep the original decimal
+  // string to avoid JavaScript precision loss for large Baidu fs_id values.
+  const fsids = /^\d+$/u.test(String(fsId)) ? `[${String(fsId)}]` : JSON.stringify([String(fsId)]);
+  const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', access_token: mobileBaiduToken(), fsids, dlink: '1', extra: '1' }));
   const dlink = stringValue(meta.list?.[0]?.dlink);
   if (!dlink) throw new Error('百度网盘没有返回备份下载地址。');
   emitCloudProgress('正在下载百度网盘完整备份...');
