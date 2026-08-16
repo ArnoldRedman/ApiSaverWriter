@@ -129,7 +129,7 @@ const mobileBaiduStatus = async () => {
   const token = mobileBaiduToken();
   if (!token) return { authenticated: false, logged_in: false, raw: '未登录' };
   try {
-    const data = await mobileBaiduRequest<Record<string, unknown>>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/nas', { method: 'uinfo', access_token: token }));
+    const data = await mobileBaiduRequest<Record<string, unknown>>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/nas', { method: 'uinfo', openapi: 'xpansdk', access_token: token }));
     return { ...data, authenticated: true, logged_in: true, username: stringValue(data.baidu_name || data.netdisk_name) };
   } catch (error) {
     localStorage.removeItem(baiduTokenKey);
@@ -169,7 +169,7 @@ const mobileBaiduEnsureDirectory = async (remotePath: string) => {
   for (const segment of segments) {
     current += `/${segment}`;
     try {
-      await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', access_token: mobileBaiduToken() }), {
+      await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', openapi: 'xpansdk', access_token: mobileBaiduToken() }), {
         method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: mobileBaiduForm({ path: current, isdir: '1', rtype: '1' }),
       });
@@ -185,7 +185,7 @@ const mobileBaiduUpload = async (remotePath: string, bytes: Uint8Array) => {
   for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) chunks.push(bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength)));
   const blockList = chunks.map(chunk => SparkMD5.ArrayBuffer.hash(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)));
   const path = `/apps/bdpan/${remotePath}/${baiduBackupName}`;
-  const precreate = await mobileBaiduRequest<{ uploadid?: string; return_type?: number }>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'precreate', access_token: mobileBaiduToken() }), {
+  const precreate = await mobileBaiduRequest<{ uploadid?: string; return_type?: number }>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'precreate', openapi: 'xpansdk', access_token: mobileBaiduToken() }), {
     method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: mobileBaiduForm({ path, size: String(bytes.byteLength), isdir: '0', autoinit: '1', block_list: JSON.stringify(blockList), rtype: '3' }),
   });
@@ -196,9 +196,9 @@ const mobileBaiduUpload = async (remotePath: string, bytes: Uint8Array) => {
       emitCloudProgress(`正在上传备份分片 ${index + 1}/${chunks.length}...`);
       const form = new FormData();
       form.append('file', new Blob([chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)]), baiduBackupName);
-      await mobileBaiduRequest(mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/superfile2', { method: 'upload', type: 'tmpfile', access_token: mobileBaiduToken(), path, uploadid: uploadId, partseq: String(index) }), { method: 'POST', headers: { 'User-Agent': 'pan.baidu.com' }, body: form });
+      await mobileBaiduRequest(mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/superfile2', { method: 'upload', openapi: 'xpansdk', type: 'tmpfile', access_token: mobileBaiduToken(), path, uploadid: uploadId, partseq: String(index) }), { method: 'POST', headers: { 'User-Agent': 'pan.baidu.com' }, body: form });
     }
-    await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', access_token: mobileBaiduToken() }), {
+    await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', openapi: 'xpansdk', access_token: mobileBaiduToken() }), {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: mobileBaiduForm({ path, size: String(bytes.byteLength), isdir: '0', uploadid: uploadId, block_list: JSON.stringify(blockList), rtype: '3' }),
     });
@@ -262,7 +262,7 @@ const mobileBaiduDownloadBytes = async (fetcher: typeof globalThis.fetch, url: s
 
 const mobileBaiduDownload = async (remotePath: string) => {
   const directory = `/apps/bdpan/${remotePath}`;
-  const searchURL = mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'search', access_token: mobileBaiduToken(), dir: directory, key: baiduBackupName, recursion: '0', page: '1', num: '20', web: '1' });
+  const searchURL = mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'search', openapi: 'xpansdk', access_token: mobileBaiduToken(), dir: directory, key: baiduBackupName, recursion: '0', page: '1', num: '20', web: '1' });
   const fetcher = await httpFetch();
   const searchResponse = await fetcher(searchURL);
   const searchText = await searchResponse.text();
@@ -275,7 +275,7 @@ const mobileBaiduDownload = async (remotePath: string) => {
   // filemetas expects a JSON array of numeric IDs. Keep the original decimal
   // string to avoid JavaScript precision loss for large Baidu fs_id values.
   const fsids = /^\d+$/u.test(String(fsId)) ? `[${String(fsId)}]` : JSON.stringify([String(fsId)]);
-  const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', access_token: mobileBaiduToken(), fsids, dlink: '1', extra: '1' }));
+  const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', openapi: 'xpansdk', access_token: mobileBaiduToken(), fsids, dlink: '1', extra: '1' }));
   const dlink = stringValue(meta.list?.[0]?.dlink);
   if (!dlink) throw new Error('百度网盘没有返回备份下载地址。');
   const dlinkURL = `${dlink}${dlink.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(mobileBaiduToken())}`;
@@ -285,7 +285,7 @@ const mobileBaiduDownload = async (remotePath: string) => {
   } catch (primaryError) {
     emitCloudProgress('主下载地址无响应，正在切换备用下载通道...');
     const fallbackURL = mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/file', {
-      method: 'download', access_token: mobileBaiduToken(), path: `${directory}/${baiduBackupName}`,
+      method: 'download', openapi: 'xpansdk', access_token: mobileBaiduToken(), path: `${directory}/${baiduBackupName}`,
     });
     try {
       bytes = await mobileBaiduDownloadBytes(fetcher, fallbackURL, '百度网盘备用下载');
