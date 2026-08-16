@@ -1,0 +1,58 @@
+name: Cross-platform builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop-app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm ci --prefix desktop-app
+      - run: npm run tauri:build --prefix desktop-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApiSaverWriter-windows
+          path: |
+            desktop-app/src-tauri/target/release/bundle/msi/*.msi
+            desktop-app/src-tauri/target/release/bundle/nsis/*.exe
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop-app/package-lock.json
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: aarch64-linux-android, armv7-linux-androideabi, i686-linux-android, x86_64-linux-android }
+      - run: npm ci
+      - run: npm ci --prefix desktop-app
+      - run: yes | sdkmanager --licenses
+      - run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
+      - run: npx tauri android init --ci
+      - run: npm run android:build --prefix desktop-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ApiSaverWriter-android
+          path: |
+            desktop-app/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            desktop-app/src-tauri/gen/android/app/build/outputs/bundle/**/*.aab

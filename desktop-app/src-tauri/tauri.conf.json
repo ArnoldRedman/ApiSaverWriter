@@ -29,8 +29,8 @@
         "title": "ApiSaverWriter - AI小说写作助手",
         "width": 1400,
         "height": 900,
-        "minWidth": 1200,
-        "minHeight": 700,
+        "minWidth": 360,
+        "minHeight": 520,
         "resizable": true,
         "fullscreen": false
       }

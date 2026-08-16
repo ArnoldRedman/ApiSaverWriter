@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { invoke, isMobileRuntime } from './platform';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
@@ -481,6 +481,7 @@ interface AgentConfig {
   proxyEnabled: boolean;
   proxyURL: string;
   proxyBypassLocal: boolean;
+  mobileGatewayURL: string;
 }
 
 const agentStageLabel: Record<AgentStage, string> = {
@@ -1271,6 +1272,7 @@ function App() {
         proxyEnabled: Boolean(parsed.proxyEnabled),
         proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
         proxyBypassLocal: parsed.proxyBypassLocal === true,
+        mobileGatewayURL: typeof parsed.mobileGatewayURL === 'string' ? parsed.mobileGatewayURL : '',
       };
     } catch {
       return { serviceName: '帅apiGPT0.06', enabled: true, apiMode: 'openai' as const, baseURL: defaultBaseURL, apiKey: '', apiKeys: [], model: fallbackModels[0], contextWindow: 128, reasoningMode: 'auto' as const, proxyEnabled: false, proxyURL: 'http://127.0.0.1:7897', proxyBypassLocal: false };
@@ -1514,6 +1516,34 @@ function App() {
       disposed = true;
       unlisten?.();
     };
+  }, []);
+
+  // The mobile gateway sends the same stream envelope as the desktop runtime,
+  // delivered as browser events because no Node sidecar exists on iOS/Android.
+  useEffect(() => {
+    if (!isMobileRuntime()) return;
+    const receive = (event: Event) => {
+      const payload = (event as CustomEvent<AgentProgressEvent>).detail;
+      if (!payload) return;
+      const data = payload.data ?? {};
+      if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
+      if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
+      if (payload.runId !== activeAgentRunRef.current) return;
+      if (payload.type === 'chunk' && data.text) {
+        setAgentDisplayContent(current => current + String(data.text));
+        setAgentProgressPercent(current => Math.max(current, 70));
+        setAgentProgressMessage(`正文已返回 ${countNovelCharacters(String(data.text)).toLocaleString()} 字，正在整理草稿`);
+        return;
+      }
+      if (payload.type === 'complete') { setAgentProgressMessage(data.message || '章节草稿和一致性审查已完成'); setAgentProgressPercent(100); return; }
+      if (payload.type === 'error') { setAgentStage('error'); setAgentProgressMessage(data.error || '智能体运行失败'); return; }
+      if (!isAgentWorkflowStep(data.step)) return;
+      setAgentStage(data.step);
+      setAgentProgressMessage(data.message || agentStageLabel[data.step]);
+      setAgentProgressPercent(current => Math.max(current, Math.max(0, Math.min(100, Number(data.progress) || 0))));
+    };
+    window.addEventListener('agent-progress', receive);
+    return () => window.removeEventListener('agent-progress', receive);
   }, []);
 
   useEffect(() => {
@@ -5222,6 +5252,11 @@ function App() {
                   <div className="form-group">
                     <label>接口地址</label>
                     <input className="input" value={settingsDraft.baseURL} placeholder={defaultBaseURL} onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
+                  </div>
+                  <div className="form-group mobile-gateway-setting">
+                    <label>移动端 Agent Gateway <small>Android/iOS 复用桌面 Agent、缓存和书源</small></label>
+                    <input className="input" value={settingsDraft.mobileGatewayURL} placeholder="https://agent.example.com 或 http://局域网IP:8787" onChange={(event) => setSettingsDraft({ ...settingsDraft, mobileGatewayURL: event.target.value })} />
+                    <small>桌面端无需填写。运行 <code>npm run agent:gateway</code> 后填入可访问地址。</small>
                   </div>
                   <div className="form-group">
                     <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>

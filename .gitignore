@@ -26,3 +26,4 @@ projects.json
 output/playwright/
 __pycache__/
 *.pyc
+.toolchains/

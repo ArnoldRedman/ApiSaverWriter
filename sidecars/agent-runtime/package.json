@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/main.ts",
     "start": "tsx src/main.ts",
+    "gateway": "npm run build && node dist/gateway.js",
     "build": "tsc",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

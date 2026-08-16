@@ -9,6 +9,7 @@ const runtimeRoot = join(desktopRoot, 'src-tauri', 'runtime', 'agent-runtime');
 const sidecarEntry = join(workspaceRoot, 'sidecars', 'agent-runtime', 'dist', 'main.js');
 const esbuild = join(workspaceRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'esbuild.cmd' : 'esbuild');
 const nodeBinary = process.env.APISAVERWRITER_NODE_BINARY || process.execPath;
+const mobileTarget = ['android', 'ios'].includes(String(process.env.TAURI_ENV_PLATFORM || '').toLowerCase());
 
 const copyPackage = (name) => {
   const source = join(workspaceRoot, 'node_modules', ...name.split('/'));
@@ -19,6 +20,13 @@ const copyPackage = (name) => {
 
 rmSync(runtimeRoot, { recursive: true, force: true });
 mkdirSync(runtimeRoot, { recursive: true });
+
+// iOS and Android call the trusted Agent Gateway. Node child processes and
+// native SQLite modules cannot run inside a mobile WebView bundle.
+if (mobileTarget) {
+  console.log(`Skipping desktop Agent sidecar for ${process.env.TAURI_ENV_PLATFORM}; mobile uses Agent Gateway.`);
+  process.exit(0);
+}
 
 execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'build', '--workspace', '@apisaverwriter/agent-runtime'], {
   cwd: workspaceRoot,
