@@ -81,27 +81,6 @@ interface ChapterMemory {
   updatedAt: string;
 }
 
-type PublishPlatform = 'fanqie';
-
-interface PublishConfig {
-  platform: PublishPlatform;
-  enabled: boolean;
-  creatorURL: string;
-  bookId: string;
-  autoPublishOnSave: boolean;
-}
-
-interface PublishRecord {
-  id: string;
-  chapterId: number;
-  chapterTitle: string;
-  platform: PublishPlatform;
-  status: 'published' | 'prepared' | 'login_required' | 'manual_required' | 'error';
-  message: string;
-  url?: string;
-  updatedAt: string;
-}
-
 interface AIDetectionChapter {
   chapterId: number;
   chapterTitle: string;
@@ -262,8 +241,10 @@ interface Project {
   createdAt: string;
   updatedAt: string;
   wordCount: number;
-  publishConfig?: PublishConfig;
-  publishRecords?: PublishRecord[];
+  // Legacy metadata is retained verbatim when an existing project is saved.
+  // Automatic publishing is no longer part of the application.
+  publishConfig?: unknown;
+  publishRecords?: unknown;
   aiDetection?: AIDetectionReport;
   chapterTargetWords?: number;
   styleProfileId?: string;
@@ -580,15 +561,6 @@ const agentNetworkParams = (config: AgentConfig) => ({
   proxyURL: config.proxyURL.trim(),
   proxyBypassLocal: config.proxyBypassLocal,
 });
-const defaultPublishConfig: PublishConfig = {
-  // Publishing is currently supported by the Fanqie adapter; keep the
-  // default config independent from any library/ranking book object.
-  platform: 'fanqie',
-  enabled: false,
-  creatorURL: 'https://fanqienovel.com/main/writer',
-  bookId: '',
-  autoPublishOnSave: false,
-};
 const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
 const outlineKinds: OutlineKind[] = ['总纲', '章纲', '世界观与作品设定'];
 const memoryDocumentKinds: MemoryDocumentKind[] = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'];
@@ -1149,8 +1121,10 @@ function App() {
               memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : []),
               graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
               graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
-              publishConfig: { ...defaultPublishConfig, ...(project.publishConfig || {}) },
-              publishRecords: Array.isArray(project.publishRecords) ? project.publishRecords : [],
+              // Keep legacy publish metadata intact when saving older projects.
+              // The automatic publishing feature itself is no longer available.
+              publishConfig: project.publishConfig,
+              publishRecords: project.publishRecords,
               chapterTargetWords: Number(project.chapterTargetWords) > 0 ? Number(project.chapterTargetWords) : 3000,
               aiDetection: project.aiDetection,
               styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
@@ -1246,7 +1220,7 @@ function App() {
   
   // 编辑器状态
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'publish' | 'ai-detect'>('chapters');
+  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
@@ -1421,7 +1395,6 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
   const goalNoticeChapterRef = useRef<number | null>(null);
-  const [publishRunning, setPublishRunning] = useState(false);
   const [settingsDraft, setSettingsDraft] = useState(agentConfig);
   const [availableModels, setAvailableModels] = useState<string[]>(() => {
     try {
@@ -1616,8 +1589,6 @@ function App() {
               memories: Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [],
               graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
               graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
-              publishConfig: { ...defaultPublishConfig, ...(project.publishConfig || {}) },
-              publishRecords: Array.isArray(project.publishRecords) ? project.publishRecords : [],
               chapterTargetWords: Number(project.chapterTargetWords) > 0 ? Number(project.chapterTargetWords) : 3000,
               aiDetection: project.aiDetection,
               styleProfileId: typeof project.styleProfileId === 'string' ? project.styleProfileId : undefined,
@@ -1832,8 +1803,6 @@ function App() {
       memoryDocuments: [],
       graphNodes: [],
       graphEdges: [],
-      publishConfig: { ...defaultPublishConfig },
-      publishRecords: [],
       chapterTargetWords: 3000,
       sourceDismantleBookId: imitationSource?.bookId,
       createdAt: now,
@@ -3174,26 +3143,34 @@ function App() {
   };
 
   const cardSearchTerms = (card: KnowledgeCard) => {
-    const generic = new Set(['角色', '物品', '地点', '势力', '金手指', '身份', '性格', '目标', '能力', '关系', '当前状态', '详细信息', '暂无', '设定']);
+    const generic = new Set([
+      '角色', '角色卡', '人物', '人物卡', '物品', '物品卡', '地点', '地点卡', '势力', '势力卡',
+      '金手指', '金手指卡', '手指', '身份', '性格', '目标', '能力', '天赋', '关系', '当前状态',
+      '详细信息', '暂无', '设定', '限制', '代价', '升级路径', '触发条件', '核心能力',
+    ]);
     const primaryTerms: string[] = [];
     const secondaryTerms = new Set<string>();
     const addPrimary = (value: string) => {
-      const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').trim();
-      if (normalized.length >= 2 && !primaryTerms.includes(normalized)) primaryTerms.push(normalized);
+      const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').replace(/[“”"']/gu, '').trim();
+      if (normalized.length >= 2 && normalized.length <= 24 && !generic.has(normalized) && !primaryTerms.includes(normalized)) primaryTerms.push(normalized);
     };
     const addSecondary = (value: string) => {
       const normalized = value.replace(/^[#*\-\s]+|[#*\-\s]+$/gu, '').trim();
       if (normalized.length >= 2 && normalized.length <= 12 && !generic.has(normalized) && !primaryTerms.includes(normalized)) secondaryTerms.add(normalized);
     };
-    addPrimary(card.title);
+    if (!generic.has(card.title.trim())) addPrimary(card.title);
     const canonicalTitle = card.title.replace(/^(主角|角色|人物|本命|关键|核心)/u, '').trim();
-    addPrimary(canonicalTitle);
-    if (/^[\u3400-\u9fff]{3,}$/u.test(canonicalTitle)) {
+    if (!generic.has(canonicalTitle)) addPrimary(canonicalTitle);
+    if (!generic.has(canonicalTitle) && /^[\u3400-\u9fff]{3,}$/u.test(canonicalTitle)) {
       addPrimary(canonicalTitle.slice(-2));
       if (canonicalTitle.length > 3) addPrimary(canonicalTitle.slice(-3));
     }
     const identityPattern = /^\s*(?:[-*]\s*)?(?:姓名|名称|本名|别名|称号|代号|简称|天赋名称|能力名称)\s*[：:]\s*(.+)$/gmu;
     for (const match of card.content.matchAll(identityPattern)) {
+      for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
+    }
+    const abilityHeadingPattern = /^\s*#{2,6}\s*(?:[^\n：:]{0,24}[：:])\s*([^\n]+)$/gmu;
+    for (const match of card.content.matchAll(abilityHeadingPattern)) {
       for (const value of match[1].split(/[、,，;；/]/u)) addPrimary(value.replace(/[（(].*$/u, '').trim());
     }
     for (const segment of `${card.title}\n${card.content}`.match(/[\u3400-\u9fff]{2,10}|[A-Za-z][A-Za-z0-9_-]{1,24}/g) || []) {
@@ -3260,14 +3237,27 @@ function App() {
     return { ...project, cards, graphNodes, graphEdges, updatedAt: now };
   };
 
-  const updateCardStatesFromBook = (cardId?: number) => {
+  const updateCardStatesFromBook = async (cardId?: number) => {
     if (!editingProject) return;
-    const targetCards = cardId === undefined ? editingProject.cards : editingProject.cards.filter(card => card.id === cardId);
+    let searchProject = editingProject;
+    // 章节正文以 Markdown 文件为事实来源；刷新前重新载入一次，避免只扫描启动时的元数据快照。
+    if ('__TAURI_INTERNALS__' in window) {
+      try {
+        const loadedProjects = await invoke<Project[] | null>('load_projects');
+        const loadedProject = loadedProjects?.find(project => project.id === editingProject.id);
+        if (loadedProject) searchProject = { ...editingProject, chapters: loadedProject.chapters };
+      } catch (error) {
+        setNotice({ title: '读取本地章节失败', content: String(error) });
+      }
+    }
+    if (activeChapter && searchProject.chapters.some(chapter => chapter.id === activeChapter.id)) {
+      searchProject = { ...searchProject, chapters: searchProject.chapters.map(chapter => chapter.id === activeChapter.id ? activeChapter : chapter) };
+    }
+    const targetCards = cardId === undefined ? searchProject.cards : searchProject.cards.filter(card => card.id === cardId);
     if (!targetCards.length) return;
-    const searchProject = activeChapter
-      ? { ...editingProject, chapters: editingProject.chapters.map(chapter => chapter.id === activeChapter.id ? activeChapter : chapter) }
-      : editingProject;
-    updateEditorProject(() => refreshCardStatesForProject(searchProject, new Set(targetCards.map(card => card.id))));
+    const refreshedProject = refreshCardStatesForProject(searchProject, new Set(targetCards.map(card => card.id)));
+    setEditingProject(refreshedProject);
+    setProjects(current => current.map(project => project.id === refreshedProject.id ? refreshedProject : project));
     setNotice({ title: cardId === undefined ? '卡片状态已更新' : '卡片状态已更新', content: `已全文检索并更新 ${targetCards.length} 张卡片的最近出现状态。` });
   };
 
@@ -3276,7 +3266,7 @@ function App() {
     const updatedChapters = project.chapters.map(item => item.id === chapter.id ? chapter : item);
     const chapterNodeId = `chapter:${chapter.id}`;
     const chapterNumber = project.chapters.findIndex(item => item.id === chapter.id) + 1;
-    const mentionedCards = project.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term)) || (card.title.length >= 2 && chapter.content.includes(card.title.slice(-2))));
+    const mentionedCards = project.cards.filter(card => cardSearchTerms(card).some(term => chapter.content.includes(term)));
     const referencedCards = project.cards.filter(card => selectedCardIds.includes(card.id) || mentionedCards.some(item => item.id === card.id));
     const graphNodes = [...project.graphNodes];
     const ensureNode = (id: string, label: string, type: KnowledgeGraphNode['type'], category?: string) => {
@@ -3438,10 +3428,6 @@ function App() {
       setNotice({ title: '章节保存失败', content: String(error) });
       setChapterSaving(false);
       return;
-    }
-
-    if (localProject.publishConfig?.enabled && localProject.publishConfig.autoPublishOnSave && chapter.content.trim()) {
-      void publishChapterToFanqie(chapter, localProject);
     }
 
     if (!chapter.content.trim() || !agentConfig.enabled || !agentConfig.apiKey.trim()) {
@@ -3750,50 +3736,6 @@ function App() {
 
   const toggleCardForChapter = (id: number) => {
     setSelectedCardIds(current => current.includes(id) ? current.filter(cardId => cardId !== id) : [...current, id]);
-  };
-
-  const publishChapterToFanqie = async (chapter: Chapter | null = activeChapter, projectOverride: Project | null = editingProject) => {
-    if (!chapter || !projectOverride) return;
-    const config = { ...defaultPublishConfig, ...(projectOverride.publishConfig || {}) };
-    if (!config.enabled) {
-      setNotice({ title: '番茄发布未启用', content: '请先在发布面板启用番茄小说并保存配置。' });
-      return;
-    }
-    if (!chapter.content.trim()) {
-      setNotice({ title: '章节为空', content: '请先保存有正文的章节，再发布到番茄小说。' });
-      return;
-    }
-    setPublishRunning(true);
-    try {
-      if (!('__TAURI_INTERNALS__' in window)) throw new Error('发布功能需要桌面版浏览器运行时');
-      await invoke<string>('save_projects', { projects });
-      const result = await invoke<{ status?: PublishRecord['status']; message?: string; url?: string }>('publish_fanqie', {
-        payload: {
-          creatorURL: config.creatorURL,
-          bookId: config.bookId,
-          chapterTitle: chapter.title,
-          content: chapter.content,
-        },
-      });
-      const status = result.status || 'error';
-      const record: PublishRecord = {
-        id: `${projectOverride.id}:${chapter.id}:${Date.now()}`,
-        chapterId: chapter.id,
-        chapterTitle: chapter.title,
-        platform: 'fanqie',
-        status,
-        message: result.message || '发布流程完成',
-        url: result.url,
-        updatedAt: new Date().toISOString(),
-      };
-      setProjects(current => current.map(project => project.id === projectOverride.id ? { ...project, publishRecords: [...(project.publishRecords || []), record].slice(-100), updatedAt: new Date().toISOString() } : project));
-      setEditingProject(current => current?.id === projectOverride.id ? { ...current, publishRecords: [...(current.publishRecords || []), record].slice(-100), updatedAt: new Date().toISOString() } : current);
-      setNotice({ title: status === 'published' ? '番茄发布成功' : '番茄发布流程完成', content: result.message || '请查看番茄创作后台状态。' });
-    } catch (error) {
-      setNotice({ title: '番茄发布失败', content: String(error) });
-    } finally {
-      setPublishRunning(false);
-    }
   };
 
   const runAIDetection = (scope: 'chapter' | 'book') => {
@@ -4522,34 +4464,12 @@ function App() {
                   记忆中心
                 </button>
                 <button
-                  className={editorSidebarTab === 'publish' ? 'active' : ''}
-                  onClick={() => setEditorSidebarTab('publish')}
-                >
-                  发布
-                </button>
-                <button
                   className={editorSidebarTab === 'ai-detect' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('ai-detect')}
                 >
                   AI 检测
                 </button>
               </div>
-
-              {editorSidebarTab === 'publish' && (() => {
-                const publishConfig = { ...defaultPublishConfig, ...(editingProject.publishConfig || {}) };
-                const publishRecords = editingProject.publishRecords || [];
-                return <div className="publish-panel">
-                  <div className="panel-section-title">自动发布 <span>仅支持番茄小说</span></div>
-                  <label className="publish-platform-row"><span>发布平台</span><select className="select" value={publishConfig.platform} disabled><option value="fanqie">番茄小说</option></select></label>
-                  <label className="publish-switch-row"><span>启用番茄发布</span><input type="checkbox" checked={publishConfig.enabled} onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, enabled: event.target.checked } }))} /></label>
-                  <label>番茄创作后台地址<input className="input" value={publishConfig.creatorURL} onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, creatorURL: event.target.value } }))} /></label>
-                  <label>作品 ID <small>可选，用于直接定位作品</small><input className="input" value={publishConfig.bookId} placeholder="番茄后台作品 ID" onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, bookId: event.target.value } }))} /></label>
-                  <label className="publish-switch-row"><span>保存章节后自动发布</span><input type="checkbox" checked={publishConfig.autoPublishOnSave} onChange={(event) => updateEditorProject(project => ({ ...project, publishConfig: { ...publishConfig, autoPublishOnSave: event.target.checked } }))} /></label>
-                  <button className="btn-primary publish-button" disabled={publishRunning || !activeChapter} onClick={() => publishChapterToFanqie()}>{publishRunning ? '发布中...' : '发布当前章节'}</button>
-                  <p className="publish-hint">首次发布会打开持久化浏览器窗口，请先登录番茄创作后台；登录状态只保存在本机浏览器配置中。</p>
-                  <div className="publish-records"><div className="panel-section-title">发布记录 <span>{publishRecords.length}</span></div>{publishRecords.length === 0 ? <p className="empty-hint compact">暂无发布记录</p> : [...publishRecords].reverse().slice(0, 8).map(record => <div className="publish-record" key={record.id}><div><strong>{record.chapterTitle}</strong><small>{record.message}</small></div><span className={`publish-status ${record.status}`}>{record.status === 'published' ? '已发布' : record.status === 'login_required' ? '待登录' : record.status === 'prepared' ? '待确认' : '需处理'}</span></div>)}</div>
-                </div>;
-              })()}
 
               {editorSidebarTab === 'ai-detect' && (() => {
                 const report = editingProject.aiDetection;

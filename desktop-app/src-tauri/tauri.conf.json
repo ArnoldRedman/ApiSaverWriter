@@ -12,7 +12,6 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "fanqie_publish.py": "fanqie_publish.py",
       "runtime/agent-runtime": "agent-runtime"
     },
     "icon": [

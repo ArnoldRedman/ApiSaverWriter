@@ -180,51 +180,6 @@ async fn call_agent_rpc(app: tauri::AppHandle, state: State<'_, AgentRuntimeStat
         .map_err(|error| format!("Agent 任务线程退出：{error}"))?
 }
 
-#[tauri::command]
-fn publish_fanqie(app: tauri::AppHandle, payload: Value) -> Result<Value, String> {
-    let script_candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fanqie_publish.py"),
-        app.path().resource_dir().unwrap_or_else(|_| PathBuf::from("." )).join("fanqie_publish.py"),
-    ];
-    let script = script_candidates
-        .into_iter()
-        .find(|path| path.exists())
-        .ok_or_else(|| "找不到番茄发布脚本".to_string())?;
-    let input = serde_json::to_vec(&payload).map_err(|error| format!("序列化发布参数失败: {error}"))?;
-    let mut last_error = String::new();
-    for executable in ["python", "python3", "/opt/anaconda3/bin/python"] {
-        let mut child = match Command::new(executable)
-            .arg(&script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                last_error = error.to_string();
-                continue;
-            }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(&input).map_err(|error| format!("发送发布参数失败: {error}"))?;
-        }
-        let output = child.wait_with_output().map_err(|error| format!("等待番茄发布失败: {error}"))?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if let Some(line) = stdout.lines().rev().find(|line| !line.trim().is_empty()) {
-            let parsed: Value = serde_json::from_str(line).map_err(|error| format!("解析番茄发布结果失败: {error}"))?;
-            if parsed.get("status").and_then(Value::as_str) == Some("missing_runtime") {
-                last_error = parsed.get("message").and_then(Value::as_str).unwrap_or("Python Playwright 不可用").to_string();
-                continue;
-            }
-            return Ok(parsed);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        last_error = if stderr.is_empty() { format!("{executable} 退出状态 {}", output.status) } else { stderr };
-    }
-    Err(format!("找不到可用 Python 运行时：{last_error}"))
-}
-
 fn agent_runtime_script() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Some(path) = bundled_agent_resource("main.cjs") {
@@ -1811,7 +1766,6 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             start_agent_runtime,
             call_agent_rpc,
-            publish_fanqie,
             cloud_sync_status,
             baidu_login_url,
             complete_baidu_login,
