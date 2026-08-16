@@ -2,18 +2,11 @@
 
 本项目使用同一份 React 前端和 Tauri Rust 数据层构建 Windows、macOS、Android、iOS。
 
-## Agent Gateway
+## 移动端 Agent
 
-Android 与 iOS 不能运行桌面端内置的 Node 子进程。先在一台可信桌面电脑或服务器启动同仓库 Gateway：
+Android 与 iOS 不启动桌面 Node 子进程，直接通过 Tauri 原生 HTTP 通道访问“AI 模型配置”里的 OpenAI/Responses/Anthropic 兼容接口。模型密钥只保存在本机，移动端不需要填写 Gateway，也不需要额外服务器。章节、章纲、卡片和润色请求保持 SSE 流式返回；本地项目、记忆和用量仍由 Tauri 数据层保存。
 
-```bash
-cd desktop-app
-npm run agent:gateway
-```
-
-默认监听 `http://127.0.0.1:8787`。部署到局域网或 HTTPS 服务后，在移动端“设置 -> AI 模型配置 -> 移动端 Agent Gateway”填写可访问地址。它转发同一套 RPC、流式进度、缓存和书源逻辑；模型 Key 仍由手机本地设置随请求发送。
-
-生产环境必须将 Gateway 放在 HTTPS 反向代理之后，并限制 `AGENT_GATEWAY_ORIGIN` 与网络访问范围。
+如果接口没有浏览器 CORS 头，应用会自动使用内置的 `tauri-plugin-http` 原生请求通道；桌面端仍使用内置 Agent Runtime。
 
 ## 初始化与构建
 

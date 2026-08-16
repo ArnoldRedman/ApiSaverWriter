@@ -481,7 +481,6 @@ interface AgentConfig {
   proxyEnabled: boolean;
   proxyURL: string;
   proxyBypassLocal: boolean;
-  mobileGatewayURL: string;
 }
 
 const agentStageLabel: Record<AgentStage, string> = {
@@ -1210,6 +1209,7 @@ function App() {
   const [projectFormMode, setProjectFormMode] = useState<'create' | 'edit'>('create');
   const [projectEditingId, setProjectEditingId] = useState<number | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showMobileMore, setShowMobileMore] = useState(false);
   const [showOutlineTypeModal, setShowOutlineTypeModal] = useState(false);
   const [showTagPicker, setShowTagPicker] = useState(false);
   const [activeTagTab, setActiveTagTab] = useState<TagTab>('主分类');
@@ -1272,7 +1272,6 @@ function App() {
         proxyEnabled: Boolean(parsed.proxyEnabled),
         proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
         proxyBypassLocal: parsed.proxyBypassLocal === true,
-        mobileGatewayURL: typeof parsed.mobileGatewayURL === 'string' ? parsed.mobileGatewayURL : '',
       };
     } catch {
       return { serviceName: '帅apiGPT0.06', enabled: true, apiMode: 'openai' as const, baseURL: defaultBaseURL, apiKey: '', apiKeys: [], model: fallbackModels[0], contextWindow: 128, reasoningMode: 'auto' as const, proxyEnabled: false, proxyURL: 'http://127.0.0.1:7897', proxyBypassLocal: false };
@@ -1518,8 +1517,7 @@ function App() {
     };
   }, []);
 
-  // The mobile gateway sends the same stream envelope as the desktop runtime,
-  // delivered as browser events because no Node sidecar exists on iOS/Android.
+  // The mobile HTTP Agent sends the same stream envelope as the desktop runtime.
   useEffect(() => {
     if (!isMobileRuntime()) return;
     const receive = (event: Event) => {
@@ -5052,9 +5050,16 @@ function App() {
           <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); }}>
             ◈ 文风管理 <small>{writingStyles.length}</small>
           </button>
+          <button className="mobile-more-button" aria-expanded={showMobileMore} onClick={() => setShowMobileMore(current => !current)}>
+            ··· 更多
+          </button>
         </nav>
+        <div className={`mobile-more-menu ${showMobileMore ? 'open' : ''}`}>
+          <button className={activeTab === 'skills' ? 'active' : ''} onClick={() => { setActiveTab('skills'); setShowMobileMore(false); }}>✦ 技能管理 <small>{skills.length}</small></button>
+          <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); setShowMobileMore(false); }}>◈ 文风管理 <small>{writingStyles.length}</small></button>
+        </div>
         <div className="sidebar-footer">
-          <button className="settings-button" onClick={openSettings}>⚙ 设置</button>
+          <button className="settings-button" onClick={openSettings}><span aria-hidden="true">⚙</span><b>设置</b></button>
         </div>
       </aside>
 
@@ -5252,11 +5257,6 @@ function App() {
                   <div className="form-group">
                     <label>接口地址</label>
                     <input className="input" value={settingsDraft.baseURL} placeholder={defaultBaseURL} onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
-                  </div>
-                  <div className="form-group mobile-gateway-setting">
-                    <label>移动端 Agent Gateway <small>Android/iOS 复用桌面 Agent、缓存和书源</small></label>
-                    <input className="input" value={settingsDraft.mobileGatewayURL} placeholder="https://agent.example.com 或 http://局域网IP:8787" onChange={(event) => setSettingsDraft({ ...settingsDraft, mobileGatewayURL: event.target.value })} />
-                    <small>桌面端无需填写。运行 <code>npm run agent:gateway</code> 后填入可访问地址。</small>
                   </div>
                   <div className="form-group">
                     <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>

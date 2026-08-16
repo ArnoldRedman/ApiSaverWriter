@@ -1,0 +1,24 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "ApiSaverWriter desktop and mobile capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "http://*" },
+        { "url": "http://*/*" },
+        { "url": "http://*:*" },
+        { "url": "http://*:*/*" },
+        { "url": "http://**" },
+        { "url": "https://*" },
+        { "url": "https://*/*" },
+        { "url": "https://*:*" },
+        { "url": "https://*:*/*" },
+        { "url": "https://**" }
+      ]
+    }
+  ]
+}
