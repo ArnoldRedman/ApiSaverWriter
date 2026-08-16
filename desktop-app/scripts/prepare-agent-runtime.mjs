@@ -2,12 +2,12 @@ import { cpSync, copyFileSync, existsSync, mkdirSync, rmSync, chmodSync } from '
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
+import { buildSync } from 'esbuild';
 
 const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = resolve(desktopRoot, '..');
 const runtimeRoot = join(desktopRoot, 'src-tauri', 'runtime', 'agent-runtime');
 const sidecarEntry = join(workspaceRoot, 'sidecars', 'agent-runtime', 'dist', 'main.js');
-const esbuild = join(workspaceRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'esbuild.cmd' : 'esbuild');
 const nodeBinary = process.env.APISAVERWRITER_NODE_BINARY || process.execPath;
 const mobileTarget = ['android', 'ios'].includes(String(process.env.TAURI_ENV_PLATFORM || '').toLowerCase());
 
@@ -28,13 +28,26 @@ if (mobileTarget) {
   process.exit(0);
 }
 
-execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['run', 'build', '--workspace', '@apisaverwriter/agent-runtime'], {
-  cwd: workspaceRoot,
-  stdio: 'inherit',
-});
-execFileSync(esbuild, [sidecarEntry, '--bundle', '--platform=node', '--format=cjs', '--target=node22', '--external:better-sqlite3', '--external:undici', '--external:iconv-lite', `--outfile=${join(runtimeRoot, 'main.cjs')}`], {
-  cwd: workspaceRoot,
-  stdio: 'inherit',
+if (process.platform === 'win32') {
+  execFileSync('cmd.exe', ['/d', '/s', '/c', 'npm run build --workspace @apisaverwriter/agent-runtime'], {
+    cwd: workspaceRoot,
+    stdio: 'inherit',
+  });
+} else {
+  execFileSync('npm', ['run', 'build', '--workspace', '@apisaverwriter/agent-runtime'], {
+    cwd: workspaceRoot,
+    stdio: 'inherit',
+  });
+}
+buildSync({
+  entryPoints: [sidecarEntry],
+  bundle: true,
+  platform: 'node',
+  format: 'cjs',
+  target: 'node22',
+  external: ['better-sqlite3', 'undici', 'iconv-lite'],
+  outfile: join(runtimeRoot, 'main.cjs'),
+  logLevel: 'info',
 });
 
 // better-sqlite3 is a native module. Keep it external to the single-file JS

@@ -20,6 +20,7 @@ jobs:
           - { label: macos-apple-silicon, runner: macos-latest, kind: macos-arm }
           - { label: macos-intel, runner: macos-15-intel, kind: macos-intel }
           - { label: android, runner: ubuntu-latest, kind: android }
+          - { label: ios, runner: macos-latest, kind: ios }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -33,11 +34,17 @@ jobs:
       - name: Add Android Rust targets
         if: matrix.kind == 'android'
         run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+      - name: Add iOS Rust target
+        if: matrix.kind == 'ios'
+        run: rustup target add aarch64-apple-ios
       - uses: actions/setup-java@v4
         if: matrix.kind == 'android'
         with: { distribution: temurin, java-version: '21' }
       - uses: android-actions/setup-android@v3
         if: matrix.kind == 'android'
+      - name: Install iOS build tools
+        if: matrix.kind == 'ios'
+        run: brew install cocoapods xcodegen libimobiledevice
       - run: npm ci
       - run: npm ci --prefix desktop-app
       - name: Build Windows
@@ -76,9 +83,10 @@ jobs:
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018"
       - name: Build Android
         if: matrix.kind == 'android'
+        working-directory: desktop-app
         run: |
           npx tauri android init --ci
-          npm run android:build --prefix desktop-app
+          npm run android:build -- --ci --apk --aab
       - name: Package Android assets
         if: matrix.kind == 'android'
         shell: bash
@@ -86,6 +94,25 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           find desktop-app/src-tauri/gen/android/app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) -exec cp {} release-assets/ \;
+      - name: Build unsigned iOS archive
+        if: matrix.kind == 'ios'
+        working-directory: desktop-app
+        run: |
+          npx tauri ios init --ci
+          npm run ios:build -- --target aarch64 --ci --no-sign --archive-only
+      - name: Package unsigned iOS assets
+        if: matrix.kind == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets ios-package/Payload
+          archive="$(find desktop-app/src-tauri/gen/apple/build -type d -name '*.xcarchive' -print -quit)"
+          test -n "$archive"
+          app="$(find "$archive/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          cp -R "$app" ios-package/Payload/
+          (cd ios-package && zip -qry "../release-assets/ApiSaverWriter_${{ github.ref_name }}_iOS_unsigned.ipa" Payload)
+          tar -C "$(dirname "$archive")" -czf "release-assets/ApiSaverWriter_${{ github.ref_name }}_iOS_unsigned.xcarchive.tar.gz" "$(basename "$archive")"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
