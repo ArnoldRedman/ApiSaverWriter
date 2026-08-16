@@ -206,6 +206,60 @@ const mobileBaiduUpload = async (remotePath: string, bytes: Uint8Array) => {
   return path;
 };
 
+const mobileBaiduTimeout = async <T>(operation: Promise<T>, timeoutMs: number, onTimeout: () => void) => {
+  let timer: number | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => {
+          onTimeout();
+          reject(new Error('请求超时。'));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
+  }
+};
+
+const mobileBaiduDownloadBytes = async (fetcher: typeof globalThis.fetch, url: string, label: string) => {
+  const controller = new AbortController();
+  const request = fetcher(url, { headers: { 'User-Agent': 'pan.baidu.com' }, signal: controller.signal });
+  let response: Response;
+  try {
+    response = await mobileBaiduTimeout(request, 30_000, () => controller.abort());
+  } catch (error) {
+    controller.abort();
+    throw new Error(`${label}连接超时（30 秒）：${String(error)}`);
+  }
+  if (!response.ok) throw new Error(`${label}失败（${response.status}）。`);
+  const expected = Number(response.headers.get('content-length')) || 0;
+  emitCloudProgress(expected ? `${label}已连接，准备下载 ${(expected / 1_048_576).toFixed(1)} MB...` : `${label}已连接，正在下载...`);
+  if (!response.body) {
+    const bytes = await mobileBaiduTimeout(response.arrayBuffer(), 30_000, () => controller.abort());
+    return new Uint8Array(bytes);
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  while (true) {
+    const result = await mobileBaiduTimeout(reader.read(), 30_000, () => {
+      controller.abort();
+      void reader.cancel();
+    });
+    if (result.done) break;
+    if (result.value?.byteLength) {
+      chunks.push(result.value);
+      received += result.value.byteLength;
+      emitCloudProgress(expected
+        ? `${label} ${Math.min(100, Math.round(received * 100 / expected))}%（${(received / 1_048_576).toFixed(1)}/${(expected / 1_048_576).toFixed(1)} MB）`
+        : `${label} 已下载 ${(received / 1_048_576).toFixed(1)} MB`);
+    }
+  }
+  return concatBytes(chunks);
+};
+
 const mobileBaiduDownload = async (remotePath: string) => {
   const directory = `/apps/bdpan/${remotePath}`;
   const searchURL = mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'search', access_token: mobileBaiduToken(), dir: directory, key: baiduBackupName, recursion: '0', page: '1', num: '20', web: '1' });
@@ -224,10 +278,22 @@ const mobileBaiduDownload = async (remotePath: string) => {
   const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', access_token: mobileBaiduToken(), fsids, dlink: '1', extra: '1' }));
   const dlink = stringValue(meta.list?.[0]?.dlink);
   if (!dlink) throw new Error('百度网盘没有返回备份下载地址。');
-  emitCloudProgress('正在下载百度网盘完整备份...');
-  const response = await fetcher(`${dlink}${dlink.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(mobileBaiduToken())}`, { headers: { 'User-Agent': 'pan.baidu.com' } });
-  if (!response.ok) throw new Error(`百度网盘下载失败（${response.status}）`);
-  return readMobileBackupBundle(new Uint8Array(await response.arrayBuffer()));
+  const dlinkURL = `${dlink}${dlink.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(mobileBaiduToken())}`;
+  let bytes: Uint8Array;
+  try {
+    bytes = await mobileBaiduDownloadBytes(fetcher, dlinkURL, '百度网盘完整备份下载');
+  } catch (primaryError) {
+    emitCloudProgress('主下载地址无响应，正在切换备用下载通道...');
+    const fallbackURL = mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/file', {
+      method: 'download', access_token: mobileBaiduToken(), path: `${directory}/${baiduBackupName}`,
+    });
+    try {
+      bytes = await mobileBaiduDownloadBytes(fetcher, fallbackURL, '百度网盘备用下载');
+    } catch (fallbackError) {
+      throw new Error(`百度网盘下载失败：${String(primaryError)}；备用通道：${String(fallbackError)}`);
+    }
+  }
+  return readMobileBackupBundle(bytes);
 };
 
 const mobileBaiduBackup = async (remotePath: string, clientState: Record<string, string | null>) => {
