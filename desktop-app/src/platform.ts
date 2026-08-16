@@ -1,4 +1,5 @@
 import { invoke as nativeInvoke } from '@tauri-apps/api/core';
+import { gzip, gunzip } from 'fflate';
 import SparkMD5 from 'spark-md5';
 
 type InvokeArgs = Record<string, unknown> | undefined;
@@ -54,23 +55,15 @@ const mobileBaiduRequest = async <T = Record<string, unknown>>(url: string, init
   return data as T;
 };
 
-const gzipBytes = async (bytes: Uint8Array) => {
-  if (!('CompressionStream' in globalThis)) return bytes;
-  const stream = new CompressionStream('gzip');
-  const writer = stream.writable.getWriter();
-  await writer.write(bytes);
-  await writer.close();
-  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
-};
+const gzipBytes = (bytes: Uint8Array) => new Promise<Uint8Array>((resolve, reject) => {
+  gzip(bytes, { level: 9 }, (error, result) => error ? reject(error) : resolve(result));
+});
 
-const gunzipBytes = async (bytes: Uint8Array) => {
+const gunzipBytes = (bytes: Uint8Array) => {
   if (!bytes.slice(0, 2).every((value, index) => value === [0x1f, 0x8b][index])) return bytes;
-  if (!('DecompressionStream' in globalThis)) throw new Error('当前 iOS 版本不支持解压百度网盘备份包，请升级系统。');
-  const stream = new DecompressionStream('gzip');
-  const writer = stream.writable.getWriter();
-  await writer.write(bytes);
-  await writer.close();
-  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+  return new Promise<Uint8Array>((resolve, reject) => {
+    gunzip(bytes, (error, result) => error ? reject(error) : resolve(result));
+  });
 };
 
 const u32 = (value: number) => {
@@ -106,7 +99,9 @@ const mobileBackupBundle = async (clientState: Record<string, string | null>) =>
 };
 
 const readMobileBackupBundle = async (bytes: Uint8Array) => {
+  emitCloudProgress(`下载完成（${(bytes.byteLength / 1_048_576).toFixed(1)} MB），正在解压完整备份...`);
   const raw = await gunzipBytes(bytes);
+  emitCloudProgress(`解压完成（${(raw.byteLength / 1_048_576).toFixed(1)} MB），正在校验备份内容...`);
   const decoder = new TextDecoder();
   let offset = backupMagic.byteLength;
   if (decoder.decode(raw.slice(0, offset)) !== decoder.decode(backupMagic)) throw new Error('云端文件不是有效的 ApiSaverWriter 完整备份包。');
@@ -120,8 +115,11 @@ const readMobileBackupBundle = async (bytes: Uint8Array) => {
     const path = decoder.decode(raw.slice(offset, offset + pathLength)); offset += pathLength;
     if (!path || path.includes('..') || path.startsWith('/') || !Number.isSafeInteger(size) || size < 0 || offset + size > raw.byteLength) throw new Error('云端备份包包含不安全路径或无效内容。');
     files[path] = decoder.decode(raw.slice(offset, offset + size)); offset += size;
+    if (count > 1) emitCloudProgress(`正在解析备份文件 ${index + 1}/${count}...`);
   }
+  emitCloudProgress('备份包校验通过，正在读取应用数据...');
   const state = JSON.parse(files['client-state.json'] || '{}') as Record<string, string | null>;
+  emitCloudProgress('应用数据读取完成，正在写入本机存储...');
   return { clientState: state };
 };
 

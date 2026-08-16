@@ -4049,13 +4049,20 @@ function App() {
       const restoredRanking = parseState('writer-ranking-books');
       const restoredDismantle = parseState('writer-dismantle-books');
       const restoredStyles = parseState('writer-writing-styles');
-      await Promise.all([
-        Array.isArray(restoredProjects) ? invoke<string>('save_projects', { projects: restoredProjects }) : Promise.resolve(),
-        Array.isArray(restoredLibrary) ? invoke<string>('save_library_books', { books: restoredLibrary }) : Promise.resolve(),
-        Array.isArray(restoredRanking) ? invoke<string>('save_ranking_books', { books: restoredRanking }) : Promise.resolve(),
-        Array.isArray(restoredDismantle) ? invoke<string>('save_dismantle_books', { books: restoredDismantle }) : Promise.resolve(),
-        Array.isArray(restoredStyles) ? invoke<string>('save_writing_styles', { styles: restoredStyles }) : Promise.resolve(),
-      ]);
+      const restoreTasks: Array<{ label: string; run: () => Promise<string> }> = [];
+      if (Array.isArray(restoredProjects)) restoreTasks.push({ label: '小说、章节、大纲与记忆', run: () => invoke<string>('save_projects', { projects: restoredProjects }) });
+      if (Array.isArray(restoredLibrary)) restoreTasks.push({ label: '书籍管理', run: () => invoke<string>('save_library_books', { books: restoredLibrary }) });
+      if (Array.isArray(restoredRanking)) restoreTasks.push({ label: '扫榜数据', run: () => invoke<string>('save_ranking_books', { books: restoredRanking }) });
+      if (Array.isArray(restoredDismantle)) restoreTasks.push({ label: '拆书数据', run: () => invoke<string>('save_dismantle_books', { books: restoredDismantle }) });
+      if (Array.isArray(restoredStyles)) restoreTasks.push({ label: '文风数据', run: () => invoke<string>('save_writing_styles', { styles: restoredStyles }) });
+      let restoredCount = 0;
+      setCloudSyncMessage(`备份包已解析，正在并行恢复 ${restoreTasks.length} 类本机数据...`);
+      await Promise.all(restoreTasks.map(async task => {
+        await task.run();
+        restoredCount += 1;
+        setCloudSyncMessage(`已恢复 ${task.label}（${restoredCount}/${restoreTasks.length}），正在继续写入...`);
+      }));
+      setCloudSyncMessage('本机数据写入完成，正在重新载入小说项目...');
       const restored = Array.isArray(restoredProjects)
         ? restoredProjects as Project[]
         : await invoke<Project[] | null>('load_projects');
