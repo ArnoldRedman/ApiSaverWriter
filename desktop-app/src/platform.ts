@@ -1,4 +1,5 @@
 import { invoke as nativeInvoke } from '@tauri-apps/api/core';
+import SparkMD5 from 'spark-md5';
 
 type InvokeArgs = Record<string, unknown> | undefined;
 type MobileParams = Record<string, unknown>;
@@ -25,6 +26,229 @@ const baseURL = (value: unknown) => {
 };
 
 const usageKey = 'writer-mobile-usage';
+const baiduTokenKey = 'writer-baidu-access-token';
+const baiduClientId = 'zF5kkNsCvckX4aIpRdHxpFkcSMxnGZky';
+const baiduBackupName = 'ApiSaverWriter-backup.aswbackup';
+const backupMagic = new TextEncoder().encode('ASWBACKUP\x01');
+
+const emitCloudProgress = (message: string) => window.dispatchEvent(new CustomEvent('cloud-sync-progress', { detail: { message } }));
+
+const mobileBaiduToken = () => stringValue(localStorage.getItem(baiduTokenKey)).trim();
+const mobileBaiduURL = (base: string, params: Record<string, string>) => {
+  const url = new URL(base);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  return url.toString();
+};
+
+const mobileBaiduRequest = async <T = Record<string, unknown>>(url: string, init?: RequestInit): Promise<T> => {
+  const fetcher = await httpFetch();
+  const response = await fetcher(url, init);
+  const text = await response.text();
+  let data: Record<string, unknown> = {};
+  try { data = text ? JSON.parse(text) as Record<string, unknown> : {}; } catch { /* Keep the response text for diagnostics. */ }
+  const errno = Number(data.errno ?? data.error_code ?? 0);
+  if (!response.ok || errno !== 0 || data.error) {
+    const detail = stringValue(data.error_msg || data.error_description || data.error) || text.replace(/\s+/gu, ' ').slice(0, 220);
+    throw new Error(`百度网盘请求失败（${response.status}${errno ? `/${errno}` : ''}）：${detail || '未知错误'}`);
+  }
+  return data as T;
+};
+
+const gzipBytes = async (bytes: Uint8Array) => {
+  if (!('CompressionStream' in globalThis)) return bytes;
+  const stream = new CompressionStream('gzip');
+  const writer = stream.writable.getWriter();
+  await writer.write(bytes);
+  await writer.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+};
+
+const gunzipBytes = async (bytes: Uint8Array) => {
+  if (!bytes.slice(0, 2).every((value, index) => value === [0x1f, 0x8b][index])) return bytes;
+  if (!('DecompressionStream' in globalThis)) throw new Error('当前 iOS 版本不支持解压百度网盘备份包，请升级系统。');
+  const stream = new DecompressionStream('gzip');
+  const writer = stream.writable.getWriter();
+  await writer.write(bytes);
+  await writer.close();
+  return new Uint8Array(await new Response(stream.readable).arrayBuffer());
+};
+
+const u32 = (value: number) => {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, true);
+  return bytes;
+};
+
+const u64 = (value: number) => {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigUint64(0, BigInt(value), true);
+  return bytes;
+};
+
+const concatBytes = (parts: Uint8Array[]) => {
+  const output = new Uint8Array(parts.reduce((total, part) => total + part.byteLength, 0));
+  let offset = 0;
+  parts.forEach(part => { output.set(part, offset); offset += part.byteLength; });
+  return output;
+};
+
+const mobileBackupBundle = async (clientState: Record<string, string | null>) => {
+  const encoder = new TextEncoder();
+  const state = encoder.encode(JSON.stringify(clientState));
+  const projects = encoder.encode(stringValue(clientState.projects, '[]'));
+  const entries = [['client-state.json', state], ['projects.json', projects]] as Array<[string, Uint8Array]>;
+  const parts: Uint8Array[] = [backupMagic, u64(entries.length)];
+  entries.forEach(([path, content]) => {
+    const pathBytes = encoder.encode(path);
+    parts.push(u32(pathBytes.byteLength), u64(content.byteLength), pathBytes, content);
+  });
+  return gzipBytes(concatBytes(parts));
+};
+
+const readMobileBackupBundle = async (bytes: Uint8Array) => {
+  const raw = await gunzipBytes(bytes);
+  const decoder = new TextDecoder();
+  let offset = backupMagic.byteLength;
+  if (decoder.decode(raw.slice(0, offset)) !== decoder.decode(backupMagic)) throw new Error('云端文件不是有效的 ApiSaverWriter 完整备份包。');
+  const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+  const count = Number(view.getBigUint64(offset, true)); offset += 8;
+  if (!Number.isSafeInteger(count) || count > 10000) throw new Error('云端备份包文件数量异常。');
+  const files: Record<string, string> = {};
+  for (let index = 0; index < count; index += 1) {
+    const pathLength = view.getUint32(offset, true); offset += 4;
+    const size = Number(view.getBigUint64(offset, true)); offset += 8;
+    const path = decoder.decode(raw.slice(offset, offset + pathLength)); offset += pathLength;
+    if (!path || path.includes('..') || path.startsWith('/') || !Number.isSafeInteger(size) || size < 0 || offset + size > raw.byteLength) throw new Error('云端备份包包含不安全路径或无效内容。');
+    files[path] = decoder.decode(raw.slice(offset, offset + size)); offset += size;
+  }
+  const state = JSON.parse(files['client-state.json'] || '{}') as Record<string, string | null>;
+  return { clientState: state };
+};
+
+const mobileBaiduStatus = async () => {
+  const token = mobileBaiduToken();
+  if (!token) return { authenticated: false, logged_in: false, raw: '未登录' };
+  try {
+    const data = await mobileBaiduRequest<Record<string, unknown>>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/nas', { method: 'uinfo', access_token: token }));
+    return { ...data, authenticated: true, logged_in: true, username: stringValue(data.baidu_name || data.netdisk_name) };
+  } catch (error) {
+    localStorage.removeItem(baiduTokenKey);
+    throw error;
+  }
+};
+
+const mobileBaiduLoginURL = () => mobileBaiduURL('https://openapi.baidu.com/oauth/2.0/authorize', {
+  client_id: baiduClientId, display: 'popup', qrcode: '1', redirect_uri: 'oob', response_type: 'token', scope: 'basic,netdisk',
+});
+
+const extractBaiduToken = (value: string) => {
+  const raw = value.trim();
+  try {
+    const url = new URL(raw);
+    return new URLSearchParams(url.hash.replace(/^#/u, '')).get('access_token')
+      || url.searchParams.get('access_token')
+      || '';
+  } catch {
+    const match = raw.match(/(?:access_token[=:])([A-Za-z0-9._-]+)/u);
+    return match?.[1] || raw;
+  }
+};
+
+const mobileBaiduCompleteLogin = async (value: string) => {
+  const token = extractBaiduToken(value);
+  if (token.length < 20) throw new Error('授权结果中没有找到有效 access_token，请粘贴浏览器地址栏完整内容或 access_token。');
+  localStorage.setItem(baiduTokenKey, token);
+  try { return await mobileBaiduStatus(); } catch (error) { localStorage.removeItem(baiduTokenKey); throw error; }
+};
+
+const mobileBaiduForm = (fields: Record<string, string>) => Object.entries(fields).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join('&');
+
+const mobileBaiduEnsureDirectory = async (remotePath: string) => {
+  const segments = remotePath.split('/').filter(Boolean);
+  let current = '/apps/bdpan';
+  for (const segment of segments) {
+    current += `/${segment}`;
+    try {
+      await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', access_token: mobileBaiduToken() }), {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: mobileBaiduForm({ path: current, isdir: '1', rtype: '1' }),
+      });
+    } catch (error) {
+      if (!/已存在|exist|errno.?-8|\/-8/u.test(String(error))) throw error;
+    }
+  }
+};
+
+const mobileBaiduUpload = async (remotePath: string, bytes: Uint8Array) => {
+  const chunkSize = 4 * 1024 * 1024;
+  const chunks: Uint8Array[] = [];
+  for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) chunks.push(bytes.slice(offset, Math.min(offset + chunkSize, bytes.byteLength)));
+  const blockList = chunks.map(chunk => SparkMD5.ArrayBuffer.hash(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)));
+  const path = `/apps/bdpan/${remotePath}/${baiduBackupName}`;
+  const precreate = await mobileBaiduRequest<{ uploadid?: string; return_type?: number }>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'precreate', access_token: mobileBaiduToken() }), {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: mobileBaiduForm({ path, size: String(bytes.byteLength), isdir: '0', autoinit: '1', block_list: JSON.stringify(blockList), rtype: '3' }),
+  });
+  const uploadId = stringValue(precreate.uploadid);
+  if (Number(precreate.return_type) !== 2 && !uploadId) throw new Error('百度网盘没有返回上传任务 ID。');
+  if (Number(precreate.return_type) !== 2) {
+    for (const [index, chunk] of chunks.entries()) {
+      emitCloudProgress(`正在上传备份分片 ${index + 1}/${chunks.length}...`);
+      const form = new FormData();
+      form.append('file', new Blob([chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)]), baiduBackupName);
+      await mobileBaiduRequest(mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/superfile2', { method: 'upload', type: 'tmpfile', access_token: mobileBaiduToken(), path, uploadid: uploadId, partseq: String(index) }), { method: 'POST', headers: { 'User-Agent': 'pan.baidu.com' }, body: form });
+    }
+    await mobileBaiduRequest(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'create', access_token: mobileBaiduToken() }), {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: mobileBaiduForm({ path, size: String(bytes.byteLength), isdir: '0', uploadid: uploadId, block_list: JSON.stringify(blockList), rtype: '3' }),
+    });
+  }
+  return path;
+};
+
+const mobileBaiduDownload = async (remotePath: string) => {
+  const directory = `/apps/bdpan/${remotePath}`;
+  const searchURL = mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'search', access_token: mobileBaiduToken(), dir: directory, key: baiduBackupName, recursion: '0', page: '1', num: '20', web: '1' });
+  const fetcher = await httpFetch();
+  const searchResponse = await fetcher(searchURL);
+  const searchText = await searchResponse.text();
+  if (!searchResponse.ok) throw new Error(`百度网盘搜索失败（${searchResponse.status}）`);
+  const searchData = JSON.parse(searchText) as { errno?: number; error_msg?: string; list?: Array<{ path?: string; fs_id?: number | string }> };
+  if (Number(searchData.errno || 0) !== 0) throw new Error(`百度网盘搜索失败：${searchData.error_msg || `errno ${searchData.errno}`}`);
+  const match = searchData.list?.find(item => item.path === `${directory}/${baiduBackupName}`) || searchData.list?.[0];
+  const fsId = match?.fs_id;
+  if (!match || fsId === undefined || fsId === null) throw new Error('没有找到云端完整备份文件。');
+  const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', access_token: mobileBaiduToken(), fsids: JSON.stringify([String(fsId)]), dlink: '1', extra: '1' }));
+  const dlink = stringValue(meta.list?.[0]?.dlink);
+  if (!dlink) throw new Error('百度网盘没有返回备份下载地址。');
+  emitCloudProgress('正在下载百度网盘完整备份...');
+  const response = await fetcher(`${dlink}${dlink.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(mobileBaiduToken())}`, { headers: { 'User-Agent': 'pan.baidu.com' } });
+  if (!response.ok) throw new Error(`百度网盘下载失败（${response.status}）`);
+  return readMobileBackupBundle(new Uint8Array(await response.arrayBuffer()));
+};
+
+const mobileBaiduBackup = async (remotePath: string, clientState: Record<string, string | null>) => {
+  const status = await mobileBaiduStatus();
+  if (!status.authenticated) throw new Error('请先登录百度网盘，再开始备份。');
+  const path = remotePath.trim().replace(/^\/+|\/+$/gu, '');
+  if (!path || path.includes('..')) throw new Error('云端路径无效，只能使用 /apps/bdpan/ 下的相对路径。');
+  emitCloudProgress('正在整理完整应用备份...');
+  const bundle = await mobileBackupBundle(clientState);
+  await mobileBaiduEnsureDirectory(path);
+  const remoteFile = await mobileBaiduUpload(path, bundle);
+  emitCloudProgress('完整备份已上传到百度网盘。');
+  return { remotePath: path, remoteFile, size: bundle.byteLength, scope: 'projects, books, dismantles, rankings, styles, client-state' };
+};
+
+const mobileBaiduRestore = async (remotePath: string) => {
+  const status = await mobileBaiduStatus();
+  if (!status.authenticated) throw new Error('请先登录百度网盘，再开始恢复。');
+  const path = remotePath.trim().replace(/^\/+|\/+$/gu, '');
+  if (!path || path.includes('..')) throw new Error('云端路径无效，只能使用 /apps/bdpan/ 下的相对路径。');
+  const result = await mobileBaiduDownload(path);
+  emitCloudProgress('完整备份已下载，正在恢复本机数据。');
+  return result;
+};
 const readUsage = (): MobileUsage => {
   try {
     const parsed = JSON.parse(localStorage.getItem(usageKey) || '') as Partial<MobileUsage>;
@@ -212,6 +436,20 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
 export const invoke = async <T>(command: string, args?: InvokeArgs): Promise<T> => {
   if (!mobileRuntime()) return nativeInvoke<T>(command, args);
   if (command === 'start_agent_runtime') return 'Mobile direct Agent ready' as T;
+  if (command === 'cloud_sync_status') return mobileBaiduStatus() as T;
+  if (command === 'baidu_login_url') return mobileBaiduLoginURL() as T;
+  if (command === 'complete_baidu_login') {
+    const input = args as { code?: string } | undefined;
+    return mobileBaiduCompleteLogin(stringValue(input?.code)) as T;
+  }
+  if (command === 'backup_projects_to_baidu') {
+    const input = args as { remotePath?: string; clientState?: Record<string, string | null> } | undefined;
+    return mobileBaiduBackup(stringValue(input?.remotePath), input?.clientState || {}) as T;
+  }
+  if (command === 'restore_projects_from_baidu') {
+    const input = args as { remotePath?: string } | undefined;
+    return mobileBaiduRestore(stringValue(input?.remotePath)) as T;
+  }
   if (command === 'call_agent_rpc') {
     const input = args as { method?: string; params?: MobileParams } | undefined;
     if (!input?.method) throw new Error('缺少 Agent RPC 方法。');

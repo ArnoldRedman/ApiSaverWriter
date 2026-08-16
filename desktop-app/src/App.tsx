@@ -1517,6 +1517,16 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!isMobileRuntime()) return;
+    const receive = (event: Event) => {
+      const message = (event as CustomEvent<{ message?: string }>).detail?.message;
+      if (message) setCloudSyncMessage(message);
+    };
+    window.addEventListener('cloud-sync-progress', receive);
+    return () => window.removeEventListener('cloud-sync-progress', receive);
+  }, []);
+
   // The mobile HTTP Agent sends the same stream envelope as the desktop runtime.
   useEffect(() => {
     if (!isMobileRuntime()) return;
@@ -3943,7 +3953,9 @@ function App() {
     try {
       const result = await invoke<{ raw?: string; authenticated?: boolean; is_login?: boolean; logged_in?: boolean; username?: string }>('cloud_sync_status');
       const loggedIn = result.authenticated === true || result.is_login === true || result.logged_in === true || /已登录|logged.?in|success/iu.test(result.raw || '');
-      setCloudSyncMessage(loggedIn ? `百度网盘已登录${result.username ? `：${result.username}` : ''}` : '百度网盘工具已安装，但当前未登录，请先运行 Skill 的登录脚本。');
+      setCloudSyncMessage(loggedIn
+        ? `百度网盘已登录${result.username ? `：${result.username}` : ''}`
+        : isMobileRuntime() ? '百度网盘当前未登录，请点击“登录百度网盘”完成授权。' : '百度网盘工具已安装，但当前未登录，请先完成百度网盘授权。');
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -3958,7 +3970,9 @@ function App() {
       const url = await invoke<string>('baidu_login_url');
       if (!/^https?:\/\//iu.test(url.trim())) throw new Error('百度网盘没有返回有效授权链接');
       setBaiduAuthURL(url.trim());
-      setCloudSyncMessage('请在浏览器完成授权，然后将页面显示的 32 位授权码粘贴到下方。');
+      setCloudSyncMessage(isMobileRuntime()
+        ? '请复制链接到浏览器完成授权，再粘贴地址栏中的完整授权结果或 access_token。'
+        : '请在浏览器完成授权，然后将页面显示的 32 位授权码粘贴到下方。');
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -3967,7 +3981,7 @@ function App() {
   };
 
   const confirmBaiduLogin = async () => {
-    if (!baiduAuthCode.trim()) { setCloudSyncMessage('请先粘贴授权码。'); return; }
+    if (!baiduAuthCode.trim()) { setCloudSyncMessage(isMobileRuntime() ? '请先粘贴授权结果。' : '请先粘贴授权码。'); return; }
     setCloudSyncRunning(true);
     setCloudSyncMessage('正在验证百度网盘授权...');
     try {
@@ -3994,6 +4008,11 @@ function App() {
         'agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
         'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
       ].map(key => [key, localStorage.getItem(key)]));
+      clientState.projects = JSON.stringify(snapshot);
+      clientState['writer-library-books'] = JSON.stringify(libraryBooks);
+      clientState['writer-ranking-books'] = JSON.stringify(rankingBooks);
+      clientState['writer-dismantle-books'] = JSON.stringify(dismantleBooks);
+      clientState['writer-writing-styles'] = JSON.stringify(writingStyles);
       clientState['cloud-remote-path'] = remotePath;
       const result = await invoke<{ message?: string; remotePath?: string }>('backup_projects_to_baidu', { remotePath, clientState });
       localStorage.setItem('cloud-remote-path', remotePath);
@@ -4016,7 +4035,30 @@ function App() {
         if (typeof value === 'string') localStorage.setItem(key, value);
         else localStorage.removeItem(key);
       });
-      const restored = await invoke<Project[] | null>('load_projects');
+      const restoredState = result.clientState || {};
+      const parseState = (key: string): unknown => {
+        try {
+          const value = restoredState[key];
+          return typeof value === 'string' ? JSON.parse(value) : null;
+        } catch {
+          return null;
+        }
+      };
+      const restoredProjects = parseState('projects');
+      const restoredLibrary = parseState('writer-library-books');
+      const restoredRanking = parseState('writer-ranking-books');
+      const restoredDismantle = parseState('writer-dismantle-books');
+      const restoredStyles = parseState('writer-writing-styles');
+      await Promise.all([
+        Array.isArray(restoredProjects) ? invoke<string>('save_projects', { projects: restoredProjects }) : Promise.resolve(),
+        Array.isArray(restoredLibrary) ? invoke<string>('save_library_books', { books: restoredLibrary }) : Promise.resolve(),
+        Array.isArray(restoredRanking) ? invoke<string>('save_ranking_books', { books: restoredRanking }) : Promise.resolve(),
+        Array.isArray(restoredDismantle) ? invoke<string>('save_dismantle_books', { books: restoredDismantle }) : Promise.resolve(),
+        Array.isArray(restoredStyles) ? invoke<string>('save_writing_styles', { styles: restoredStyles }) : Promise.resolve(),
+      ]);
+      const restored = Array.isArray(restoredProjects)
+        ? restoredProjects as Project[]
+        : await invoke<Project[] | null>('load_projects');
       if (restored) {
         setProjects(restored);
         if (editingProject) setEditingProject(restored.find(project => project.id === editingProject.id) || null);
@@ -5304,7 +5346,7 @@ function App() {
                 <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
                 <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
                 <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void restoreFromCloud()}>从百度网盘恢复</button></div>
-                {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder="粘贴 32 位授权码" autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
+                {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>{isMobileRuntime() ? '复制以下链接到浏览器完成授权，再粘贴浏览器地址栏中的完整授权结果或 access_token。' : '复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。'}</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder={isMobileRuntime() ? '粘贴完整授权结果或 access_token' : '粘贴 32 位授权码'} autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
                 {cloudSyncMessage && <p className={`model-list-message ${/失败|错误|未找到|未登录/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
                 <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
               </section>}
