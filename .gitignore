@@ -3,7 +3,12 @@ node_modules/
 desktop-app/node_modules/
 desktop-app/src-tauri/target/
 sidecars/agent-runtime/dist/
-desktop-app/src-tauri/runtime/agent-runtime/
+desktop-app/src-tauri/runtime/
+desktop-app/src-tauri/gen/apple/
+desktop-app/src-tauri/gen/schemas/iOS-schema.json
+desktop-app/src-tauri/gen/schemas/mobile-schema.json
+desktop-app/release-assets/
+desktop-app/output-dev.png
 dist/
 *.dmg
 *.app

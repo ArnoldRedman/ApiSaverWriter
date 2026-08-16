@@ -21,10 +21,10 @@ const copyPackage = (name) => {
 rmSync(runtimeRoot, { recursive: true, force: true });
 mkdirSync(runtimeRoot, { recursive: true });
 
-// iOS and Android call the trusted Agent Gateway. Node child processes and
-// native SQLite modules cannot run inside a mobile WebView bundle.
+// iOS and Android use Tauri's native HTTP plugin. Node child processes and
+// native SQLite modules are only bundled for desktop targets.
 if (mobileTarget) {
-  console.log(`Skipping desktop Agent sidecar for ${process.env.TAURI_ENV_PLATFORM}; mobile uses Agent Gateway.`);
+  console.log(`Skipping desktop Agent sidecar for ${process.env.TAURI_ENV_PLATFORM}; mobile uses direct native HTTP.`);
   process.exit(0);
 }
 
