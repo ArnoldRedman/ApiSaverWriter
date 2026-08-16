@@ -85,6 +85,12 @@ const concatBytes = (parts: Uint8Array[]) => {
   return output;
 };
 
+const safeBackupRelativePath = (value: string) => {
+  if (!value || value.startsWith('/') || value.includes('\0') || /^[A-Za-z]:[\\/]/u.test(value)) return false;
+  const segments = value.replace(/\\/gu, '/').split('/');
+  return segments.every(segment => Boolean(segment) && segment !== '.' && segment !== '..');
+};
+
 const mobileBackupBundle = async (clientState: Record<string, string | null>) => {
   const encoder = new TextEncoder();
   const state = encoder.encode(JSON.stringify(clientState));
@@ -110,10 +116,13 @@ const readMobileBackupBundle = async (bytes: Uint8Array) => {
   if (!Number.isSafeInteger(count) || count > 10000) throw new Error('云端备份包文件数量异常。');
   const files: Record<string, string> = {};
   for (let index = 0; index < count; index += 1) {
+    if (offset + 12 > raw.byteLength) throw new Error(`云端备份包索引不完整（文件 ${index + 1}/${count}）。`);
     const pathLength = view.getUint32(offset, true); offset += 4;
     const size = Number(view.getBigUint64(offset, true)); offset += 8;
+    if (!pathLength || offset + pathLength > raw.byteLength) throw new Error(`云端备份包路径索引无效（文件 ${index + 1}/${count}）。`);
     const path = decoder.decode(raw.slice(offset, offset + pathLength)); offset += pathLength;
-    if (!path || path.includes('..') || path.startsWith('/') || !Number.isSafeInteger(size) || size < 0 || offset + size > raw.byteLength) throw new Error('云端备份包包含不安全路径或无效内容。');
+    if (!safeBackupRelativePath(path)) throw new Error(`云端备份包包含不安全路径：${path}`);
+    if (!Number.isSafeInteger(size) || size < 0 || offset + size > raw.byteLength) throw new Error(`云端备份包文件内容不完整：${path}`);
     files[path] = decoder.decode(raw.slice(offset, offset + size)); offset += size;
     if (count > 1) emitCloudProgress(`正在解析备份文件 ${index + 1}/${count}...`);
   }
