@@ -1,5 +1,19 @@
 # ApiSaverWriter - AI 小说写作助手
 
+## 下载应用
+
+当前稳定版本：[v0.1.1 Release](https://github.com/Vaxue/ApiSaverWriter/releases/tag/v0.1.1)
+
+| 平台 | 安装包 |
+| --- | --- |
+| Windows x64 | [EXE 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_0.1.1_x64-setup.exe) · [MSI 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_0.1.1_x64_en-US.msi) |
+| macOS Apple Silicon | [DMG 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_v0.1.1_macOS_AppleSilicon.dmg) |
+| macOS Intel | [DMG 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_v0.1.1_macOS_Intel.dmg) |
+| Android | [APK 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/app-universal-release-unsigned.apk) · [AAB 包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/app-universal-release.aab) |
+| iOS | [未签名 IPA](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_v0.1.1_iOS_unsigned.ipa) |
+
+> iOS IPA 与 Android APK 未签名，需要使用对应设备的安装或签名方式导入。后续版本可从 [Releases](https://github.com/Vaxue/ApiSaverWriter/releases) 页面获取。
+
 ## 📖 项目简介
 
 ApiSaverWriter 是一款功能强大的 AI 小说写作助手，参考 QMai 小说的设计理念，提供完整的小说创作工具链。
