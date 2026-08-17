@@ -29,9 +29,13 @@ function trimTrailingSlash(value: string): string {
 }
 
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
+const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
 
 function apiErrorMessage(status: number, detail: string, statusText: string, attempts: number, routeHint = ""): string {
   const retrySuffix = attempts > 1 ? `，已自动重试 ${attempts - 1} 次` : "";
+  if (isQuotaExceeded(detail)) {
+    return `API 中转服务额度已用尽${routeHint}。章节正文已保存，本章记忆将在额度恢复后再更新。`;
+  }
   if ([502, 503, 504, 524].includes(status)) {
     return `API 中转服务当前返回 ${status}（可能来自代理或 API 上游网关）${routeHint}${retrySuffix}，请稍后再试、测试模型，或在设置中切换模型。`;
   }
@@ -351,7 +355,7 @@ export class ApiSaverClient {
         }
 
         const detail = await response.text();
-        const retryable = [408, 429, 500, 502, 503, 504, 524].includes(response.status);
+        const retryable = [408, 429, 500, 502, 503, 504, 524].includes(response.status) && !isQuotaExceeded(detail);
         if (retryable && attempt < maxAttempts) {
           await sleep(800 * 2 ** (attempt - 1));
           continue;

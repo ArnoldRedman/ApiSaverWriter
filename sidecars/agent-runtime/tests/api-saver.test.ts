@@ -69,4 +69,15 @@ describe("API Saver model configuration", () => {
     expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: "Bearer primary-key" });
     expect(fetchMock.mock.calls[1][1]?.headers).toMatchObject({ Authorization: "Bearer backup-key" });
   });
+
+  it("does not retry an exhausted quota response", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ error: { message: "The quota has been exceeded" } }), { status: 429 }));
+
+    const request = new ApiSaverClient({ apiKey: "test-key", baseURL: "https://example.test/v1", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }]);
+
+    await expect(request).rejects.toThrow("API 中转服务额度已用尽");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

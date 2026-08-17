@@ -147,6 +147,25 @@ const stringList = (value: unknown, limit = 20): string[] => Array.isArray(value
   ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, limit)
   : [];
 
+const memoryStringList = (value: unknown, limit = 40): string[] => Array.isArray(value)
+  ? value.map(item => {
+      if (typeof item === "string") return item.trim();
+      if (!item || typeof item !== "object") return "";
+      const entry = item as Record<string, unknown>;
+      return compactText(entry.text || entry.content || entry.change || entry.changes || entry.description || entry.name || "", 600).trim();
+    }).filter(Boolean).slice(0, limit)
+  : typeof value === "string"
+    ? value.split(/\r?\n|[；;、]/u).map(item => item.trim()).filter(Boolean).slice(0, limit)
+  : [];
+
+const memoryField = (result: Record<string, unknown>, ...names: string[]): unknown => {
+  for (const name of names) {
+    const value = result[name];
+    if ((Array.isArray(value) && value.length) || (typeof value === "string" && value.trim())) return value;
+  }
+  return [];
+};
+
 const networkProxyConfig = (params?: Record<string, unknown>) => ({
   proxyEnabled: Boolean(params?.proxyEnabled),
   proxyURL: typeof params?.proxyURL === "string" ? params.proxyURL : "",
@@ -170,13 +189,16 @@ const normalizeRelationWeight = (value: unknown, fallback = 0.7): number => {
 const normalizeMemoryResult = (content: string): Record<string, unknown> => {
   try {
     const cleanedResponse = content.trim().replace(/^```(?:json)?\s*/i, "").replace(/```$/u, "").trim();
-    const result = JSON.parse(cleanedResponse) as Record<string, unknown>;
+    const parsed = JSON.parse(cleanedResponse) as Record<string, unknown>;
+    const result = typeof parsed.content === "string" && parsed.content.trim().startsWith("{")
+      ? (JSON.parse(parsed.content) as Record<string, unknown>)
+      : parsed;
     return {
-      summary: typeof result.summary === "string" ? result.summary : content,
-      keywords: stringList(result.keywords, 8),
-      characterStateChanges: stringList(result.characterStateChanges),
-      knowledgeChanges: stringList(result.knowledgeChanges),
-      foreshadowingChanges: stringList(result.foreshadowingChanges),
+      summary: typeof (result.summary || result.摘要 || result.chapterSummary || result.chapter_summary) === "string" ? String(result.summary || result.摘要 || result.chapterSummary || result.chapter_summary) : content,
+      keywords: memoryStringList(memoryField(result, "keywords", "关键词", "key_words"), 8),
+      characterStateChanges: memoryStringList(memoryField(result, "characterStateChanges", "character_state_changes", "characterChanges", "character_changes", "人物状态变化", "人物状态", "角色状态变化")),
+      knowledgeChanges: memoryStringList(memoryField(result, "knowledgeChanges", "knowledge_changes", "characterKnowledgeChanges", "roleKnowledgeChanges", "角色认知变化", "角色认知", "认知变化", "知识变化")),
+      foreshadowingChanges: memoryStringList(memoryField(result, "foreshadowingChanges", "foreshadowing_changes", "伏笔变化", "伏笔进展")),
       foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems.filter(item => item && typeof item === "object").slice(0, 20).map(item => {
         const entry = item as Record<string, unknown>;
         return {
@@ -187,10 +209,10 @@ const normalizeMemoryResult = (content: string): Record<string, unknown> => {
           targetChapter: Number.isFinite(Number(entry.targetChapter)) ? Number(entry.targetChapter) : undefined,
         };
       }).filter(item => item.text) : [],
-      timelineEvents: stringList(result.timelineEvents),
-      canonFacts: stringList(result.canonFacts),
-      conflicts: stringList(result.conflicts),
-      endingHook: typeof result.endingHook === "string" ? String(result.endingHook).trim() : "",
+      timelineEvents: memoryStringList(memoryField(result, "timelineEvents", "timeline_events", "时间线事件", "时间线")),
+      canonFacts: memoryStringList(memoryField(result, "canonFacts", "canon_facts", "设定事实", "世界观事实")),
+      conflicts: memoryStringList(memoryField(result, "conflicts", "冲突", "冲突变化")),
+      endingHook: typeof (result.endingHook || result.ending_hook || result.章末钩子 || result.结尾钩子) === "string" ? String(result.endingHook || result.ending_hook || result.章末钩子 || result.结尾钩子).trim() : "",
       entities: Array.isArray(result.entities) ? (result.entities as unknown[]).filter(item => item && typeof item === "object").slice(0, 30).map((item: unknown) => {
         const entity = item as Record<string, unknown>;
         return { name: String(entity.name || "").trim(), type: String(entity.type || "实体").trim() };
@@ -1197,24 +1219,44 @@ const fetchQidianRanking = async (rankType: string, gender: string, params?: Rec
     const $ = loadHtml(html);
     // 页面顶部也可能带 data-rid 的导航项；先筛出真实书籍行再截取，避免
     // 前置无关元素占满 slice 后造成“返回 0 本书”。
-    const rankRows = $('li[data-rid]').toArray().filter(element => {
+    const rankRows = $('[data-rid], li.rank-list-item, .rank-list .book-mid-info').toArray().filter(element => {
       const titleNode = $(element).find('.book-mid-info h2 a').first();
-      return Boolean(titleNode.text().trim() && titleNode.attr('href'));
+      return Boolean((titleNode.text().trim() && titleNode.attr('href')) || $(element).is('.book-mid-info'));
     }).slice(0, 60);
-    return rankRows.map((element, index) => {
+    const parsed = rankRows.map((element, index) => {
       const item = $(element);
-      const titleNode = item.find('.book-mid-info h2 a').first();
+      const scope = item.is('.book-mid-info') ? item : item;
+      const titleNode = scope.find('.book-mid-info h2 a, h2 a, a[href*="/book/"]').filter((_i, node) => Boolean($(node).text().trim())).first();
       const href = resolveBookUrl(pageUrl, titleNode.attr('href') || '');
       const bookId = titleNode.attr('data-bid') || href.match(/\/book\/(\d+)/u)?.[1] || String(index);
       const categories = item.find('.book-mid-info .author a').toArray().slice(1).map(node => $(node).text().trim()).filter(Boolean);
       return {
         id: `qidian:${bookId}`, sourceBookId: bookId, title: titleNode.text().trim(),
         author: item.find('.book-mid-info .author a.name').first().text().trim() || '未知作者',
-        intro: item.find('.book-mid-info .intro').text().trim(), cover: resolveBookUrl(pageUrl, item.find('.book-img-box img').attr('src') || '') || undefined,
+        intro: scope.find('.book-mid-info .intro, .intro, [class*="intro"]').first().text().trim(), cover: resolveBookUrl(pageUrl, scope.find('.book-img-box img, img').first().attr('src') || '') || undefined,
         category: categories.join(' · ') || undefined, rank: Number(item.attr('data-rid')) || index + 1,
         rankType, gender: 'all', platform: 'qidian', url: href,
       };
     }).filter(book => book.title && book.url);
+    if (parsed.length) return parsed;
+    // Fallback for markup changes: locate every canonical /book/<id> link and
+    // walk to its nearest card for author, intro and cover metadata.
+    const seen = new Set<string>();
+    return $('a[href*="/book/"]').toArray().flatMap((node, index) => {
+      const link = $(node);
+      const href = resolveBookUrl(pageUrl, link.attr('href') || '');
+      const id = href.match(/\/book\/(\d+)/u)?.[1] || '';
+      const title = link.text().replace(/\s+/gu, ' ').trim();
+      if (!id || !title || seen.has(id)) return [];
+      seen.add(id);
+      let card = link;
+      for (let depth = 0; depth < 5 && card.length; depth += 1) {
+        const text = card.text().trim();
+        if (text.length > title.length + 10) break;
+        card = card.parent();
+      }
+      return [{ id: `qidian:${id}`, sourceBookId: id, title, author: card.find('.author a.name, .author a').first().text().trim() || '未知作者', intro: card.find('.intro, [class*="intro"]').first().text().trim(), cover: resolveBookUrl(pageUrl, card.find('img').first().attr('src') || '') || undefined, category: undefined, rank: index + 1, rankType, gender: 'all', platform: 'qidian', url: href }];
+    }).slice(0, 60);
   };
   const requestOptions = { headers: { Referer: 'https://www.qidian.com/rank/' } };
   let books = parseRankingPage(await fetchWebText(pageUrl, params, requestOptions));
@@ -1223,7 +1265,11 @@ const fetchQidianRanking = async (rankType: string, gender: string, params?: Rec
   if (!books.length && params?.proxyEnabled === true) {
     books = parseRankingPage(await fetchWebText(pageUrl, { ...params, proxyEnabled: false }, requestOptions));
   }
-  if (!books.length) throw new Error(`起点中文网${basePath}榜单未返回可解析书籍，官网页面可能正在校验或已更新结构`);
+  if (!books.length) {
+    const probe = await fetchWebText(pageUrl, { ...params, proxyEnabled: false }, requestOptions).catch(() => '');
+    if (/C2WF946J0\/probe\.js|var\s+buid\s*=|challenge|verify/iu.test(probe)) throw new Error(`起点中文网${basePath}返回了反爬校验页，请更换代理出口或稍后重试`);
+    throw new Error(`起点中文网${basePath}未找到书籍条目，官网结构可能已变化`);
+  }
   return books;
 };
 

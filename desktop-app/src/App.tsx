@@ -556,6 +556,40 @@ const isAgentWorkflowStep = (value: string | undefined): value is AgentWorkflowS
 const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(stage);
 
 const defaultBaseURL = 'https://api.apisaver.com/v1';
+const memoryQuotaCooldownMs = 5 * 60 * 1000;
+let memoryQuotaRetryAt = 0;
+const isQuotaExceededError = (value: unknown) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|额度(?:已)?用尽|余额不足/iu.test(String(value));
+// These records can contain complete novels and downloaded books. Tauri writes
+// them to the iOS app-data directory; keeping a second WebView copy exhausts
+// the WKWebView quota and is only needed by the plain-browser development mode.
+const deviceBackedStateKeys = new Set([
+  'projects',
+  'writer-library-books',
+  'writer-ranking-books',
+  'writer-dismantle-books',
+  'writer-writing-styles',
+]);
+const normalizeAgentConfig = (value: unknown): AgentConfig => {
+  const parsed = value && typeof value === 'object' ? value as Partial<AgentConfig> & Record<string, unknown> : {};
+  const storedBaseURL = typeof parsed.baseURL === 'string' ? parsed.baseURL : '';
+  const apiKeys = Array.isArray(parsed.apiKeys)
+    ? parsed.apiKeys.filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())
+    : (typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? [parsed.apiKey.trim()] : []);
+  return {
+    serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : '帅apiGPT0.06',
+    enabled: parsed.enabled !== false,
+    apiMode: parsed.apiMode === 'responses' || parsed.apiMode === 'anthropic' ? parsed.apiMode : 'openai',
+    baseURL: !storedBaseURL || /api\.shuaiapi\.com/iu.test(storedBaseURL) ? defaultBaseURL : storedBaseURL,
+    apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
+    apiKeys,
+    model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
+    contextWindow: Number((parsed as Record<string, unknown>).contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
+    reasoningMode: parsed.reasoningMode === 'off' || parsed.reasoningMode === 'low' || parsed.reasoningMode === 'medium' || parsed.reasoningMode === 'high' || parsed.reasoningMode === 'max' || parsed.reasoningMode === 'custom' ? parsed.reasoningMode : 'auto',
+    proxyEnabled: parsed.proxyEnabled === true,
+    proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
+    proxyBypassLocal: parsed.proxyBypassLocal === true,
+  };
+};
 const agentNetworkParams = (config: AgentConfig) => ({
   proxyEnabled: config.proxyEnabled,
   proxyURL: config.proxyURL.trim(),
@@ -829,6 +863,65 @@ const extractLocalKeywords = (content: string) => {
   const ignored = new Set(['这一章', '故事', '小说', '主角', '他们', '自己', '已经', '没有', '一个', '什么']);
   const matches = content.match(/[\u4e00-\u9fff]{2,6}/g) ?? [];
   return Array.from(new Set(matches.filter(word => !ignored.has(word)))).slice(0, 8);
+};
+
+const chapterSentences = (content: string) => content
+  .replace(/\s+/gu, ' ')
+  .split(/(?<=[。！？!?])/u)
+  .map(sentence => sentence.trim())
+  .filter(sentence => sentence.length >= 8);
+
+// This is intentionally conservative: it gives a saved chapter a useful local
+// memory immediately, while the model can later refine it. It also prevents an
+// iOS network/SSE failure from replacing all structured fields with empty lists.
+const buildLocalStructuredMemory = (chapter: Chapter, project: Project) => {
+  const sentences = chapterSentences(chapter.content);
+  const namedCharacters = Array.from(new Set([
+    project.protagonist1,
+    project.protagonist2,
+    ...project.cards.filter(card => card.type === '角色卡').flatMap(card => {
+      const aliases = card.content.match(/(?:姓名|名称|本名|别名|称号|代号)\s*[：:]\s*([^\n；;，,]+)/gu) ?? [];
+      return [card.title, ...aliases.map(alias => alias.replace(/^.*?[：:]/u, '').trim())];
+    }),
+  ].map(name => (name || '').trim()).filter(name => name.length >= 2 && name.length <= 24)));
+  const quote = (sentence: string, limit = 110) => sentence.length > limit ? `${sentence.slice(0, limit)}...` : sentence;
+  const sentencesFor = (name: string) => sentences.filter(sentence => sentence.includes(name));
+  const stateSignals = /(?:受伤|恢复|突破|晋升|获得|失去|决定|答应|拒绝|愤怒|紧张|恐惧|欣喜|冷静|昏迷|逃离|抵达|离开|出现|死亡|复活|怀疑|对峙|交手|战胜|失败)/u;
+  const knowledgeSignals = /(?:得知|发现|意识到|明白|知晓|看出|听说|告知|透露|隐瞒|秘密|真相|怀疑|认出|记起|见到|听到|收到|面对|接触|阅读|察觉)/u;
+  const characterStateChanges = namedCharacters.flatMap(name => {
+    const evidence = sentencesFor(name).find(sentence => stateSignals.test(sentence)) || sentencesFor(name)[0];
+    return evidence ? [`${name}：${quote(evidence)}`] : [];
+  }).slice(0, 12);
+  const knowledgeChanges = namedCharacters.flatMap(name => {
+    const characterSentences = sentencesFor(name);
+    const evidence = characterSentences.find(sentence => knowledgeSignals.test(sentence)) || characterSentences[0];
+    return evidence ? [`${name}：本章可确认其接触到的信息或局势：${quote(evidence)}`] : [];
+  }).slice(0, 12);
+  if (!knowledgeChanges.length && sentences.length) {
+    knowledgeChanges.push(`叙事视角：本章新增可确认信息：${quote(sentences[0])}`);
+  }
+  const explicitForeshadowing = sentences.filter(sentence => /(?:伏笔|秘密|异常|似乎|预感|未知|线索|暗中|背后|等待|不对劲|尚未|还没|未曾|将要|明天|计划|任务|目标|约定)/u.test(sentence)).slice(-4).map(sentence => quote(sentence));
+  const timelineEvents = sentences.filter(sentence => /(?:此时|随后|当晚|次日|清晨|傍晚|终于|之后|不久|刚刚|同时)/u.test(sentence)).slice(0, 6).map(sentence => quote(sentence));
+  const canonFacts = sentences.filter(sentence => /(?:规则|能力|境界|系统|必须|不能|限制|代价|身份|设定)/u.test(sentence)).slice(0, 6).map(sentence => quote(sentence));
+  const endingHook = [...sentences].reverse().find(sentence => /(?:？|!|！|却|竟|突然|危机|秘密|声音|身影|下一刻|门外)/u.test(sentence)) || '';
+  const foreshadowingChanges = explicitForeshadowing.length
+    ? explicitForeshadowing
+    : (endingHook ? [`待承接线索：${quote(endingHook)}`] : (sentences.length ? [`待承接事项：${quote(sentences[sentences.length - 1])}`] : []));
+  const explicitConflicts = sentences.filter(sentence => /(?:冲突|争执|嘲讽|威胁|攻击|反击|对峙|战斗|追杀|阻拦|拒绝|质问|逼迫|挑衅|敌人|杀意|不满|冷笑|喝道|争夺|谈判)/u.test(sentence)).slice(0, 6).map(sentence => quote(sentence));
+  const conflicts = explicitConflicts.length
+    ? explicitConflicts
+    : (characterStateChanges.length ? [`本章主要张力：${characterStateChanges[0]}`] : (sentences.length ? [`本章待解决事件：${quote(sentences[sentences.length - 1])}`] : []));
+  return {
+    summary: buildLocalChapterSummary(chapter.content),
+    keywords: extractLocalKeywords(chapter.content),
+    characterStateChanges,
+    knowledgeChanges,
+    foreshadowingChanges,
+    timelineEvents,
+    canonFacts,
+    conflicts,
+    endingHook: quote(endingHook),
+  };
 };
 
 const aiDetectionLabel = (confidence: number): AIDetectionLabel => {
@@ -1180,8 +1273,6 @@ function App() {
   const [rankingLoading, setRankingLoading] = useState(false);
   const [rankingQuery, setRankingQuery] = useState('');
   const [rankingFontCss, setRankingFontCss] = useState('');
-  const [rankingAnalysis, setRankingAnalysis] = useState('');
-  const [rankingAnalysisRunning, setRankingAnalysisRunning] = useState(false);
 
   const [bookSearchQuery, setBookSearchQuery] = useState('');
   const [bookSearchLoading, setBookSearchLoading] = useState(false);
@@ -1254,27 +1345,9 @@ function App() {
   const [agentConfig, setAgentConfig] = useState<AgentConfig>(() => {
     const saved = localStorage.getItem('agent-config');
     try {
-      const parsed = saved ? JSON.parse(saved) : {};
-      const storedBaseURL = typeof parsed.baseURL === 'string' ? parsed.baseURL : '';
-      const baseURL = !storedBaseURL || /api\.shuaiapi\.com/i.test(storedBaseURL) ? defaultBaseURL : storedBaseURL;
-      return {
-        serviceName: parsed.serviceName ?? '帅apiGPT0.06',
-        enabled: parsed.enabled ?? true,
-        apiMode: ['openai', 'responses', 'anthropic'].includes(parsed.apiMode) ? parsed.apiMode : 'openai',
-        baseURL,
-        apiKey: parsed.apiKey ?? (Array.isArray(parsed.apiKeys) ? parsed.apiKeys[0] ?? '' : ''),
-        apiKeys: Array.isArray(parsed.apiKeys)
-          ? parsed.apiKeys.filter((key: unknown): key is string => typeof key === 'string' && key.trim()).map((key: string) => key.trim())
-          : (typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? [parsed.apiKey.trim()] : []),
-        model: parsed.model ?? fallbackModels[0],
-        contextWindow: Number(parsed.contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
-        reasoningMode: ['auto', 'off', 'low', 'medium', 'high', 'max', 'custom'].includes(parsed.reasoningMode) ? parsed.reasoningMode : 'auto',
-        proxyEnabled: Boolean(parsed.proxyEnabled),
-        proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
-        proxyBypassLocal: parsed.proxyBypassLocal === true,
-      };
+      return normalizeAgentConfig(saved ? JSON.parse(saved) : {});
     } catch {
-      return { serviceName: '帅apiGPT0.06', enabled: true, apiMode: 'openai' as const, baseURL: defaultBaseURL, apiKey: '', apiKeys: [], model: fallbackModels[0], contextWindow: 128, reasoningMode: 'auto' as const, proxyEnabled: false, proxyURL: 'http://127.0.0.1:7897', proxyBypassLocal: false };
+      return normalizeAgentConfig({});
     }
   });
 
@@ -2085,34 +2158,6 @@ function App() {
       setNotice({ title: '扫榜失败', content: String(error) });
     } finally {
       setRankingLoading(false);
-    }
-  };
-
-  const runRankingAnalysis = async () => {
-    if (!rankingBooks.length) {
-      setNotice({ title: '请先获取榜单', content: '刷新榜单后才能生成市场趋势盘点。' });
-      return;
-    }
-    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
-      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型密钥，再运行扫榜分析。' });
-      return;
-    }
-    setRankingAnalysisRunning(true);
-    try {
-      const result = await invoke<{ report?: string }>('call_agent_rpc', {
-        method: 'ranking.analyze',
-        params: {
-          books: rankingBooks.slice(0, 60), platform: rankingPlatform, rankType: rankingType, gender: rankingPlatform === 'fanqie' ? (fanqieSection.startsWith('female') ? 'female' : 'male') : 'all',
-          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
-          model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
-          contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-        },
-      });
-      setRankingAnalysis(result.report?.trim() || '未生成可用的扫榜报告。');
-    } catch (error) {
-      setNotice({ title: '扫榜分析失败', content: String(error) });
-    } finally {
-      setRankingAnalysisRunning(false);
     }
   };
 
@@ -3438,10 +3483,11 @@ function App() {
       updatedAt: now,
     };
     const currentMemory = editingProject.memories.find(memory => memory.chapterId === chapter.id);
+    const localStructuredMemory = buildLocalStructuredMemory(chapter, editingProject);
     const selectedKeywords = editingProject.cards.filter(card => selectedCardIds.includes(card.id)).map(card => card.title);
-    const keywords = selectedKeywords.length ? selectedKeywords : (currentMemory?.keywords?.length ? currentMemory.keywords : extractLocalKeywords(chapter.content));
+    const keywords = selectedKeywords.length ? selectedKeywords : (currentMemory?.keywords?.length ? currentMemory.keywords : localStructuredMemory.keywords);
     const localProjectWithMemory = buildProjectWithChapterMemory(editingProject, chapter, {
-      summary: buildLocalChapterSummary(chapter.content),
+      ...localStructuredMemory,
       keywords,
     });
     const cardsToRefresh = new Set(localProjectWithMemory.cards
@@ -3474,6 +3520,13 @@ function App() {
       return;
     }
 
+    if (Date.now() < memoryQuotaRetryAt) {
+      const remainingMinutes = Math.max(1, Math.ceil((memoryQuotaRetryAt - Date.now()) / 60_000));
+      setNotice({ title: '章节已保存', content: `正文和本地章节记忆已更新；API 中转额度暂不可用，本章智能摘要将在 ${remainingMinutes} 分钟后可再次更新。` });
+      setChapterSaving(false);
+      return;
+    }
+
     // 本地章节已经保存，AI 记忆只处理当前章节，并在后台增量更新。
     // 这样网络中转变慢或返回 502 时不会阻塞编辑器的保存按钮。
     setChapterSaving(false);
@@ -3499,19 +3552,25 @@ function App() {
             ...agentNetworkParams(agentConfig),
           },
         });
-        const summary = result.summary?.trim() || buildLocalChapterSummary(chapter.content);
+        const summary = result.summary?.trim() || localStructuredMemory.summary;
         const aiKeywords = Array.isArray(result.keywords) && result.keywords.length ? asTextList(result.keywords, 8) : keywords;
+        // Never erase useful local facts just because a provider returned only
+        // a summary, or used an unsupported JSON field name on mobile.
+        const preferAIList = (value: unknown, fallback: string[], existing: string[] | undefined) => {
+          const extracted = asTextList(value);
+          return extracted.length ? extracted : (fallback.length ? fallback : (existing || []));
+        };
         const memoryPatch = {
           summary,
           keywords: aiKeywords,
-          characterStateChanges: asTextList(result.characterStateChanges),
-          knowledgeChanges: asTextList(result.knowledgeChanges),
-          foreshadowingChanges: asTextList(result.foreshadowingChanges),
+          characterStateChanges: preferAIList(result.characterStateChanges, localStructuredMemory.characterStateChanges, currentMemory?.characterStateChanges),
+          knowledgeChanges: preferAIList(result.knowledgeChanges, localStructuredMemory.knowledgeChanges, currentMemory?.knowledgeChanges),
+          foreshadowingChanges: preferAIList(result.foreshadowingChanges, localStructuredMemory.foreshadowingChanges, currentMemory?.foreshadowingChanges),
           foreshadowingItems: Array.isArray(result.foreshadowingItems) ? result.foreshadowingItems : [],
-          timelineEvents: asTextList(result.timelineEvents),
-          canonFacts: asTextList(result.canonFacts),
-          conflicts: asTextList(result.conflicts),
-          endingHook: typeof result.endingHook === 'string' ? result.endingHook.trim() : '',
+          timelineEvents: preferAIList(result.timelineEvents, localStructuredMemory.timelineEvents, currentMemory?.timelineEvents),
+          canonFacts: preferAIList(result.canonFacts, localStructuredMemory.canonFacts, currentMemory?.canonFacts),
+          conflicts: preferAIList(result.conflicts, localStructuredMemory.conflicts, currentMemory?.conflicts),
+          endingHook: typeof result.endingHook === 'string' && result.endingHook.trim() ? result.endingHook.trim() : (localStructuredMemory.endingHook || currentMemory?.endingHook || ''),
         };
         // 如果用户在等待期间又编辑了本章，丢弃过期摘要，避免覆盖新正文。
         setProjects(currentProjects => {
@@ -3542,6 +3601,11 @@ function App() {
         });
         setNotice({ title: '章节记忆更新完成', content: '本章结构化摘要已写入本地；若期间再次编辑，旧摘要会被自动丢弃。' });
       } catch (error) {
+        if (isQuotaExceededError(error)) {
+          memoryQuotaRetryAt = Date.now() + memoryQuotaCooldownMs;
+          setNotice({ title: '章节已保存', content: '正文和本地章节记忆已更新；API 中转额度已用尽，本章智能摘要会在额度恢复后再更新。' });
+          return;
+        }
         setNotice({ title: '章节已保存', content: `本章记忆暂未更新：${String(error)}。正文和本地快照不受影响。` });
       }
     })();
@@ -4000,23 +4064,47 @@ function App() {
     const remotePath = cloudRemotePath.trim();
     if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
     setCloudSyncRunning(true);
-    setCloudSyncMessage('正在备份小说目录到百度网盘...');
+    setCloudSyncMessage('正在保存并核对全部本机数据...');
     try {
       const snapshot = editingProject ? projects.map(project => project.id === editingProject.id ? editingProject : project) : projects;
-      await invoke<string>('save_projects', { projects: snapshot });
+      await Promise.all([
+        invoke<string>('save_projects', { projects: snapshot }),
+        invoke<string>('save_library_books', { books: libraryBooks }),
+        invoke<string>('save_ranking_books', { books: rankingBooks }),
+        invoke<string>('save_dismantle_books', { books: dismantleBooks }),
+        invoke<string>('save_writing_styles', { styles: writingStyles }),
+      ]);
+      const backupManifest = {
+        schemaVersion: 2,
+        createdAt: new Date().toISOString(),
+        counts: {
+          projects: snapshot.length,
+          libraryBooks: libraryBooks.length,
+          rankingBooks: rankingBooks.length,
+          dismantleBooks: dismantleBooks.length,
+          writingStyles: writingStyles.length,
+          skills: skills.length,
+          models: availableModels.length,
+        },
+        apiConfigured: Boolean(agentConfig.apiKey.trim() || agentConfig.apiKeys.some(key => key.trim())),
+      };
       const clientState = Object.fromEntries([
         'agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
         'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
       ].map(key => [key, localStorage.getItem(key)]));
+      clientState['agent-config'] = JSON.stringify(agentConfig);
+      clientState['agent-models'] = JSON.stringify(availableModels);
+      clientState['writer-skills'] = JSON.stringify(skills);
       clientState.projects = JSON.stringify(snapshot);
       clientState['writer-library-books'] = JSON.stringify(libraryBooks);
       clientState['writer-ranking-books'] = JSON.stringify(rankingBooks);
       clientState['writer-dismantle-books'] = JSON.stringify(dismantleBooks);
       clientState['writer-writing-styles'] = JSON.stringify(writingStyles);
       clientState['cloud-remote-path'] = remotePath;
-      const result = await invoke<{ message?: string; remotePath?: string }>('backup_projects_to_baidu', { remotePath, clientState });
+      clientState['backup-manifest'] = JSON.stringify(backupManifest);
+      await invoke<{ message?: string; remotePath?: string }>('backup_projects_to_baidu', { remotePath, clientState });
       localStorage.setItem('cloud-remote-path', remotePath);
-      setCloudSyncMessage(`完整备份完成：${result.remotePath || remotePath}`);
+      setCloudSyncMessage(`完整备份完成：小说 ${snapshot.length}、书籍 ${libraryBooks.length}、拆书 ${dismantleBooks.length}、榜单 ${rankingBooks.length}、文风 ${writingStyles.length}。`);
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -4031,10 +4119,6 @@ function App() {
     setCloudSyncMessage('正在从百度网盘恢复小说目录...');
     try {
       const result = await invoke<{ clientState?: Record<string, string | null> }>('restore_projects_from_baidu', { remotePath });
-      Object.entries(result.clientState || {}).forEach(([key, value]) => {
-        if (typeof value === 'string') localStorage.setItem(key, value);
-        else localStorage.removeItem(key);
-      });
       const restoredState = result.clientState || {};
       const parseState = (key: string): unknown => {
         try {
@@ -4044,17 +4128,48 @@ function App() {
           return null;
         }
       };
-      const restoredProjects = parseState('projects');
-      const restoredLibrary = parseState('writer-library-books');
-      const restoredRanking = parseState('writer-ranking-books');
-      const restoredDismantle = parseState('writer-dismantle-books');
-      const restoredStyles = parseState('writer-writing-styles');
+      const restoreArray = async <T,>(key: string, command: string): Promise<T[] | null> => {
+        const value = parseState(key);
+        if (Array.isArray(value)) return value as T[];
+        const stored = await invoke<T[] | null>(command);
+        return Array.isArray(stored) ? stored : null;
+      };
+      const [restoredProjects, restoredLibrary, restoredRanking, restoredDismantle, restoredStyles] = await Promise.all([
+        restoreArray<Project>('projects', 'load_projects'),
+        restoreArray<LibraryBook>('writer-library-books', 'load_library_books'),
+        restoreArray<RankingBook>('writer-ranking-books', 'load_ranking_books'),
+        restoreArray<DismantleBook>('writer-dismantle-books', 'load_dismantle_books'),
+        restoreArray<WritingStyle>('writer-writing-styles', 'load_writing_styles'),
+      ]);
+      const restoredConfigValue = parseState('agent-config');
+      const restoredModelsValue = parseState('agent-models');
+      const restoredSkillsValue = parseState('writer-skills');
+      const restoredManifest = parseState('backup-manifest') as { counts?: Record<string, unknown> } | null;
+      const restoredRankings = Array.isArray(restoredRanking) ? restoredRanking.map((book, index) => normalizeRankingBook({
+        ...book,
+        sourceName: book.sourceName || (book.platform === 'qidian' ? '起点中文网官网' : book.platform === 'faloo' ? '飞卢小说网官网' : '番茄小说网'),
+      }, index)) : null;
+      const actualCounts: Record<string, number> = {
+        projects: restoredProjects?.length || 0,
+        libraryBooks: restoredLibrary?.length || 0,
+        rankingBooks: restoredRankings?.length || 0,
+        dismantleBooks: restoredDismantle?.length || 0,
+        writingStyles: restoredStyles?.length || 0,
+      };
+      if (restoredManifest?.counts) {
+        for (const [key, count] of Object.entries(restoredManifest.counts)) {
+          if (key in actualCounts && Number(count) > actualCounts[key]) {
+            throw new Error(`备份完整性校验失败：${key} 应有 ${Number(count)} 条，实际只读取到 ${actualCounts[key]} 条。`);
+          }
+        }
+      }
       const restoreTasks: Array<{ label: string; run: () => Promise<string> }> = [];
       if (Array.isArray(restoredProjects)) restoreTasks.push({ label: '小说、章节、大纲与记忆', run: () => invoke<string>('save_projects', { projects: restoredProjects }) });
       if (Array.isArray(restoredLibrary)) restoreTasks.push({ label: '书籍管理', run: () => invoke<string>('save_library_books', { books: restoredLibrary }) });
-      if (Array.isArray(restoredRanking)) restoreTasks.push({ label: '扫榜数据', run: () => invoke<string>('save_ranking_books', { books: restoredRanking }) });
+      if (Array.isArray(restoredRankings)) restoreTasks.push({ label: '扫榜数据', run: () => invoke<string>('save_ranking_books', { books: restoredRankings }) });
       if (Array.isArray(restoredDismantle)) restoreTasks.push({ label: '拆书数据', run: () => invoke<string>('save_dismantle_books', { books: restoredDismantle }) });
       if (Array.isArray(restoredStyles)) restoreTasks.push({ label: '文风数据', run: () => invoke<string>('save_writing_styles', { styles: restoredStyles }) });
+      if (!restoreTasks.length) throw new Error('备份包中没有可恢复的小说、书籍、拆书、榜单或文风数据。');
       let restoredCount = 0;
       setCloudSyncMessage(`备份包已解析，正在并行恢复 ${restoreTasks.length} 类本机数据...`);
       await Promise.all(restoreTasks.map(async task => {
@@ -4062,6 +4177,43 @@ function App() {
         restoredCount += 1;
         setCloudSyncMessage(`已恢复 ${task.label}（${restoredCount}/${restoreTasks.length}），正在继续写入...`);
       }));
+      // The data above now lives in the native app directory. Remove legacy
+      // browser copies before persisting lightweight settings so iOS storage
+      // quota cannot affect the next chapter save or model request.
+      if ('__TAURI_INTERNALS__' in window) {
+        deviceBackedStateKeys.forEach(key => localStorage.removeItem(key));
+      } else {
+        Object.entries(restoredState).forEach(([key, value]) => {
+          if (deviceBackedStateKeys.has(key) || typeof value !== 'string') return;
+          localStorage.setItem(key, value);
+        });
+      }
+      const lightweightState = ['agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage', 'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path'];
+      lightweightState.forEach(key => {
+        const value = restoredState[key];
+        if (typeof value !== 'string') return;
+        try { localStorage.setItem(key, value); } catch { /* Native project files remain intact if WebView settings quota is full. */ }
+      });
+      if (Array.isArray(restoredLibrary)) setLibraryBooks(restoredLibrary.map(book => normalizeLibraryBook(book)));
+      if (Array.isArray(restoredRankings)) setRankingBooks(restoredRankings);
+      if (Array.isArray(restoredDismantle)) setDismantleBooks(restoredDismantle.map(book => normalizeDismantleBook(book)));
+      if (Array.isArray(restoredStyles)) setWritingStyles(restoredStyles.map(style => normalizeWritingStyle(style)));
+      if (restoredConfigValue && typeof restoredConfigValue === 'object') {
+        const restoredConfig = normalizeAgentConfig(restoredConfigValue);
+        setAgentConfig(restoredConfig);
+        setSettingsDraft(restoredConfig);
+      }
+      if (Array.isArray(restoredModelsValue)) {
+        const restoredModels = restoredModelsValue.filter((model): model is string => typeof model === 'string' && Boolean(model.trim()));
+        if (restoredModels.length) {
+          setAvailableModels(restoredModels);
+          setSettingsModels(restoredModels);
+        }
+      }
+      if (Array.isArray(restoredSkillsValue)) {
+        const restoredSkills = restoredSkillsValue.filter((skill): skill is Skill => Boolean(skill && typeof skill === 'object' && typeof (skill as Skill).name === 'string'));
+        if (restoredSkills.length) setSkills(restoredSkills);
+      }
       setCloudSyncMessage('本机数据写入完成，正在重新载入小说项目...');
       const restored = Array.isArray(restoredProjects)
         ? restoredProjects as Project[]
@@ -4071,8 +4223,8 @@ function App() {
         if (editingProject) setEditingProject(restored.find(project => project.id === editingProject.id) || null);
       }
       localStorage.setItem('cloud-remote-path', remotePath);
-      setCloudSyncMessage(`完整恢复完成：${remotePath}。正在重新载入应用数据...`);
-      window.setTimeout(() => window.location.reload(), 700);
+      setCloudSyncMessage(`完整恢复完成：小说 ${actualCounts.projects}、书籍 ${actualCounts.libraryBooks}、拆书 ${actualCounts.dismantleBooks}、榜单 ${actualCounts.rankingBooks}、文风 ${actualCounts.writingStyles}。正在重新载入...`);
+      window.setTimeout(() => window.location.reload(), 1000);
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -4313,15 +4465,32 @@ function App() {
   const rebuildMemoryDocuments = () => {
     if (!editingProject) return;
     const now = new Date().toISOString();
+    const memories = editingProject.memories.map(memory => {
+      const chapter = editingProject.chapters.find(item => item.id === memory.chapterId);
+      if (!chapter?.content.trim()) return memory;
+      const local = buildLocalStructuredMemory(chapter, editingProject);
+      return normalizeChapterMemory({
+        ...memory,
+        characterStateChanges: memory.characterStateChanges.length ? memory.characterStateChanges : local.characterStateChanges,
+        knowledgeChanges: memory.knowledgeChanges.length ? memory.knowledgeChanges : local.knowledgeChanges,
+        foreshadowingChanges: memory.foreshadowingChanges.length ? memory.foreshadowingChanges : local.foreshadowingChanges,
+        timelineEvents: memory.timelineEvents.length ? memory.timelineEvents : local.timelineEvents,
+        canonFacts: memory.canonFacts.length ? memory.canonFacts : local.canonFacts,
+        conflicts: memory.conflicts.length ? memory.conflicts : local.conflicts,
+        endingHook: memory.endingHook || local.endingHook,
+        updatedAt: now,
+      }, chapter);
+    });
     const updated = {
       ...editingProject,
-      memoryDocuments: buildMemoryDocuments(editingProject.memories, editingProject.memoryDocuments, true)
+      memories,
+      memoryDocuments: buildMemoryDocuments(memories, editingProject.memoryDocuments, true)
         .map(document => ({ ...document, updatedAt: now })),
       updatedAt: now,
     };
     setEditingProject(updated);
     setProjects(current => current.map(project => project.id === updated.id ? updated : project));
-    setNotice({ title: '记忆已重新整理', content: '已按全部章节快照重建人物状态、伏笔、时间线和设定事实。' });
+    setNotice({ title: '记忆已重新整理', content: '已按正文回填空的认知、伏笔和冲突，并重建全部记忆文档。' });
   };
 
   const activeOutline = editingProject?.outlines.find(outline => outline.id === activeOutlineId) ?? null;
@@ -5075,32 +5244,29 @@ function App() {
         </div>
 
         <nav className="nav">
-          <button
-            className={activeTab === 'projects' ? 'active' : ''}
-            onClick={() => setActiveTab('projects')}
-          >
-            📚 小说管理
+          <button aria-label="小说管理" className={activeTab === 'projects' ? 'active' : ''} onClick={() => setActiveTab('projects')}>
+            <span className="nav-icon" aria-hidden="true">▣</span><span className="nav-label">小说</span>
           </button>
           <button className={activeTab === 'books' ? 'active' : ''} onClick={() => setActiveTab('books')}>
-            ▣ 书籍管理 <small>{libraryBooks.length}</small>
+            <span className="nav-icon" aria-hidden="true">▤</span><span className="nav-label">书籍</span><small>{libraryBooks.length}</small>
           </button>
           <button
             className={activeTab === 'dismantles' ? 'active' : ''}
             onClick={() => { setActiveTab('dismantles'); if (!activeDismantleBookId && dismantleBooks[0]) { setActiveDismantleBookId(dismantleBooks[0].id); setActiveDismantleChapterId(dismantleBooks[0].chapters[0]?.id || null); } }}
           >
-            ⌘ 拆书管理 <small>{dismantleBooks.length}</small>
+            <span className="nav-icon" aria-hidden="true">⌘</span><span className="nav-label">拆书</span><small>{dismantleBooks.length}</small>
           </button>
           <button className={activeTab === 'rankings' ? 'active' : ''} onClick={() => setActiveTab('rankings')}>
-            ↗ 扫榜管理 <small>{rankingBooks.length}</small>
+            <span className="nav-icon" aria-hidden="true">↗</span><span className="nav-label">扫榜</span><small>{rankingBooks.length}</small>
           </button>
           <button className={activeTab === 'skills' ? 'active' : ''} onClick={() => setActiveTab('skills')}>
-            ✦ 技能管理 <small>{skills.length}</small>
+            <span className="nav-icon" aria-hidden="true">✦</span><span className="nav-label">技能</span><small>{skills.length}</small>
           </button>
           <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); }}>
-            ◈ 文风管理 <small>{writingStyles.length}</small>
+            <span className="nav-icon" aria-hidden="true">◈</span><span className="nav-label">文风</span><small>{writingStyles.length}</small>
           </button>
           <button className="mobile-more-button" aria-expanded={showMobileMore} onClick={() => setShowMobileMore(current => !current)}>
-            ··· 更多
+            <span className="nav-icon" aria-hidden="true">•••</span><span className="nav-label">更多</span>
           </button>
         </nav>
         <div className={`mobile-more-menu ${showMobileMore ? 'open' : ''}`}>
@@ -5202,9 +5368,8 @@ function App() {
         )}
         {activeTab === 'rankings' && (
           <div className="ranking-page">
-            <header className="page-header"><div><span className="page-eyebrow">市场观察</span><h2>扫榜管理</h2><p>聚合番茄小说网、起点和飞卢榜单，选书后可下载或进入拆书流程。</p></div><div className="ranking-header-actions"><button className="btn-secondary" onClick={() => void runRankingAnalysis()} disabled={rankingAnalysisRunning || !rankingBooks.length}>{rankingAnalysisRunning ? '盘点中...' : 'AI 趋势盘点'}</button><button className="btn-primary" onClick={() => void fetchRankingBooks()} disabled={rankingLoading}>{rankingLoading ? '拉取中...' : '刷新榜单'}</button></div></header>
+            <header className="page-header"><div><span className="page-eyebrow">市场观察</span><h2>扫榜管理</h2><p>聚合番茄小说网、起点和飞卢榜单，选书后可下载或进入拆书流程。</p></div><div className="ranking-header-actions"><button className="btn-primary" onClick={() => void fetchRankingBooks()} disabled={rankingLoading}>{rankingLoading ? '拉取中...' : '刷新榜单'}</button></div></header>
             <div className="ranking-toolbar"><select className="select" aria-label="榜单平台" value={rankingPlatform} onChange={event => { const nextPlatform = event.target.value as RankingPlatform; setRankingPlatform(nextPlatform); setRankingBooks([]); if (nextPlatform === 'fanqie') { setFanqieSection('male-read'); setFanqieCategoryId('all'); setRankingType('read'); } else { setRankingType(rankingTypeOptions(nextPlatform)[0].value); } }}><option value="fanqie">番茄小说网</option><option value="qidian">起点中文网</option><option value="faloo">飞卢中文网</option></select>{rankingPlatform === 'fanqie' ? <><select className="select" aria-label="番茄榜单分类" value={fanqieSection} onChange={event => { setFanqieSection(event.target.value as FanqieSection); setFanqieCategoryId('all'); }} >{fanqieSectionOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select><select className="select" aria-label="番茄题材分类" value={fanqieCategoryId} onChange={event => setFanqieCategoryId(event.target.value)} disabled={fanqieCategoriesLoading}><option value="all">{fanqieCategoriesLoading ? '分类加载中...' : '总榜'}</option>{(fanqieCategories[fanqieSection] || []).filter(category => category.id !== 'all').map(category => <option key={category.id} value={category.id}>{category.label}</option>)}</select></> : <select className="select" value={rankingType} onChange={event => setRankingType(event.target.value as RankingType)}>{rankingTypeOptions(rankingPlatform).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}</select>}<input className="input" value={rankingQuery} onChange={event => setRankingQuery(event.target.value)} placeholder="筛选书名、作者、分类" />{rankingSourceName && <span className="ranking-source-label">数据来源：{rankingSourceName}</span>}</div>
-            {rankingAnalysis && <section className="ranking-analysis"><div className="panel-section-title">story-long-scan 市场盘点 <button className="link-button" onClick={() => setRankingAnalysis('')}>收起</button></div><pre>{rankingAnalysis}</pre></section>}
             {visibleRankingBooks.length === 0 ? <div className="empty-state"><p>选择平台后点击“刷新榜单”。</p></div> : <div className="ranking-grid">{visibleRankingBooks.map(book => <article className="ranking-book-card" key={book.id}><div className="ranking-book-rank">{book.rank}</div><div className={`ranking-book-cover ${book.cover ? 'has-image' : ''}`}><span>{book.title.trim().slice(0, 1) || '书'}</span>{book.cover && <img src={book.cover} alt={`${book.title}封面`} loading="lazy" onError={event => event.currentTarget.parentElement?.classList.remove('has-image')} />}</div><div className="ranking-book-copy"><h3>{book.title}</h3><span>{book.author} · {book.category || '未分类'}</span><p>{book.intro || '暂无简介'}</p><small>{book.wordCount ? `${book.wordCount.toLocaleString()} 字` : '字数未知'}{book.readCount ? ` · ${book.readCount.toLocaleString()} 热度` : ''}</small><div className="ranking-book-actions"><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : '一键下载 TXT'}</button><button className="link-button" onClick={async () => { const downloaded = libraryBooks.find(item => item.title === book.title); const ready = downloaded || await downloadLibraryBook(book); if (ready) createDismantleFromLibrary(ready); }}>{bookDownloadRunningId === book.id ? '处理中...' : '一键拆书'}</button></div></div></article>)}</div>}
           </div>
         )}
