@@ -5586,10 +5586,12 @@ function App() {
         <div className="modal-overlay cloud-backup-picker-overlay" onClick={() => setShowCloudBackupPicker(false)}>
           <div className="modal cloud-backup-picker" role="dialog" aria-modal="true" aria-labelledby="cloud-backup-picker-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
-              <div><h3 id="cloud-backup-picker-title">选择云端备份</h3><small className="cloud-backup-picker-subtitle">请选择要恢复的版本，应用不会自动替你选取。</small></div>
+              <div><h3 id="cloud-backup-picker-title">选择云端备份</h3><small className="cloud-backup-picker-subtitle">从百度网盘备份目录中选择一个版本恢复</small></div>
               <button className="modal-close" aria-label="关闭" onClick={() => setShowCloudBackupPicker(false)}>×</button>
             </div>
             <div className="modal-body cloud-backup-picker-body">
+              <div className="cloud-backup-breadcrumb"><span>百度网盘</span><b>/</b><span>{cloudRemotePath.trim()}</span></div>
+              <div className="cloud-backup-toolbar"><strong>完整备份文件</strong><span>{cloudBackupFiles.length} 个项目</span><button type="button" className="link-button" onClick={() => void loadCloudBackups()} disabled={cloudSyncRunning}>刷新列表</button></div>
               <div className="cloud-backup-list" role="radiogroup" aria-label="云端备份文件">
                 {cloudBackupFiles.map(file => {
                   const selected = selectedCloudBackup?.path === file.path && selectedCloudBackup?.fsId === file.fsId;
@@ -5598,15 +5600,20 @@ function App() {
                   const sizeText = file.size > 0 ? `${(file.size / 1_048_576).toFixed(file.size >= 1_048_576 ? 1 : 2)} MB` : '大小未知';
                   return <label key={`${file.path}-${file.fsId || ''}`} className={`cloud-backup-option${selected ? ' active' : ''}`}>
                     <input type="radio" name="cloud-backup" checked={selected} onChange={() => setSelectedCloudBackup(file)} />
-                    <span className="cloud-backup-option-main"><strong>{file.name}</strong><small>{dateText} · {sizeText}</small><em>{file.isBundle ? '完整应用备份' : '备份文件'}</em></span>
+                    <span className="cloud-backup-file-icon" aria-hidden="true">ASW</span>
+                    <span className="cloud-backup-option-main"><strong>{file.name}</strong><small>{file.isBundle ? '完整应用备份' : '备份文件'}</small><em className="cloud-backup-mobile-meta">{dateText} · {sizeText}</em></span>
+                    <span className="cloud-backup-option-date">{dateText}</span>
+                    <span className="cloud-backup-option-size">{sizeText}</span>
                   </label>;
                 })}
               </div>
-              <p className="cloud-backup-picker-note">恢复会覆盖本机对应的小说、书籍、拆书、扫榜、文风、技能、记忆和设置。请确认选择的备份时间。</p>
+              <p className="cloud-backup-picker-note">恢复会覆盖本机对应的小说、书籍、拆书、扫榜、文风、技能、记忆和设置。</p>
             </div>
             <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setShowCloudBackupPicker(false)}>取消</button>
+              <span className="cloud-backup-selection-status">{selectedCloudBackup ? `已选择：${selectedCloudBackup.name}` : '请选择一个备份文件'}</span>
+              <div className="cloud-backup-picker-actions"><button className="btn-secondary" onClick={() => setShowCloudBackupPicker(false)}>取消</button>
               <button className="btn-primary" disabled={!selectedCloudBackup || cloudSyncRunning} onClick={() => selectedCloudBackup && void restoreFromCloud(selectedCloudBackup)}>恢复所选备份</button>
+              </div>
             </div>
           </div>
         </div>
