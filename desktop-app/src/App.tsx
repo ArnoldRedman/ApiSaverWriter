@@ -126,6 +126,16 @@ interface MemoryDocument {
   manuallyEdited?: boolean;
 }
 
+interface CloudBackupFile {
+  name: string;
+  path: string;
+  fsId?: string;
+  size: number;
+  modifiedAt: string;
+  isBundle: boolean;
+  source: 'bundle';
+}
+
 interface KnowledgeGraphNode {
   id: string;
   label: string;
@@ -893,24 +903,18 @@ const buildLocalStructuredMemory = (chapter: Chapter, project: Project) => {
     return evidence ? [`${name}：${quote(evidence)}`] : [];
   }).slice(0, 12);
   const knowledgeChanges = namedCharacters.flatMap(name => {
-    const characterSentences = sentencesFor(name);
-    const evidence = characterSentences.find(sentence => knowledgeSignals.test(sentence)) || characterSentences[0];
-    return evidence ? [`${name}：本章可确认其接触到的信息或局势：${quote(evidence)}`] : [];
+    const evidence = sentencesFor(name).find(sentence => knowledgeSignals.test(sentence));
+    return evidence ? [`${name}：${quote(evidence)}`] : [];
   }).slice(0, 12);
-  if (!knowledgeChanges.length && sentences.length) {
-    knowledgeChanges.push(`叙事视角：本章新增可确认信息：${quote(sentences[0])}`);
-  }
   const explicitForeshadowing = sentences.filter(sentence => /(?:伏笔|秘密|异常|似乎|预感|未知|线索|暗中|背后|等待|不对劲|尚未|还没|未曾|将要|明天|计划|任务|目标|约定)/u.test(sentence)).slice(-4).map(sentence => quote(sentence));
   const timelineEvents = sentences.filter(sentence => /(?:此时|随后|当晚|次日|清晨|傍晚|终于|之后|不久|刚刚|同时)/u.test(sentence)).slice(0, 6).map(sentence => quote(sentence));
   const canonFacts = sentences.filter(sentence => /(?:规则|能力|境界|系统|必须|不能|限制|代价|身份|设定)/u.test(sentence)).slice(0, 6).map(sentence => quote(sentence));
   const endingHook = [...sentences].reverse().find(sentence => /(?:？|!|！|却|竟|突然|危机|秘密|声音|身影|下一刻|门外)/u.test(sentence)) || '';
   const foreshadowingChanges = explicitForeshadowing.length
     ? explicitForeshadowing
-    : (endingHook ? [`待承接线索：${quote(endingHook)}`] : (sentences.length ? [`待承接事项：${quote(sentences[sentences.length - 1])}`] : []));
+    : (endingHook ? [`待承接线索：${quote(endingHook)}`] : []);
   const explicitConflicts = sentences.filter(sentence => /(?:冲突|争执|嘲讽|威胁|攻击|反击|对峙|战斗|追杀|阻拦|拒绝|质问|逼迫|挑衅|敌人|杀意|不满|冷笑|喝道|争夺|谈判)/u.test(sentence)).slice(0, 6).map(sentence => quote(sentence));
-  const conflicts = explicitConflicts.length
-    ? explicitConflicts
-    : (characterStateChanges.length ? [`本章主要张力：${characterStateChanges[0]}`] : (sentences.length ? [`本章待解决事件：${quote(sentences[sentences.length - 1])}`] : []));
+  const conflicts = explicitConflicts;
   return {
     summary: buildLocalChapterSummary(chapter.content),
     keywords: extractLocalKeywords(chapter.content),
@@ -1403,6 +1407,9 @@ function App() {
   });
   const [cloudSyncRunning, setCloudSyncRunning] = useState(false);
   const [cloudSyncMessage, setCloudSyncMessage] = useState('');
+  const [cloudBackupFiles, setCloudBackupFiles] = useState<CloudBackupFile[]>([]);
+  const [selectedCloudBackup, setSelectedCloudBackup] = useState<CloudBackupFile | null>(null);
+  const [showCloudBackupPicker, setShowCloudBackupPicker] = useState(false);
   const [baiduAuthURL, setBaiduAuthURL] = useState('');
   const [baiduAuthCode, setBaiduAuthCode] = useState('');
   const [usageDateFilter, setUsageDateFilter] = useState('all');
@@ -3554,10 +3561,21 @@ function App() {
         });
         const summary = result.summary?.trim() || localStructuredMemory.summary;
         const aiKeywords = Array.isArray(result.keywords) && result.keywords.length ? asTextList(result.keywords, 8) : keywords;
-        // Never erase useful local facts just because a provider returned only
-        // a summary, or used an unsupported JSON field name on mobile.
+        const aiStructuredFieldCount = [
+          result.characterStateChanges,
+          result.knowledgeChanges,
+          result.foreshadowingChanges,
+          result.timelineEvents,
+          result.canonFacts,
+          result.conflicts,
+        ].filter(value => asTextList(value).length > 0).length + (result.endingHook?.trim() ? 1 : 0);
+        // A complete model response is used as one coherent classification.
+        // Mixing individual local heuristic fields into it made iOS memories
+        // noticeably less precise than desktop memories.
+        const useCoherentAIResult = aiStructuredFieldCount >= 3;
         const preferAIList = (value: unknown, fallback: string[], existing: string[] | undefined) => {
           const extracted = asTextList(value);
+          if (useCoherentAIResult) return extracted;
           return extracted.length ? extracted : (fallback.length ? fallback : (existing || []));
         };
         const memoryPatch = {
@@ -4112,13 +4130,44 @@ function App() {
     }
   };
 
-  const restoreFromCloud = async () => {
+  const loadCloudBackups = async () => {
     const remotePath = cloudRemotePath.trim();
     if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
     setCloudSyncRunning(true);
-    setCloudSyncMessage('正在从百度网盘恢复小说目录...');
+    setCloudSyncMessage('正在读取百度网盘备份列表...');
     try {
-      const result = await invoke<{ clientState?: Record<string, string | null> }>('restore_projects_from_baidu', { remotePath });
+      const result = await invoke<{ files?: CloudBackupFile[] }>('list_baidu_backups', { remotePath });
+      const files = Array.isArray(result.files) ? result.files.filter(file => file && typeof file.path === 'string') : [];
+      if (!files.length) {
+        setCloudBackupFiles([]);
+        setSelectedCloudBackup(null);
+        setCloudSyncMessage('当前云端目录没有找到 .aswbackup 完整备份包。');
+        return;
+      }
+      setCloudBackupFiles(files);
+      setSelectedCloudBackup(null);
+      setShowCloudBackupPicker(true);
+      setCloudSyncMessage(`找到 ${files.length} 个完整备份包，请选择要恢复的版本。`);
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const restoreFromCloud = async (selectedBackup?: CloudBackupFile) => {
+    const remotePath = cloudRemotePath.trim();
+    if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
+    if (!selectedBackup) { setCloudSyncMessage('请先选择要恢复的云端备份文件。'); return; }
+    setShowCloudBackupPicker(false);
+    setCloudSyncRunning(true);
+    setCloudSyncMessage(`正在恢复备份：${selectedBackup.name}...`);
+    try {
+      const result = await invoke<{ clientState?: Record<string, string | null> }>('restore_projects_from_baidu', {
+        remotePath,
+        backupPath: selectedBackup.path,
+        backupFsId: selectedBackup.fsId,
+      });
       const restoredState = result.clientState || {};
       const parseState = (key: string): unknown => {
         try {
@@ -5517,7 +5566,7 @@ function App() {
               {settingsSection === 'sync' && <section className="settings-sync-card">
                 <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
                 <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
-                <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void restoreFromCloud()}>从百度网盘恢复</button></div>
+                <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void loadCloudBackups()}>选择备份恢复</button></div>
                 {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>{isMobileRuntime() ? '复制以下链接到浏览器完成授权，再粘贴浏览器地址栏中的完整授权结果或 access_token。' : '复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。'}</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder={isMobileRuntime() ? '粘贴完整授权结果或 access_token' : '粘贴 32 位授权码'} autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
                 {cloudSyncMessage && <p className={`model-list-message ${/失败|错误|未找到|未登录/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
                 <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
@@ -5528,6 +5577,36 @@ function App() {
             <div className="modal-footer">
               <button className="btn-secondary" onClick={() => setShowSettingsModal(false)}>取消</button>
               <button className="btn-primary" onClick={saveSettings}>保存设置</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showCloudBackupPicker && (
+        <div className="modal-overlay cloud-backup-picker-overlay" onClick={() => setShowCloudBackupPicker(false)}>
+          <div className="modal cloud-backup-picker" role="dialog" aria-modal="true" aria-labelledby="cloud-backup-picker-title" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div><h3 id="cloud-backup-picker-title">选择云端备份</h3><small className="cloud-backup-picker-subtitle">请选择要恢复的版本，应用不会自动替你选取。</small></div>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowCloudBackupPicker(false)}>×</button>
+            </div>
+            <div className="modal-body cloud-backup-picker-body">
+              <div className="cloud-backup-list" role="radiogroup" aria-label="云端备份文件">
+                {cloudBackupFiles.map(file => {
+                  const selected = selectedCloudBackup?.path === file.path && selectedCloudBackup?.fsId === file.fsId;
+                  const date = file.modifiedAt ? new Date(file.modifiedAt) : null;
+                  const dateText = date && !Number.isNaN(date.getTime()) ? date.toLocaleString() : '时间未知';
+                  const sizeText = file.size > 0 ? `${(file.size / 1_048_576).toFixed(file.size >= 1_048_576 ? 1 : 2)} MB` : '大小未知';
+                  return <label key={`${file.path}-${file.fsId || ''}`} className={`cloud-backup-option${selected ? ' active' : ''}`}>
+                    <input type="radio" name="cloud-backup" checked={selected} onChange={() => setSelectedCloudBackup(file)} />
+                    <span className="cloud-backup-option-main"><strong>{file.name}</strong><small>{dateText} · {sizeText}</small><em>{file.isBundle ? '完整应用备份' : '备份文件'}</em></span>
+                  </label>;
+                })}
+              </div>
+              <p className="cloud-backup-picker-note">恢复会覆盖本机对应的小说、书籍、拆书、扫榜、文风、技能、记忆和设置。请确认选择的备份时间。</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setShowCloudBackupPicker(false)}>取消</button>
+              <button className="btn-primary" disabled={!selectedCloudBackup || cloudSyncRunning} onClick={() => selectedCloudBackup && void restoreFromCloud(selectedCloudBackup)}>恢复所选备份</button>
             </div>
           </div>
         </div>

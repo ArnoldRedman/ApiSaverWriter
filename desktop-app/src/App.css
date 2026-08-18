@@ -1221,6 +1221,20 @@ main {
 .settings-sync-path small { color: #64748B; font-size: 11px; font-weight: 400; }
 .settings-sync-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .settings-sync-actions button { min-height: 36px; }
+.cloud-backup-picker-overlay { z-index: 180; }
+.cloud-backup-picker { width: min(640px, calc(100vw - 40px)); max-width: 640px; }
+.cloud-backup-picker-subtitle { display: block; margin-top: 4px; color: #64748B; font-size: 11px; }
+.cloud-backup-picker-body { display: grid; gap: 14px; }
+.cloud-backup-list { display: grid; gap: 8px; max-height: min(440px, 52vh); overflow-y: auto; padding-right: 2px; }
+.cloud-backup-option { display: flex; align-items: flex-start; gap: 11px; padding: 13px 14px; border: 1px solid #334155; border-radius: 9px; background: #0F172A; cursor: pointer; transition: border-color .16s, background .16s, transform .16s; }
+.cloud-backup-option:hover { border-color: #0E7490; background: #102335; }
+.cloud-backup-option.active { border-color: #22D3EE; background: rgba(8, 145, 178, .16); transform: translateY(-1px); }
+.cloud-backup-option input { margin-top: 3px; accent-color: #22D3EE; }
+.cloud-backup-option-main { min-width: 0; display: grid; gap: 4px; }
+.cloud-backup-option-main strong { overflow: hidden; color: #E2E8F0; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.cloud-backup-option-main small { color: #94A3B8; font-size: 11px; }
+.cloud-backup-option-main em { width: fit-content; padding: 2px 6px; border: 1px solid #155E75; border-radius: 4px; color: #A5F3FC; background: #0C1B2A; font-size: 10px; font-style: normal; }
+.cloud-backup-picker-note { margin: 0; color: #64748B; font-size: 11px; line-height: 1.55; }
 .settings-baidu-auth { display: grid; gap: 9px; padding: 13px; border: 1px solid #1E5B70; border-radius: 8px; background: #0C1B2A; }
 .settings-baidu-auth strong { color: #CFFAFE; font-size: 13px; }
 .settings-baidu-auth small { color: #94A3B8; font-size: 11px; line-height: 1.5; }
@@ -2923,6 +2937,10 @@ select.input {
   .settings-model-tags span, .settings-key-tags span { border-color: var(--m-line); background: #1b2832; color: var(--m-mint); }
   .settings-sync-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
   .settings-sync-actions .btn-primary { grid-column: 1 / -1; }
+  .cloud-backup-picker { width: 100%; max-width: none; }
+  .cloud-backup-picker-body { padding: 14px; }
+  .cloud-backup-list { max-height: 52dvh; }
+  .cloud-backup-option { padding: 12px; }
   .usage-filter-bar, .usage-date-controls { align-items: stretch; flex-direction: column; }
   .usage-range-checks { width: 100%; }
   .usage-range-checks button { flex: 1; }

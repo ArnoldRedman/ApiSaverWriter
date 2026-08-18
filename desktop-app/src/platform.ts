@@ -7,6 +7,15 @@ type InvokeArgs = Record<string, unknown> | undefined;
 type MobileParams = Record<string, unknown>;
 type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 type MobileUsage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedInputTokens: number; cacheWriteTokens: number; reasoningTokens: number; requests: number; startedAt: string };
+type CloudBackupFile = {
+  name: string;
+  path: string;
+  fsId?: string;
+  size: number;
+  modifiedAt: string;
+  isBundle: boolean;
+  source: 'bundle';
+};
 type MobileQianyueSource = {
   bookSourceName?: string;
   bookSourceUrl?: string;
@@ -305,6 +314,28 @@ const mobileBaiduCompleteLogin = async (value: string) => {
 
 const mobileBaiduForm = (fields: Record<string, string>) => Object.entries(fields).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join('&');
 
+const mobileCloudDirectory = (remotePath: string) => {
+  const path = remotePath.trim().replace(/^\/+|\/+$/gu, '');
+  if (!path || path.includes('..') || path.includes('\0') || path.includes('\\') || path.startsWith('.') || path.startsWith('~') || /^[A-Za-z]:/u.test(path)) {
+    throw new Error('云端路径无效，只能使用 /apps/bdpan/ 下的相对路径。');
+  }
+  return { path, directory: `/apps/bdpan/${path}` };
+};
+
+const mobileCloudBackupPath = (remotePath: string, backupPath: string) => {
+  const { path, directory } = mobileCloudDirectory(remotePath);
+  const normalized = backupPath.trim().replace(/\\/gu, '/').replace(/^\/+|\/+$/gu, '');
+  const relative = normalized.startsWith('apps/bdpan/') ? normalized.slice('apps/bdpan/'.length) : normalized;
+  if (!relative || relative.includes('..') || !relative.toLowerCase().endsWith('.aswbackup')) {
+    throw new Error('所选云端文件不是有效的 ApiSaverWriter 备份包。');
+  }
+  const expectedPrefix = `${path}/`;
+  if (!relative.startsWith(expectedPrefix) || relative.slice(expectedPrefix.length).includes('/')) {
+    throw new Error('所选备份文件不在当前云端备份目录中。');
+  }
+  return { relative, fullPath: `${directory}/${relative.slice(expectedPrefix.length)}` };
+};
+
 const mobileBaiduEnsureDirectory = async (remotePath: string) => {
   const segments = remotePath.split('/').filter(Boolean);
   let current = '/apps/bdpan';
@@ -402,24 +433,61 @@ const mobileBaiduDownloadBytes = async (fetcher: typeof globalThis.fetch, url: s
   return concatBytes(chunks);
 };
 
-const mobileBaiduDownload = async (remotePath: string) => {
-  const directory = `/apps/bdpan/${remotePath}`;
-  const searchURL = mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', { method: 'search', openapi: 'xpansdk', access_token: mobileBaiduToken(), dir: directory, key: baiduBackupName, recursion: '0', page: '1', num: '20', web: '1' });
+const mobileBaiduListBackups = async (remotePath: string): Promise<{ files: CloudBackupFile[] }> => {
+  const status = await mobileBaiduStatus();
+  if (!status.authenticated) throw new Error('请先登录百度网盘，再查看云端备份。');
+  const { path, directory } = mobileCloudDirectory(remotePath);
+  const listURL = mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/file', {
+    method: 'list', openapi: 'xpansdk', access_token: mobileBaiduToken(), dir: directory,
+    order: 'time', desc: '1', start: '0', limit: '1000', web: '1',
+  });
   const fetcher = await httpFetch();
-  const searchResponse = await fetcher(searchURL);
-  const searchText = await searchResponse.text();
-  if (!searchResponse.ok) throw new Error(`百度网盘搜索失败（${searchResponse.status}）`);
-  const searchData = JSON.parse(searchText) as { errno?: number; error_msg?: string; list?: Array<{ path?: string; fs_id?: number | string }> };
-  if (Number(searchData.errno || 0) !== 0) throw new Error(`百度网盘搜索失败：${searchData.error_msg || `errno ${searchData.errno}`}`);
-  const match = searchData.list?.find(item => item.path === `${directory}/${baiduBackupName}`) || searchData.list?.[0];
-  const fsId = match?.fs_id;
-  if (!match || fsId === undefined || fsId === null) throw new Error('没有找到云端完整备份文件。');
+  const response = await fetcher(listURL);
+  const responseText = await response.text();
+  if (!response.ok) throw new Error(`百度网盘备份列表加载失败（${response.status}）`);
+  const data = JSON.parse(responseText) as {
+    errno?: number;
+    error_msg?: string;
+    list?: Array<{ path?: string; server_filename?: string; fs_id?: number | string; size?: number; isdir?: number | boolean; server_mtime?: number | string; local_mtime?: number | string }>;
+  };
+  if (Number(data.errno || 0) !== 0) throw new Error(`百度网盘备份列表加载失败：${data.error_msg || `errno ${data.errno}`}`);
+  const files = (data.list || []).flatMap((item): CloudBackupFile[] => {
+    const name = stringValue(item.server_filename) || stringValue(item.path).split('/').pop() || '';
+    const itemPath = stringValue(item.path);
+    if (!name.toLowerCase().endsWith('.aswbackup') || Boolean(item.isdir) || !itemPath.startsWith(`${directory}/`)) return [];
+    const rawTime = item.server_mtime ?? item.local_mtime;
+    const numericTime = Number(rawTime);
+    const modifiedAt = typeof rawTime === 'string' && /[T:-]/u.test(rawTime)
+      ? rawTime
+      : numericTime > 0 ? new Date(numericTime * 1000).toISOString() : '';
+    return [{
+      name,
+      path: `${path}/${name}`,
+      fsId: item.fs_id === undefined || item.fs_id === null ? undefined : String(item.fs_id),
+      size: Number(item.size) || 0,
+      modifiedAt,
+      isBundle: true,
+      source: 'bundle',
+    }];
+  }).sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt));
+  return { files };
+};
+
+const mobileBaiduDownload = async (remotePath: string, backupPath: string, backupFsId?: string) => {
+  const selected = mobileCloudBackupPath(remotePath, backupPath);
+  let fsId = backupFsId?.trim();
+  if (!fsId) {
+    const listed = await mobileBaiduListBackups(remotePath);
+    fsId = listed.files.find(file => file.path === selected.relative)?.fsId;
+  }
+  if (!fsId) throw new Error('所选备份文件已不存在，请刷新备份列表后重试。');
   // filemetas expects a JSON array of numeric IDs. Keep the original decimal
   // string to avoid JavaScript precision loss for large Baidu fs_id values.
   const fsids = /^\d+$/u.test(String(fsId)) ? `[${String(fsId)}]` : JSON.stringify([String(fsId)]);
   const meta = await mobileBaiduRequest<{ list?: Array<{ dlink?: string }>}>(mobileBaiduURL('https://pan.baidu.com/rest/2.0/xpan/multimedia', { method: 'filemetas', openapi: 'xpansdk', access_token: mobileBaiduToken(), fsids, dlink: '1', extra: '1' }));
   const dlink = stringValue(meta.list?.[0]?.dlink);
   if (!dlink) throw new Error('百度网盘没有返回备份下载地址。');
+  const fetcher = await httpFetch();
   const dlinkURL = `${dlink}${dlink.includes('?') ? '&' : '?'}access_token=${encodeURIComponent(mobileBaiduToken())}`;
   let bytes: Uint8Array;
   try {
@@ -427,7 +495,7 @@ const mobileBaiduDownload = async (remotePath: string) => {
   } catch (primaryError) {
     emitCloudProgress('主下载地址无响应，正在切换备用下载通道...');
     const fallbackURL = mobileBaiduURL('https://d.pcs.baidu.com/rest/2.0/pcs/file', {
-      method: 'download', openapi: 'xpansdk', access_token: mobileBaiduToken(), path: `${directory}/${baiduBackupName}`,
+      method: 'download', openapi: 'xpansdk', access_token: mobileBaiduToken(), path: selected.fullPath,
     });
     try {
       bytes = await mobileBaiduDownloadBytes(fetcher, fallbackURL, '百度网盘备用下载');
@@ -451,12 +519,12 @@ const mobileBaiduBackup = async (remotePath: string, clientState: Record<string,
   return { remotePath: path, remoteFile, size: bundle.byteLength, scope: 'projects, books, dismantles, rankings, styles, client-state' };
 };
 
-const mobileBaiduRestore = async (remotePath: string) => {
+const mobileBaiduRestore = async (remotePath: string, backupPath: string, backupFsId?: string) => {
   const status = await mobileBaiduStatus();
   if (!status.authenticated) throw new Error('请先登录百度网盘，再开始恢复。');
-  const path = remotePath.trim().replace(/^\/+|\/+$/gu, '');
-  if (!path || path.includes('..')) throw new Error('云端路径无效，只能使用 /apps/bdpan/ 下的相对路径。');
-  const result = await mobileBaiduDownload(path);
+  const { path } = mobileCloudDirectory(remotePath);
+  if (!backupPath.trim()) throw new Error('请先选择要恢复的云端备份文件。');
+  const result = await mobileBaiduDownload(path, backupPath, backupFsId);
   emitCloudProgress('完整备份已下载，正在恢复本机数据。');
   return result;
 };
@@ -576,9 +644,141 @@ const normalizeMobileMemoryResult = (value: Record<string, unknown>, rawContent:
   };
 };
 
+const mobilePromptByteLength = (value: string) => new TextEncoder().encode(value).byteLength;
+const mobilePromptWhitespace = (value: unknown) => String(value ?? '')
+  .replace(/\r\n?/gu, '\n')
+  .split('\n')
+  .map(line => line.trim().replace(/[ \t]{2,}/gu, ' '))
+  .join('\n')
+  .replace(/\n{3,}/gu, '\n\n')
+  .trim();
+
+const mobileSliceToBytes = (value: string, maxBytes: number) => {
+  if (mobilePromptByteLength(value) <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (mobilePromptByteLength(value.slice(0, middle)) <= maxBytes) low = middle;
+    else high = middle - 1;
+  }
+  return value.slice(0, low);
+};
+
+const mobileCompactPromptText = (value: unknown, maxBytes: number) => {
+  const text = mobilePromptWhitespace(value);
+  if (!text || maxBytes <= 0 || mobilePromptByteLength(text) <= maxBytes) return text;
+  const marker = '\n...[已按相关性与预算裁剪]...\n';
+  const available = Math.max(0, maxBytes - mobilePromptByteLength(marker));
+  const head = mobileSliceToBytes(text, Math.floor(available * 0.62));
+  const tailCharacters = Array.from(text).reverse().join('');
+  const tail = Array.from(mobileSliceToBytes(tailCharacters, Math.max(0, available - mobilePromptByteLength(head)))).reverse().join('');
+  return `${head}${marker}${tail}`;
+};
+
+const mobileMemorySystemPrompt = `你是长篇小说的记忆编辑。只从章节正文与给定的相关资料抽取明确事实，不补写未发生的剧情。
+
+输出必须是严格 JSON 对象，不要代码围栏或解释。摘要应简短、可检索、包含事件推进、人物状态和未解决线索。实体与关系必须有正文依据；卡片只在状态确有变化且正文能证明时更新。`;
+
+const mobileKnowledgeGraphSummary = (value: unknown, query: string, maxBytes = 2400) => {
+  if (!value || typeof value !== 'object') return '';
+  const graph = value as Record<string, unknown>;
+  const nodes = Array.isArray(graph.nodes) ? graph.nodes.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>> : [];
+  const edges = Array.isArray(graph.edges) ? graph.edges.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>> : [];
+  const queryText = query.toLocaleLowerCase();
+  const selectedIds = new Set(nodes.filter(node => {
+    const label = stringValue(node.label).trim();
+    return Boolean(label) && queryText.includes(label.toLocaleLowerCase());
+  }).map(node => String(node.id || '')));
+  edges.forEach(edge => {
+    const source = String(edge.source || '');
+    const target = String(edge.target || '');
+    if (selectedIds.has(source) || selectedIds.has(target)) {
+      selectedIds.add(source);
+      selectedIds.add(target);
+    }
+  });
+  const selectedNodes = nodes.filter(node => selectedIds.has(String(node.id || ''))).slice(0, 30);
+  const selectedEdges = edges.filter(edge => selectedIds.has(String(edge.source || '')) && selectedIds.has(String(edge.target || ''))).slice(0, 60);
+  if (!selectedNodes.length && !selectedEdges.length) return '';
+  const labels = new Map(selectedNodes.map(node => [String(node.id || ''), stringValue(node.label, String(node.id || '实体'))]));
+  const lines = [
+    ...selectedNodes.map(node => `实体：${stringValue(node.label, '未命名')}（${stringValue(node.category || node.type, '实体')}）`),
+    ...selectedEdges.map(edge => `关系：${labels.get(String(edge.source || '')) || String(edge.source || '')} -[${stringValue(edge.label, '关联')}]-> ${labels.get(String(edge.target || '')) || String(edge.target || '')}（权重 ${Number(edge.weight) || 0.7}）`),
+  ];
+  return mobileCompactPromptText(lines.join('\n'), maxBytes);
+};
+
+const mobileMemoryMessages = (params: MobileParams): ChatMessage[] => {
+  const projectTitle = stringValue(params.projectTitle, '未命名小说');
+  const chapterTitle = stringValue(params.chapterTitle, '未命名章节');
+  const content = stringValue(params.content);
+  const contextWindowKB = Math.max(16, Number(params.contextWindow) || 128);
+  const chapterBudget = Math.min(20 * 1024, Math.max(8 * 1024, Math.floor(contextWindowKB * 1024 * 0.16)));
+  const chapterContent = mobileCompactPromptText(content, chapterBudget);
+  const cards = Array.isArray(params.cards)
+    ? params.cards.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>
+    : [];
+  const relevantCards = cards.filter(card => {
+    const title = stringValue(card.title).trim();
+    return Boolean(title) && content.includes(title);
+  }).slice(0, 10);
+  const cardContext = relevantCards.length
+    ? `\n## 正文命中的卡片（仅可更新这些卡片）\n${relevantCards.map(card => {
+      const history = Array.isArray(card.stateHistory)
+        ? card.stateHistory.slice(-2).map(item => item && typeof item === 'object' ? mobileCompactPromptText((item as Record<string, unknown>).changes, 180) : '').filter(Boolean).join('；')
+        : '';
+      return `${String(card.id || '')} | ${mobileCompactPromptText(card.title || '卡片', 100)}\n当前状态：${mobileCompactPromptText(card.currentState || '暂无', 360)}${history ? `\n近期变化：${history}` : ''}\n知识：${mobileCompactPromptText(card.content || '', 720)}`;
+    }).join('\n\n')}`
+    : '';
+  const graphSummary = mobileKnowledgeGraphSummary(params.knowledgeGraph, `${chapterTitle}\n${chapterContent}\n${relevantCards.map(card => stringValue(card.title)).join(' ')}`);
+  const graphContext = graphSummary ? `\n## 相关知识图谱（用于增量更新）\n${graphSummary}` : '';
+  const prompt = `请为《${projectTitle}》的${chapterTitle}整理可检索的结构化章节记忆，并从正文抽取有证据的实体、关系和卡片变化。
+
+## 本章正文
+${chapterContent}${cardContext}${graphContext}
+
+返回 JSON：
+{
+  "summary": "180 字以内的事件、人物状态和未解决线索",
+  "keywords": ["最多 8 个关键词"],
+  "characterStateChanges": ["角色名：本章结束时的位置、身体、情绪、能力、关系或目标状态变化"],
+  "knowledgeChanges": ["角色名：本章新得知、确认、误解或仍被隐瞒的信息"],
+  "foreshadowingChanges": ["已有伏笔的新增进展，或本章新埋且后续可回收的明确线索"],
+  "foreshadowingItems": [{"text":"伏笔内容","status":"active|progressing|resolved|overdue","priority":"high|normal|low","plantedChapter":1,"targetChapter":5}],
+  "timelineEvents": ["按发生顺序记录的关键事件"],
+  "canonFacts": ["后续写作必须遵守且本章已确认的设定事实"],
+  "conflicts": ["冲突双方、起因、本章结果与尚未解决部分"],
+  "endingHook": "章末最后一个未解决事项或下一章必须承接的钩子",
+  "entities": [{"name":"实体","type":"人物|物品|地点|势力|事件|设定"}],
+  "relations": [{"source":"实体","target":"实体","label":"关系","weight":0.7}],
+  "cardUpdates": [{"cardId":"卡片 ID","cardTitle":"卡片名称","status":"changed|acquired|lost|revealed|updated","changes":"有正文依据的变化"}]
+}
+
+分类必须互不混写：人物状态只写角色自身状态；角色认知必须明确写谁知道什么；伏笔只写可在后文回收的线索；冲突必须写双方和当前结果。正文明确存在相关事实时不得遗漏；确实不存在时使用空数组，不要用“暂无”“待补充”凑数。关系 weight 为 0.1 到 1.0 的正文证据强度：明确行动、身份、持有或状态变化为 0.85 以上；直接提及为 0.65 至 0.8；推断性弱关联不超过 0.6。实体不超过 30 个，关系不超过 60 条。`;
+  return [
+    { role: 'system', content: mobileMemorySystemPrompt },
+    { role: 'user', content: prompt },
+  ];
+};
+
 const emitProgress = (runId: string, payload: Record<string, unknown>) => {
   if (!runId) return;
   window.dispatchEvent(new CustomEvent('agent-progress', { detail: { ...payload, runId } }));
+};
+
+const mobileResponseText = (value: unknown, depth = 0): string => {
+  if (depth > 5 || value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value.map(item => mobileResponseText(item, depth + 1)).join('');
+  if (typeof value !== 'object') return '';
+  const item = value as Record<string, unknown>;
+  if (typeof item.text === 'string') return item.text;
+  if (typeof item.output_text === 'string') return item.output_text;
+  if (typeof item.content === 'string') return item.content;
+  return mobileResponseText(item.content, depth + 1)
+    || mobileResponseText(item.output, depth + 1)
+    || mobileResponseText(item.message, depth + 1);
 };
 
 async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk?: (chunk: string) => void, jsonMode = false): Promise<{ content: string; usage?: unknown }> {
@@ -590,18 +790,20 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const base = baseURL(params.baseURL);
   let endpoint = `${base}/chat/completions`;
   let body: Record<string, unknown>;
-  const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
+  const maxTokens = jsonMode ? 1300 : 6000;
+  const temperature = jsonMode ? 0.2 : 0.7;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: onChunk ? 'text/event-stream' : 'application/json' };
   if (apiMode === 'responses') {
     endpoint = `${base}/responses`;
-    body = { model, input: messages.map(message => ({ role: message.role, content: message.content })), max_output_tokens: 6000, stream: true };
+    body = { model, input: messages.map(message => ({ role: message.role, content: message.content })), max_output_tokens: maxTokens, temperature, stream: Boolean(onChunk) };
     headers.Authorization = `Bearer ${key}`;
   } else if (apiMode === 'anthropic') {
     endpoint = `${base}/messages`;
-    body = { model, system: messages.filter(message => message.role === 'system').map(message => message.content).join('\n\n'), messages: messages.filter(message => message.role !== 'system'), max_tokens: 6000 };
+    body = { model, system: messages.filter(message => message.role === 'system').map(message => message.content).join('\n\n'), messages: messages.filter(message => message.role !== 'system'), max_tokens: maxTokens, temperature };
     headers['x-api-key'] = key;
     headers['anthropic-version'] = '2023-06-01';
   } else {
-    body = { model, messages, temperature: 0.7, max_tokens: 6000, stream: Boolean(onChunk), stream_options: { include_usage: true }, ...(jsonMode ? { response_format: { type: 'json_object' } } : {}) };
+    body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk ? { stream_options: { include_usage: true } } : {}), ...(jsonMode ? { response_format: { type: 'json_object' } } : {}) };
     headers.Authorization = `Bearer ${key}`;
   }
   const response = await fetcher(endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
@@ -616,21 +818,10 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
     const data = await response.json() as Record<string, unknown>;
     const choices = Array.isArray(data.choices) ? data.choices as Array<Record<string, unknown>> : [];
     const message = choices[0]?.message as Record<string, unknown> | undefined;
-    const messageContent = message?.content;
-    const content = typeof messageContent === 'string'
-      ? messageContent
-      : Array.isArray(messageContent)
-        ? messageContent.map(item => {
-          if (typeof item === 'string') return item;
-          if (!item || typeof item !== 'object') return '';
-          const part = item as Record<string, unknown>;
-          return stringValue(part.text || part.content);
-        }).join('')
-        : typeof data.output_text === 'string'
-          ? data.output_text
-          : Array.isArray(data.content)
-            ? (data.content as Array<Record<string, unknown>>).map(item => stringValue(item.text || item.content)).join('')
-            : '';
+    const content = mobileResponseText(message?.content)
+      || mobileResponseText(data.output_text)
+      || mobileResponseText(data.content)
+      || mobileResponseText(data.output);
     recordUsage(data.usage);
     return { content, usage: data.usage };
   }
@@ -1182,7 +1373,9 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   }
   const runId = stringValue(params.runId);
   emitProgress(runId, { type: 'step', step: 'writing', progress: 8, message: '移动端已连接模型，正在整理上下文' });
-  const agentMessages: ChatMessage[] = [{ role: 'system', content: '系统固定规则：保持设定一致、遵守用户输出格式、不要泄露密钥。' }, { role: 'user', content: promptFor(method, params) }];
+  const agentMessages: ChatMessage[] = method === 'memory.write'
+    ? mobileMemoryMessages(params)
+    : [{ role: 'system', content: '系统固定规则：保持设定一致、遵守用户输出格式、不要泄露密钥。' }, { role: 'user', content: promptFor(method, params) }];
   const onAgentChunk = (chunk: string) => {
     emitProgress(runId, { type: 'chunk', data: { text: chunk } });
   };
@@ -1229,9 +1422,13 @@ export const invoke = async <T>(command: string, args?: InvokeArgs): Promise<T> 
     const input = args as { remotePath?: string; clientState?: Record<string, string | null> } | undefined;
     return mobileBaiduBackup(stringValue(input?.remotePath), input?.clientState || {}) as T;
   }
-  if (command === 'restore_projects_from_baidu') {
+  if (command === 'list_baidu_backups') {
     const input = args as { remotePath?: string } | undefined;
-    return mobileBaiduRestore(stringValue(input?.remotePath)) as T;
+    return mobileBaiduListBackups(stringValue(input?.remotePath)) as T;
+  }
+  if (command === 'restore_projects_from_baidu') {
+    const input = args as { remotePath?: string; backupPath?: string; backupFsId?: string } | undefined;
+    return mobileBaiduRestore(stringValue(input?.remotePath), stringValue(input?.backupPath), stringValue(input?.backupFsId)) as T;
   }
   if (command === 'call_agent_rpc') {
     const input = args as { method?: string; params?: MobileParams } | undefined;

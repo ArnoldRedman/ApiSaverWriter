@@ -240,6 +240,18 @@ fn validate_cloud_path(path: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn validate_cloud_backup_path(remote_path: &str, backup_path: &str) -> Result<String, String> {
+    let base = validate_cloud_path(remote_path)?;
+    let normalized = backup_path.trim().replace('\\', "/").trim_matches('/').to_string();
+    let relative = normalized.strip_prefix("apps/bdpan/").unwrap_or(&normalized);
+    let prefix = format!("{base}/");
+    let file_name = relative.strip_prefix(&prefix).ok_or_else(|| "所选备份文件不在当前云端备份目录中".to_string())?;
+    if file_name.is_empty() || file_name.contains('/') || file_name.contains("..") || !file_name.to_ascii_lowercase().ends_with(".aswbackup") {
+        return Err("所选云端文件不是有效的 ApiSaverWriter 备份包".to_string());
+    }
+    validate_cloud_path(relative)
+}
+
 fn run_bdpan(args: &[&str]) -> Result<String, String> {
     run_bdpan_at(args, None)
 }
@@ -528,14 +540,47 @@ fn backup_projects_to_baidu_blocking(app: tauri::AppHandle, remote_path: String,
 }
 
 #[tauri::command]
-async fn restore_projects_from_baidu(app: tauri::AppHandle, remote_path: String) -> Result<Value, String> {
+fn list_baidu_backups(remote_path: String) -> Result<Value, String> {
+    let remote_path = validate_cloud_path(&remote_path)?;
+    let output = run_bdpan(&["ls", &remote_path, "--json", "--order", "time", "--desc", "--limit", "1000"])?;
+    let parsed: Value = serde_json::from_str(&output).map_err(|error| format!("百度网盘备份列表格式错误: {error}"))?;
+    let entries = parsed.as_array().cloned().or_else(|| parsed.get("list").and_then(Value::as_array).cloned()).unwrap_or_default();
+    let prefix = format!("/apps/bdpan/{remote_path}/");
+    let files = entries.into_iter().filter_map(|entry| {
+        if entry.get("isdir").and_then(Value::as_bool).unwrap_or(false) || entry.get("isdir").and_then(Value::as_i64).unwrap_or(0) != 0 {
+            return None;
+        }
+        let path = entry.get("path").and_then(Value::as_str).unwrap_or_default();
+        let name = entry.get("server_filename").and_then(Value::as_str)
+            .or_else(|| entry.get("name").and_then(Value::as_str))
+            .or_else(|| path.rsplit('/').next())
+            .unwrap_or_default();
+        if !path.starts_with(&prefix) || path[prefix.len()..].contains('/') || !name.to_ascii_lowercase().ends_with(".aswbackup") {
+            return None;
+        }
+        let relative_path = format!("{remote_path}/{name}");
+        Some(serde_json::json!({
+            "name": name,
+            "path": relative_path,
+            "fsId": entry.get("fs_id").map(|value| value.to_string().trim_matches('"').to_string()),
+            "size": entry.get("size").and_then(Value::as_u64).unwrap_or(0),
+            "modifiedAt": entry.get("server_mtime").and_then(Value::as_str).or_else(|| entry.get("server_ctime").and_then(Value::as_str)).unwrap_or_default(),
+            "isBundle": true,
+            "source": "bundle"
+        }))
+    }).collect::<Vec<_>>();
+    Ok(serde_json::json!({ "files": files }))
+}
+
+#[tauri::command]
+async fn restore_projects_from_baidu(app: tauri::AppHandle, remote_path: String, backup_path: Option<String>, backup_fs_id: Option<String>) -> Result<Value, String> {
     let handle = app.clone();
-    tauri::async_runtime::spawn_blocking(move || restore_projects_from_baidu_blocking(handle, remote_path))
+    tauri::async_runtime::spawn_blocking(move || restore_projects_from_baidu_blocking(handle, remote_path, backup_path, backup_fs_id))
         .await
         .map_err(|error| format!("云端恢复任务中断: {error}"))?
 }
 
-fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: String) -> Result<Value, String> {
+fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: String, backup_path: Option<String>, _backup_fs_id: Option<String>) -> Result<Value, String> {
     let remote_path = validate_cloud_path(&remote_path)?;
     let app_data = app_data_directory(&app)?;
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "download", "message": "正在后台下载完整应用备份..." }));
@@ -544,7 +589,11 @@ fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: Stri
         fs::remove_dir_all(&restore_root).map_err(|error| format!("清理上次恢复缓存失败: {error}"))?;
     }
     fs::create_dir_all(&restore_root).map_err(|error| format!("创建恢复缓存失败: {error}"))?;
-    let remote_bundle = format!("{remote_path}/{CLOUD_BACKUP_BUNDLE_NAME}");
+    let selected_bundle = backup_path.as_deref().map(|path| validate_cloud_backup_path(&remote_path, path)).transpose()?;
+    if backup_path.is_some() && selected_bundle.is_none() {
+        return Err("请先选择要恢复的云端备份文件".to_string());
+    }
+    let remote_bundle = selected_bundle.clone().unwrap_or_else(|| format!("{remote_path}/{CLOUD_BACKUP_BUNDLE_NAME}"));
     let local_bundle = restore_root.join(CLOUD_BACKUP_BUNDLE_NAME);
     let local_bundle_text = format!(".cloud-restore/{CLOUD_BACKUP_BUNDLE_NAME}");
     let (output, export_root) = match run_bdpan_at(&["download", &remote_bundle, &local_bundle_text], Some(&app_data)) {
@@ -553,13 +602,14 @@ fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: Stri
             extract_cloud_backup_bundle(&local_bundle, &export_root)?;
             (output, export_root)
         }
-        Err(bundle_error) => {
+        Err(bundle_error) if backup_path.is_none() => {
             let output = run_bdpan_at(&["download", &remote_path, "cloud-restore"], Some(&app_data))
                 .map_err(|legacy_error| format!("下载完整备份包失败: {bundle_error}\n兼容旧版目录备份也失败: {legacy_error}"))?;
             let export_root = find_cloud_export(&restore_root, 4)
                 .ok_or_else(|| "云端下载完成，但没有找到完整应用备份。请确认云端目录包含有效备份。".to_string())?;
             (output, export_root)
         }
+        Err(bundle_error) => return Err(format!("下载所选备份包失败: {bundle_error}")),
     };
     let client_state: Value = serde_json::from_str(&fs::read_to_string(export_root.join("client-state.json")).map_err(|error| format!("读取云端设置失败: {error}"))?)
         .map_err(|error| format!("云端设置格式错误: {error}"))?;
@@ -567,7 +617,7 @@ fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: Stri
     replace_cloud_data(&app_data, &export_root)?;
     fs::remove_dir_all(&restore_root).ok();
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "done", "message": "完整应用数据已恢复，正在重新载入。" }));
-    Ok(serde_json::json!({ "remotePath": remote_path, "message": output, "reloaded": true, "clientState": client_state }))
+    Ok(serde_json::json!({ "remotePath": remote_path, "backupPath": remote_bundle, "message": output, "reloaded": true, "clientState": client_state }))
 }
 
 #[tauri::command]
@@ -1673,6 +1723,20 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn selected_cloud_backup_must_stay_in_configured_directory() {
+        assert_eq!(
+            validate_cloud_backup_path(
+                "ApiSaverWriter/backup",
+                "/apps/bdpan/ApiSaverWriter/backup/ApiSaverWriter-backup-2026-08-18.aswbackup"
+            ).unwrap(),
+            "ApiSaverWriter/backup/ApiSaverWriter-backup-2026-08-18.aswbackup"
+        );
+        assert!(validate_cloud_backup_path("ApiSaverWriter/backup", "ApiSaverWriter/other/backup.aswbackup").is_err());
+        assert!(validate_cloud_backup_path("ApiSaverWriter/backup", "ApiSaverWriter/backup/../secret.aswbackup").is_err());
+        assert!(validate_cloud_backup_path("ApiSaverWriter/backup", "ApiSaverWriter/backup/client-state.json").is_err());
+    }
+
+    #[test]
     fn cloud_backup_bundle_round_trip_supports_novel_paths() {
         let root = std::env::temp_dir().join(format!(
             "apisaverwriter-backup-test-{}",
@@ -1769,6 +1833,7 @@ pub fn run() {
             baidu_login_url,
             complete_baidu_login,
             backup_projects_to_baidu,
+            list_baidu_backups,
             restore_projects_from_baidu,
             load_projects,
             save_projects,
