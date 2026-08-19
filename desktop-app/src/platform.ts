@@ -54,8 +54,9 @@ const memoryList = (value: unknown, limit = 40): string[] => {
 };
 const isQuotaExceeded = (value: string) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/iu.test(value);
 const baseURL = (value: unknown) => {
-  const raw = stringValue(value, 'https://api.apisaver.com/v1').trim().replace(/\/+$/u, '').replace(/\/(?:chat\/completions|responses|messages)$/iu, '');
-  return raw.endsWith('/v1') ? raw : `${raw}/v1`;
+  // Mobile clients use the managed ApiSaver gateway only. Ignore legacy
+  // custom values restored from older app versions.
+  return 'https://api.apisaver.com/v1';
 };
 
 const usageKey = 'writer-mobile-usage';
@@ -785,8 +786,8 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const fetcher = await httpFetch();
   const apiMode = stringValue(params.apiMode, 'openai');
   const model = stringValue(params.model, 'gpt-4o-mini');
-  const key = stringValue(params.apiKey).trim() || arrayStrings(params.apiKeys)[0] || '';
-  if (!key) throw new Error('请先在设置中填写 API Key。');
+  const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+  if (!keys.length) throw new Error('请先在设置中填写 API Key。');
   const base = baseURL(params.baseURL);
   let endpoint = `${base}/chat/completions`;
   let body: Record<string, unknown>;
@@ -796,17 +797,33 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   if (apiMode === 'responses') {
     endpoint = `${base}/responses`;
     body = { model, input: messages.map(message => ({ role: message.role, content: message.content })), max_output_tokens: maxTokens, temperature, stream: Boolean(onChunk) };
-    headers.Authorization = `Bearer ${key}`;
+    headers.Authorization = `Bearer ${keys[0]}`;
   } else if (apiMode === 'anthropic') {
     endpoint = `${base}/messages`;
     body = { model, system: messages.filter(message => message.role === 'system').map(message => message.content).join('\n\n'), messages: messages.filter(message => message.role !== 'system'), max_tokens: maxTokens, temperature };
-    headers['x-api-key'] = key;
+    headers['x-api-key'] = keys[0];
     headers['anthropic-version'] = '2023-06-01';
   } else {
     body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk ? { stream_options: { include_usage: true } } : {}), ...(jsonMode ? { response_format: { type: 'json_object' } } : {}) };
-    headers.Authorization = `Bearer ${key}`;
+    headers.Authorization = `Bearer ${keys[0]}`;
   }
-  const response = await fetcher(endpoint, { method: 'POST', headers, body: JSON.stringify(body) });
+  let response: Response | null = null;
+  let lastError = '';
+  for (const key of keys) {
+    const requestHeaders = { ...headers };
+    if (apiMode === 'anthropic') requestHeaders['x-api-key'] = key;
+    else requestHeaders.Authorization = `Bearer ${key}`;
+    const candidate = await fetcher(endpoint, { method: 'POST', headers: requestHeaders, body: JSON.stringify(body) });
+    if (candidate.ok) {
+      response = candidate;
+      break;
+    }
+    const detail = (await candidate.text()).replace(/\s+/gu, ' ').slice(0, 220);
+    lastError = `模型接口返回 ${candidate.status}：${detail}`;
+    // A key may be out of quota or lack this model while another configured
+    // key remains usable. Continue through the configured key pool.
+  }
+  if (!response) throw new Error(lastError || '所有 API Key 请求均失败。');
   if (!response.ok) {
     const detail = (await response.text()).replace(/\s+/gu, ' ').slice(0, 220);
     if (isQuotaExceeded(detail)) {
@@ -1361,10 +1378,16 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     return { sources: [{ id: 'fanqie', name: '番茄小说' }, ...mobileQianyueSources.map(source => ({ id: source.id, name: source.name }))], defaultSourceId: mobileQianyueSources[0]?.id || 'fanqie' } as T;
   }
   if (method === 'models.list') {
-    const response = await fetcher(`${baseURL(params.baseURL)}/models`, { headers: { Authorization: `Bearer ${stringValue(params.apiKey)}`, Accept: 'application/json' } });
-    if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）`);
-    const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
-    const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
+    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+    if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+    const responses = await Promise.allSettled(keys.map(async key => {
+      const response = await fetcher(`${baseURL(params.baseURL)}/models`, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' } });
+      if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）`);
+      const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
+      return (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
+    }));
+    const models = Array.from(new Set(responses.flatMap(result => result.status === 'fulfilled' ? result.value : [])));
+    if (!models.length) throw new Error('所有 API Key 拉取模型失败');
     return { models } as T;
   }
   if (method === 'models.test') {

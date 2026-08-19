@@ -617,15 +617,17 @@ const deviceBackedStateKeys = new Set([
 ]);
 const normalizeAgentConfig = (value: unknown): AgentConfig => {
   const parsed = value && typeof value === 'object' ? value as Partial<AgentConfig> & Record<string, unknown> : {};
-  const storedBaseURL = typeof parsed.baseURL === 'string' ? parsed.baseURL : '';
-  const apiKeys = Array.isArray(parsed.apiKeys)
-    ? parsed.apiKeys.filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())
-    : (typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? [parsed.apiKey.trim()] : []);
+  const apiKeys = Array.from(new Set([
+    typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
+    ...(Array.isArray(parsed.apiKeys) ? parsed.apiKeys : []),
+  ].filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())));
   return {
     serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : '帅apiGPT0.06',
     enabled: parsed.enabled !== false,
     apiMode: parsed.apiMode === 'responses' || parsed.apiMode === 'anthropic' ? parsed.apiMode : 'openai',
-    baseURL: !storedBaseURL || /api\.shuaiapi\.com/iu.test(storedBaseURL) ? defaultBaseURL : storedBaseURL,
+    // ApiSaverWriter uses one managed gateway. Keep legacy/custom values from
+    // leaking into requests or making the settings UI appear configurable.
+    baseURL: defaultBaseURL,
     apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
     apiKeys,
     model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
@@ -1373,7 +1375,7 @@ function App() {
   
   // 编辑器状态
   const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
+  const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
   const [activeOutlineId, setActiveOutlineId] = useState<number | null>(null);
@@ -1865,14 +1867,19 @@ function App() {
         void persistCurrentChapter();
       } else if (event.key.toLowerCase() === 'f') {
         event.preventDefault();
-        setShowSearchPanel(true);
-        setSearchScope('chapter');
+        if (editorSidebarTab === 'search') {
+          setSearchScope('book');
+          setShowSearchPanel(false);
+        } else {
+          setShowSearchPanel(true);
+          setSearchScope('chapter');
+        }
         window.setTimeout(() => searchInputRef.current?.focus(), 0);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [editingProject, activeChapter, chapterSaving]);
+  }, [editingProject, activeChapter, chapterSaving, editorSidebarTab]);
 
   useEffect(() => {
     void loadSkills();
@@ -3045,6 +3052,13 @@ function App() {
 
   const toggleSearchPanel = () => {
     setShowSearchPanel(current => !current);
+    window.setTimeout(() => searchInputRef.current?.focus(), 0);
+  };
+
+  const openProjectSearch = () => {
+    setEditorSidebarTab('search');
+    setSearchScope('book');
+    setShowSearchPanel(false);
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
   };
 
@@ -4350,22 +4364,25 @@ function App() {
   };
 
   const pullModels = async () => {
-    if (!settingsDraft.apiKey.trim()) {
+    const keys = Array.from(new Set([...(settingsDraft.apiKeys || []), settingsDraft.apiKey].map(key => key.trim()).filter(Boolean)));
+    if (!keys.length) {
       setNotice({ title: '需要 API Key', content: '请先填写 API Key，再拉取模型列表。' });
       return;
     }
     setModelsLoading(true);
     try {
       await invoke<string>('start_agent_runtime');
-      const result = await invoke<{ models?: string[] }>('call_agent_rpc', {
+      const responses = await Promise.allSettled(keys.map(apiKey => invoke<{ models?: string[] }>('call_agent_rpc', {
         method: 'models.list',
-        params: { baseURL: settingsDraft.baseURL.trim(), apiKey: settingsDraft.apiKey.trim(), apiKeys: settingsDraft.apiKeys, apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
-      });
-      const models = Array.isArray(result.models) ? result.models.filter((model): model is string => typeof model === 'string' && Boolean(model)) : [];
+        params: { baseURL: defaultBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
+      })));
+      const successful = responses.filter((response): response is PromiseFulfilledResult<{ models?: string[] }> => response.status === 'fulfilled');
+      const models = Array.from(new Set(successful.flatMap(response => Array.isArray(response.value.models) ? response.value.models : []).filter((model): model is string => typeof model === 'string' && Boolean(model))));
       if (models.length === 0) throw new Error('接口没有返回可用模型');
       setFetchedModels(models);
       localStorage.setItem('agent-fetched-models', JSON.stringify(models));
-      setModelListMessage(`已获取 ${models.length} 个模型${settingsDraft.proxyEnabled ? `，请求已通过代理 ${settingsDraft.proxyURL}` : ''}，点击模型即可加入启用列表。`);
+      const failed = responses.length - successful.length;
+      setModelListMessage(`已从 ${successful.length}/${keys.length} 个 Key 获取 ${models.length} 个模型${failed ? `，${failed} 个 Key 请求失败` : ''}${settingsDraft.proxyEnabled ? `，请求已通过代理 ${settingsDraft.proxyURL}` : ''}，勾选模型即可启用。`);
     } catch (error) {
       setModelListMessage(`拉取模型失败：${String(error)}`);
     } finally {
@@ -4387,7 +4404,7 @@ function App() {
         params: {
           apiKey: settingsDraft.apiKey.trim(),
           apiKeys: settingsDraft.apiKeys,
-          baseURL: settingsDraft.baseURL.trim(),
+          baseURL: defaultBaseURL,
           apiMode: settingsDraft.apiMode,
           model: settingsDraft.model.trim() || fallbackModels[0],
           reasoningMode: settingsDraft.reasoningMode,
@@ -4429,6 +4446,13 @@ function App() {
     });
   };
 
+  const setCurrentSettingsModel = (model: string) => {
+    const normalized = model.trim();
+    if (!normalized) return;
+    setSettingsModels(current => current.includes(normalized) ? current : [...current, normalized]);
+    setSettingsDraft(current => ({ ...current, model: normalized }));
+  };
+
   const addCustomModel = () => {
     const model = customModelName.trim();
     if (!model) return;
@@ -4446,10 +4470,11 @@ function App() {
 
   const updatePrimaryApiKey = (apiKey: string) => {
     setSettingsDraft(current => {
-      const keys = current.apiKeys?.length ? [...current.apiKeys] : [];
-      if (keys.length) keys[0] = apiKey;
-      else if (apiKey.trim()) keys.push(apiKey);
-      return { ...current, apiKey, apiKeys: keys };
+      const keys = Array.from(new Set([
+        apiKey.trim(),
+        ...(current.apiKeys || []).slice(1).map(key => key.trim()),
+      ].filter(Boolean)));
+      return { ...current, apiKey: keys[0] || '', apiKeys: keys };
     });
   };
 
@@ -4465,7 +4490,7 @@ function App() {
 
   const removeApiKey = (index: number) => {
     setSettingsDraft(current => {
-      const keys = (current.apiKeys || []).filter((_, itemIndex) => itemIndex !== index);
+      const keys = Array.from(new Set((current.apiKeys || []).filter((_, itemIndex) => itemIndex !== index).map(key => key.trim()).filter(Boolean)));
       return { ...current, apiKey: keys[0] || '', apiKeys: keys };
     });
   };
@@ -4480,16 +4505,17 @@ function App() {
         return;
       }
     }
-    const enabledModels = settingsModels.length ? settingsModels : [settingsDraft.model || fallbackModels[0]];
+    const enabledModels = Array.from(new Set((settingsModels.length ? settingsModels : [settingsDraft.model || fallbackModels[0]]).map(model => model.trim()).filter(Boolean)));
     const selectedModel = enabledModels.includes(settingsDraft.model) ? settingsDraft.model : enabledModels[0];
+    const apiKeys = Array.from(new Set([settingsDraft.apiKey, ...(settingsDraft.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
     setAvailableModels(enabledModels);
     localStorage.setItem('agent-models', JSON.stringify(enabledModels));
     setAgentConfig({
       ...settingsDraft,
       serviceName: settingsDraft.serviceName.trim() || '帅apiGPT0.06',
-      baseURL: settingsDraft.baseURL.trim() || defaultBaseURL,
-      apiKey: (settingsDraft.apiKeys?.[0] || settingsDraft.apiKey).trim(),
-      apiKeys: Array.from(new Set((settingsDraft.apiKeys?.length ? settingsDraft.apiKeys : [settingsDraft.apiKey]).map(key => key.trim()).filter(Boolean))),
+      baseURL: defaultBaseURL,
+      apiKey: apiKeys[0] || '',
+      apiKeys,
       model: selectedModel,
       contextWindow: Math.max(16, Number(settingsDraft.contextWindow) || 128),
     });
@@ -4686,14 +4712,28 @@ function App() {
     if (!target) return;
     const targetIndex = bookSearchMatches.indexOf(target);
     setBookSearchMatchIndex(targetIndex);
+    setEditorSidebarTab('chapters');
     setActiveChapter(target.chapter);
     setSearchMatchIndex(findTextMatches(target.chapter.content, searchQuery).indexOf(target.position));
-    window.requestAnimationFrame(() => {
+    window.setTimeout(() => {
       const editor = chapterEditorRef.current;
       if (!editor) return;
       editor.focus();
       editor.setSelectionRange(target.position, target.position + searchQuery.length);
-    });
+    }, 0);
+  };
+
+  const openBookSearchChapter = (chapter: Chapter, position?: number) => {
+    setEditorSidebarTab('chapters');
+    setActiveChapter(chapter);
+    if (position === undefined) return;
+    setSearchMatchIndex(findTextMatches(chapter.content, searchQuery).indexOf(position));
+    window.setTimeout(() => {
+      const editor = chapterEditorRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.setSelectionRange(position, position + searchQuery.length);
+    }, 0);
   };
   const graphLayout = (() => {
     const nodes = editingProject?.graphNodes ?? [];
@@ -4773,8 +4813,8 @@ function App() {
           <header className="editor-header">
             <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
             <h2>{editingProject.title}</h2>
-            {!outlineMode && !cardMode && !styleMode && <>
-              <button className="editor-tool-button" title="搜索章节与全文" onClick={() => { setShowSearchPanel(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
+            {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && <>
+              <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
               <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
               <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}>{chapterSaving ? '保存中...' : '保存章节'}</button>
@@ -4815,6 +4855,12 @@ function App() {
                   onClick={() => setEditorSidebarTab('chapters')}
                 >
                   章节
+                </button>
+                <button
+                  className={editorSidebarTab === 'search' ? 'active' : ''}
+                  onClick={openProjectSearch}
+                >
+                  剧情搜索
                 </button>
                 <button
                   className={editorSidebarTab === 'outline' ? 'active' : ''}
@@ -5020,7 +5066,42 @@ function App() {
             </aside>
 
             <main className="editor-main">
-              {editorSidebarTab === 'outline' ? (
+              {editorSidebarTab === 'search' ? (
+                <section className="project-search-workspace" aria-label="剧情搜索">
+                  <header className="project-search-header">
+                    <div>
+                      <span>作品资料检索</span>
+                      <h3>剧情搜索</h3>
+                      <p>搜索人物、事件、线索和伏笔，结果按章节归集。</p>
+                    </div>
+                    <small>{editingProject.chapters.length} 章 · {editingProject.wordCount.toLocaleString()} 字</small>
+                  </header>
+                  <div className="project-search-input-row">
+                    <span aria-hidden="true">⌕</span>
+                    <input
+                      ref={searchInputRef}
+                      className="input"
+                      value={searchQuery}
+                      placeholder="搜索人物、事件、伏笔..."
+                      onChange={event => { setSearchQuery(event.target.value); setBookSearchMatchIndex(0); }}
+                      onKeyDown={event => { if (event.key === 'Enter' && bookSearchMatches.length) focusBookSearchMatch(bookSearchMatchIndex); }}
+                    />
+                    {searchQuery && <button className="project-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setSearchQuery('')}>×</button>}
+                  </div>
+                  <div className="project-search-tabs" role="tablist" aria-label="检索方式">
+                    <button className="active" type="button">关键词</button>
+                    <span>覆盖章节标题与正文</span>
+                  </div>
+                  {!searchQuery.trim() ? <div className="project-search-empty"><b>⌕</b><strong>输入关键词后按回车搜索</strong><span>可检索人物、事件、地点、线索与伏笔。</span></div>
+                    : bookSearchResults.length ? <div className="project-search-results">
+                      <div className="project-search-summary"><strong>找到 {bookSearchMatches.length} 处匹配</strong><span>分布在 {bookSearchResults.length} 个章节</span><div><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex - 1)} disabled={!bookSearchMatches.length}>上一个</button><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex + 1)} disabled={!bookSearchMatches.length}>下一个</button></div></div>
+                      {bookSearchResults.map(({ chapter, count, snippets }) => <article className="project-search-result" key={chapter.id}>
+                        <button className="project-search-result-heading" onClick={() => openBookSearchChapter(chapter, snippets[0]?.position)}><div><strong>{chapter.title}</strong><small>{count} 处匹配 · {chapter.wordCount.toLocaleString()} 字</small></div><span>打开章节 ›</span></button>
+                        {snippets.map(snippet => <button className="project-search-snippet" key={`${chapter.id}-${snippet.position}`} onClick={() => openBookSearchChapter(chapter, snippet.position)}>{snippet.text}</button>)}
+                      </article>)}
+                    </div> : <div className="project-search-empty"><b>⌕</b><strong>没有找到“{searchQuery}”</strong><span>试试人物全名、事件关键词或地点名称。</span></div>}
+                </section>
+              ) : editorSidebarTab === 'outline' ? (
                 <section className="outline-workspace">
                   {activeOutline ? <>
                     <div className="outline-workspace-header"><div><span>{activeOutline.kind}</span><input className="outline-title-input" value={activeOutline.title} onChange={event => updateActiveOutline({ title: event.target.value })} placeholder="大纲标题" /><small>Markdown 大纲文档 · 内容会自动保存</small></div><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div>
@@ -5155,20 +5236,11 @@ function App() {
                   {showSearchPanel && (
                     <section className="search-panel" aria-label="搜索与替换">
                       <div className="search-panel-row">
-                        <input ref={searchInputRef} className="input" value={searchQuery} placeholder="搜索本章或全文" onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); setBookSearchMatchIndex(0); }} />
-                        <select className="select" value={searchScope} onChange={event => setSearchScope(event.target.value as 'chapter' | 'book')}><option value="chapter">本章</option><option value="book">全文</option></select>
-                        {searchScope === 'chapter' && <><button className="editor-tool-button" onClick={() => focusSearchMatch(-1)} disabled={!searchQuery}>上一个</button><button className="editor-tool-button" onClick={() => focusSearchMatch(1)} disabled={!searchQuery}>下一个</button></>}
+                        <input ref={searchInputRef} className="input" value={searchQuery} placeholder="搜索本章内容" onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); }} />
+                        <button className="editor-tool-button" onClick={() => focusSearchMatch(-1)} disabled={!searchQuery}>上一个</button><button className="editor-tool-button" onClick={() => focusSearchMatch(1)} disabled={!searchQuery}>下一个</button>
                         <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}>×</button>
                       </div>
-                      {searchScope === 'chapter' ? <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div> : <div className="book-search-results">
-                        {!searchQuery.trim() ? <span>输入关键词搜索整本小说</span> : bookSearchResults.length ? <>
-                          <div className="book-search-summary"><strong>全文检索</strong><span>共 {bookSearchMatches.length} 处，分布在 {bookSearchResults.length} 个章节</span><div><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex - 1)} disabled={!bookSearchMatches.length}>上一个</button><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex + 1)} disabled={!bookSearchMatches.length}>下一个</button></div></div>
-                          {bookSearchResults.map(({ chapter, count, snippets }) => <article className="book-search-result" key={chapter.id}>
-                            <button className="book-search-result-heading" onClick={() => { setActiveChapter(chapter); if (snippets[0]) focusBookSearchMatch(bookSearchMatches.findIndex(item => item.chapter.id === chapter.id && item.position === snippets[0].position)); }}><strong>{chapter.title}</strong><small>{count} 处匹配 · {chapter.wordCount} 字</small></button>
-                            {snippets.map(snippet => <button className="book-search-snippet" key={`${chapter.id}-${snippet.position}`} onClick={() => focusBookSearchMatch(bookSearchMatches.findIndex(item => item.chapter.id === chapter.id && item.position === snippet.position))}>{snippet.text}</button>)}
-                          </article>)}
-                        </> : <span>没有找到匹配章节</span>}
-                      </div>}
+                      <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div>
                     </section>
                   )}
                   <input
@@ -5614,8 +5686,8 @@ function App() {
                     </div>
                   </div>
                   <div className="form-group">
-                    <label>接口地址</label>
-                    <input className="input" value={settingsDraft.baseURL} placeholder={defaultBaseURL} onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
+                    <label>接口地址 <small>固定官方服务</small></label>
+                    <input className="input settings-fixed-address" value={defaultBaseURL} readOnly aria-readonly="true" />
                   </div>
                   <div className="form-group">
                     <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>
@@ -5624,10 +5696,14 @@ function App() {
                     <div className="model-add-row"><input className="input" type="password" value={customApiKey} placeholder="添加备用供应商 Key" onChange={(event) => setCustomApiKey(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addApiKey(); } }} /><button className="btn-secondary" onClick={addApiKey}>添加 Key</button></div>
                   </div>
                   <div className="form-group model-management">
-                    <label>模型标签 <small>当前模型：{settingsDraft.model || '未选择'}</small></label>
+                    <label>模型标签 <small>可多选 · 当前模型：{settingsDraft.model || '未选择'}</small></label>
                     <div className="settings-model-tags">
-                      {settingsModels.map(model => <button key={model} className={`settings-model-tag ${settingsDraft.model === model ? 'active' : ''}`} onClick={() => setSettingsDraft({ ...settingsDraft, model })} title="点击设为当前模型"><span>{model}</span><b aria-label={`移除 ${model}`} onClick={(event) => { event.stopPropagation(); toggleSettingsModel(model); }}>×</b></button>)}
+                      {settingsModels.map(model => <button key={model} className={`settings-model-tag ${settingsDraft.model === model ? 'active' : ''}`} onClick={() => setCurrentSettingsModel(model)} title="点击设为当前模型"><span>{model}</span><b aria-label={`移除 ${model}`} onClick={(event) => { event.stopPropagation(); toggleSettingsModel(model); }}>×</b></button>)}
                       {!settingsModels.length && <span className="settings-model-empty">暂无启用模型</span>}
+                    </div>
+                    <div className="settings-model-selection" aria-label="启用模型列表">
+                      <span>启用模型</span>
+                      {Array.from(new Set([...settingsModels, ...fetchedModels])).map(model => <label key={`select-${model}`}><input type="checkbox" checked={settingsModels.includes(model)} onChange={() => toggleSettingsModel(model)} /><span>{model}</span><button type="button" onClick={() => setCurrentSettingsModel(model)}>设为当前</button></label>)}
                     </div>
                     <div className="model-add-row">
                       <input className="input" value={customModelName} placeholder="输入模型 ID，回车添加" onChange={(event) => setCustomModelName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addCustomModel(); } }} />

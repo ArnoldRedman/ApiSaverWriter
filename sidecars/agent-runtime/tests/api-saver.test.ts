@@ -70,6 +70,29 @@ describe("API Saver model configuration", () => {
     expect(fetchMock.mock.calls[1][1]?.headers).toMatchObject({ Authorization: "Bearer backup-key" });
   });
 
+  it("merges model lists returned by multiple configured keys", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gpt-a" }, { id: "gpt-shared" }] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gpt-shared" }, { id: "gpt-b" }] }), { status: 200 }));
+
+    const models = await new ApiSaverClient({ apiKey: "primary-key", apiKeys: ["backup-key"], baseURL: "https://invalid.example/v1" }).listModels();
+
+    expect(models).toEqual(["gpt-a", "gpt-shared", "gpt-b"]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/models");
+    expect(fetchMock.mock.calls[1][0]).toBe("https://api.apisaver.com/v1/models");
+  });
+
+  it("uses the managed gateway even when a legacy custom address is supplied", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
+
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://legacy.example/v1", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }]))
+      .resolves.toEqual({ content: "OK", model: "gpt-test" });
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/chat/completions");
+  });
+
   it("does not retry an exhausted quota response", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ error: { message: "The quota has been exceeded" } }), { status: 429 }));

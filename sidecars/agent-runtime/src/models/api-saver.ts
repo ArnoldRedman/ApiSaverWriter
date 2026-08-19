@@ -30,6 +30,7 @@ function trimTrailingSlash(value: string): string {
 
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
+const API_SAVER_BASE_URL = "https://api.apisaver.com/v1";
 
 function apiErrorMessage(status: number, detail: string, statusText: string, attempts: number, routeHint = ""): string {
   const retrySuffix = attempts > 1 ? `，已自动重试 ${attempts - 1} 次` : "";
@@ -242,23 +243,30 @@ export class ApiSaverClient {
   }
 
   async listModels(): Promise<string[]> {
-    const rawBaseURL = trimTrailingSlash(this.config.baseURL || "https://api.apisaver.com/v1")
-      .replace(/\/(?:chat\/completions|responses|messages)$/i, "");
-    const baseURL = rawBaseURL.endsWith("/v1") ? rawBaseURL : `${rawBaseURL}/v1`;
-    const endpoint = `${baseURL}/models`;
-    const dispatcher = proxyDispatcherFor(endpoint, this.config);
-    const response = await fetch(endpoint, {
-      headers: { Authorization: `Bearer ${this.config.apiKey}`, Accept: "application/json" },
-      ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit);
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(apiErrorMessage(response.status, detail, response.statusText, 1, proxyRouteHint(endpoint, this.config)));
+    const endpoint = `${API_SAVER_BASE_URL}/models`;
+    const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    if (!keys.length) throw new Error("缺少 API Key");
+    const results = await Promise.allSettled(keys.map(async key => {
+      const dispatcher = proxyDispatcherFor(endpoint, this.config);
+      const response = await fetch(endpoint, {
+        headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(apiErrorMessage(response.status, detail, response.statusText, 1, proxyRouteHint(endpoint, this.config)));
+      }
+      const payload = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
+      return (payload.data ?? payload.models ?? [])
+        .map(item => typeof item === "string" ? item : item.id)
+        .filter((model): model is string => Boolean(model));
+    }));
+    const models = Array.from(new Set(results.flatMap(result => result.status === "fulfilled" ? result.value : [])));
+    if (!models.length) {
+      const errors = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
+      throw new Error(errors.length ? `所有 API Key 拉取模型失败：${errors.join("；")}` : "接口没有返回可用模型");
     }
-    const payload = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
-    return Array.from(new Set((payload.data ?? payload.models ?? [])
-      .map(item => typeof item === "string" ? item : item.id)
-      .filter((model): model is string => Boolean(model))));
+    return models;
   }
 
   async chat(
@@ -266,9 +274,7 @@ export class ApiSaverClient {
     options: ChatOptions = {}
   ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
-    const rawBaseURL = trimTrailingSlash(this.config.baseURL || "https://api.apisaver.com/v1")
-      .replace(/\/(?:chat\/completions|responses|messages)$/i, "");
-    const baseURL = rawBaseURL.endsWith("/v1") ? rawBaseURL : `${rawBaseURL}/v1`;
+    const baseURL = API_SAVER_BASE_URL;
     const apiMode = this.config.apiMode || "openai";
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const apiKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
@@ -383,19 +389,31 @@ export class ApiSaverClient {
       return response;
     }
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
-    const rawBaseURL = trimTrailingSlash(this.config.baseURL || "https://api.apisaver.com/v1").replace(/\/chat\/completions$/i, "");
-    const baseURL = rawBaseURL.endsWith("/v1") ? rawBaseURL : `${rawBaseURL}/v1`;
+    const baseURL = API_SAVER_BASE_URL;
     const endpoint = `${baseURL}/chat/completions`;
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
-    const response = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.config.apiKey}` },
-      body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: options.response_format, stream: true, stream_options: { include_usage: true } }),
-      ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit);
-    if (!response.ok || !response.body) throw new Error(apiErrorMessage(response.status, await response.text(), response.statusText, 1, proxyRouteHint(endpoint, this.config)));
-    const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
+    const apiKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    if (!apiKeys.length) throw new Error("缺少 API Key");
+    let response: Response | null = null;
+    let lastStreamError = "";
+    for (const key of apiKeys) {
+      const candidate = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+        body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: options.response_format, stream: true, stream_options: { include_usage: true } }),
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
+      if (candidate.ok && candidate.body) {
+        response = candidate;
+        break;
+      }
+      const detail = await candidate.text();
+      lastStreamError = apiErrorMessage(candidate.status, detail, candidate.statusText, 1, proxyRouteHint(endpoint, this.config));
+    }
+    const responseBody = response?.body;
+    if (!responseBody) throw new Error(lastStreamError || "所有 API Key 的流式请求均失败");
+    const reader = responseBody.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
     try {
       while (true) {
         const next = await Promise.race([
