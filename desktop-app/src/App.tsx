@@ -437,6 +437,42 @@ interface AgentDraftResult {
   };
 }
 
+/**
+ * Chapter writing uses a JSON envelope so the runtime can retain a compact
+ * chapter summary. During SSE that envelope arrives a few characters at a
+ * time. Keep the JSON transport out of the writer-facing preview while still
+ * allowing ordinary (non-JSON) provider fallbacks to render immediately.
+ */
+const chapterDraftFromStream = (raw: string): string => {
+  const trimmed = raw.trimStart();
+  if (!trimmed.startsWith('{') && !trimmed.startsWith('```')) return raw;
+  const field = /"(?:draftContent|content)"\s*:\s*"/u.exec(raw);
+  if (!field) return '';
+
+  let value = '';
+  for (let index = (field.index || 0) + field[0].length; index < raw.length; index += 1) {
+    const character = raw[index];
+    if (character === '"') break;
+    if (character !== '\\') {
+      value += character;
+      continue;
+    }
+    const escape = raw[index + 1];
+    if (!escape) break;
+    if (escape === 'u') {
+      const hex = raw.slice(index + 2, index + 6);
+      if (!/^[0-9a-f]{4}$/iu.test(hex)) break;
+      value += String.fromCharCode(Number.parseInt(hex, 16));
+      index += 5;
+      continue;
+    }
+    const escaped: Record<string, string> = { '"': '"', '\\': '\\', '/': '/', b: '\b', f: '\f', n: '\n', r: '\r', t: '\t' };
+    value += escaped[escape] ?? escape;
+    index += 1;
+  }
+  return value;
+};
+
 interface RuntimeUsageSummary {
   inputTokens: number;
   outputTokens: number;
@@ -1017,6 +1053,27 @@ const countOccurrences = (content: string, query: string) => {
   return count;
 };
 
+const findTextMatches = (content: string, query: string): number[] => {
+  if (!query) return [];
+  const matches: number[] = [];
+  let cursor = 0;
+  while (cursor < content.length) {
+    const index = content.indexOf(query, cursor);
+    if (index < 0) break;
+    matches.push(index);
+    cursor = index + Math.max(1, query.length);
+  }
+  return matches;
+};
+
+const searchSnippet = (content: string, position: number, query: string): string => {
+  const start = Math.max(0, position - 54);
+  const end = Math.min(content.length, position + query.length + 110);
+  const prefix = start > 0 ? '…' : '';
+  const suffix = end < content.length ? '…' : '';
+  return `${prefix}${content.slice(start, end).replace(/\s+/gu, ' ').trim()}${suffix}`;
+};
+
 const formatNovelChapterContent = (content: string) => content
   .replace(/^\uFEFF/u, '')
   .replace(/\r\n?/gu, '\n')
@@ -1391,6 +1448,7 @@ function App() {
   const outlineRunRef = useRef('');
   const cardRunRef = useRef('');
   const agentTypewriterRef = useRef<number | null>(null);
+  const agentStreamRawContentRef = useRef('');
   const [agentError, setAgentError] = useState('');
   const [agentProgress, setAgentProgress] = useState<AgentProgressItem[]>([]);
   const [agentProgressPercent, setAgentProgressPercent] = useState(0);
@@ -1457,6 +1515,7 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [replaceQuery, setReplaceQuery] = useState('');
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
+  const [bookSearchMatchIndex, setBookSearchMatchIndex] = useState(0);
   const [showBannedWords, setShowBannedWords] = useState(false);
   const [bannedWords, setBannedWords] = useState<string[]>(() => {
     try {
@@ -1549,7 +1608,8 @@ function App() {
         return;
       }
       if (payload.type === 'chunk' && data.text) {
-        setAgentDisplayContent(current => current + String(data.text));
+        agentStreamRawContentRef.current += String(data.text);
+        setAgentDisplayContent(chapterDraftFromStream(agentStreamRawContentRef.current));
         const characters = countNovelCharacters(data.text);
         setAgentProgressMessage(characters ? `正文已返回 ${characters.toLocaleString()} 字，正在整理草稿` : '正在接收模型输出');
         setAgentProgress(items => items.map(item => item.id === 'draft'
@@ -1618,7 +1678,8 @@ function App() {
       if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
       if (payload.runId !== activeAgentRunRef.current) return;
       if (payload.type === 'chunk' && data.text) {
-        setAgentDisplayContent(current => current + String(data.text));
+        agentStreamRawContentRef.current += String(data.text);
+        setAgentDisplayContent(chapterDraftFromStream(agentStreamRawContentRef.current));
         setAgentProgressPercent(current => Math.max(current, 70));
         setAgentProgressMessage(`正文已返回 ${countNovelCharacters(String(data.text)).toLocaleString()} 字，正在整理草稿`);
         return;
@@ -3035,7 +3096,7 @@ function App() {
     const matchCount = searchQuery ? countOccurrences(content, searchQuery) : 0;
     return <section className="search-panel document-search-panel" aria-label={`${label}搜索与替换`}>
       <div className="search-panel-row">
-        <input ref={searchInputRef} className="input" value={searchQuery} placeholder={`搜索${label}内容`} onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); }} />
+        <input ref={searchInputRef} className="input" value={searchQuery} placeholder={`搜索${label}内容`} onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); setBookSearchMatchIndex(0); }} />
         <button className="editor-tool-button" onClick={() => moveDocumentSearchMatch(content, label, -1)} disabled={!searchQuery}>上一个</button>
         <button className="editor-tool-button" onClick={() => moveDocumentSearchMatch(content, label, 1)} disabled={!searchQuery}>下一个</button>
         <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}>×</button>
@@ -3883,6 +3944,7 @@ function App() {
     setAgentError('');
     setAgentDraft(null);
     setAgentDisplayContent('');
+    agentStreamRawContentRef.current = '';
     setAgentStage('starting');
     setContextTrace([]);
     setAgentProgress(createAgentProgressItems().map((item, index) => index === 0
@@ -3961,7 +4023,13 @@ function App() {
           ...agentNetworkParams(agentConfig),
         },
       });
-      setAgentDraft(result);
+      // The completed RPC result is the source of truth. It must replace the
+      // streaming buffer because JSON envelopes can be split across SSE frames.
+      const draftContent = chapterDraftFromStream(result.draftContent || '');
+      const normalizedResult = { ...result, draftContent };
+      setAgentDraft(normalizedResult);
+      setAgentDisplayContent(draftContent);
+      agentStreamRawContentRef.current = '';
       // SSE chunks are already rendered by the shared stream listener. The
       // completed result is authoritative when the provider falls back to a
       // non-streaming response.
@@ -4605,8 +4673,28 @@ function App() {
   };
   const currentSearchMatches = activeChapter && searchQuery ? countOccurrences(activeChapter.content, searchQuery) : 0;
   const bookSearchResults = editingProject && searchScope === 'book' && searchQuery.trim()
-    ? editingProject.chapters.filter(chapter => chapter.title.includes(searchQuery) || chapter.content.includes(searchQuery)).map(chapter => ({ chapter, count: countOccurrences(`${chapter.title}\n${chapter.content}`, searchQuery) }))
+    ? editingProject.chapters.flatMap(chapter => {
+      const matches = findTextMatches(chapter.content, searchQuery);
+      const titleMatches = countOccurrences(chapter.title, searchQuery);
+      if (!matches.length && !titleMatches) return [];
+      return [{ chapter, count: matches.length + titleMatches, matches, snippets: matches.slice(0, 3).map(position => ({ position, text: searchSnippet(chapter.content, position, searchQuery) })) }];
+    })
     : [];
+  const bookSearchMatches = bookSearchResults.flatMap(result => result.matches.map(position => ({ chapter: result.chapter, position })));
+  const focusBookSearchMatch = (index: number) => {
+    const target = bookSearchMatches[(index + bookSearchMatches.length) % bookSearchMatches.length];
+    if (!target) return;
+    const targetIndex = bookSearchMatches.indexOf(target);
+    setBookSearchMatchIndex(targetIndex);
+    setActiveChapter(target.chapter);
+    setSearchMatchIndex(findTextMatches(target.chapter.content, searchQuery).indexOf(target.position));
+    window.requestAnimationFrame(() => {
+      const editor = chapterEditorRef.current;
+      if (!editor) return;
+      editor.focus();
+      editor.setSelectionRange(target.position, target.position + searchQuery.length);
+    });
+  };
   const graphLayout = (() => {
     const nodes = editingProject?.graphNodes ?? [];
     const edges = editingProject?.graphEdges ?? [];
@@ -5067,12 +5155,20 @@ function App() {
                   {showSearchPanel && (
                     <section className="search-panel" aria-label="搜索与替换">
                       <div className="search-panel-row">
-                        <input ref={searchInputRef} className="input" value={searchQuery} placeholder="搜索本章或全文" onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); }} />
+                        <input ref={searchInputRef} className="input" value={searchQuery} placeholder="搜索本章或全文" onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); setBookSearchMatchIndex(0); }} />
                         <select className="select" value={searchScope} onChange={event => setSearchScope(event.target.value as 'chapter' | 'book')}><option value="chapter">本章</option><option value="book">全文</option></select>
                         {searchScope === 'chapter' && <><button className="editor-tool-button" onClick={() => focusSearchMatch(-1)} disabled={!searchQuery}>上一个</button><button className="editor-tool-button" onClick={() => focusSearchMatch(1)} disabled={!searchQuery}>下一个</button></>}
                         <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}>×</button>
                       </div>
-                      {searchScope === 'chapter' ? <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div> : <div className="book-search-results">{!searchQuery.trim() ? <span>输入关键词搜索整本小说</span> : bookSearchResults.length ? bookSearchResults.map(({ chapter, count }) => <button key={chapter.id} onClick={() => { setActiveChapter(chapter); setSearchScope('chapter'); setSearchMatchIndex(0); }}>{chapter.title}<small>{count} 处匹配 · {chapter.wordCount} 字</small></button>) : <span>没有找到匹配章节</span>}</div>}
+                      {searchScope === 'chapter' ? <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div> : <div className="book-search-results">
+                        {!searchQuery.trim() ? <span>输入关键词搜索整本小说</span> : bookSearchResults.length ? <>
+                          <div className="book-search-summary"><strong>全文检索</strong><span>共 {bookSearchMatches.length} 处，分布在 {bookSearchResults.length} 个章节</span><div><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex - 1)} disabled={!bookSearchMatches.length}>上一个</button><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex + 1)} disabled={!bookSearchMatches.length}>下一个</button></div></div>
+                          {bookSearchResults.map(({ chapter, count, snippets }) => <article className="book-search-result" key={chapter.id}>
+                            <button className="book-search-result-heading" onClick={() => { setActiveChapter(chapter); if (snippets[0]) focusBookSearchMatch(bookSearchMatches.findIndex(item => item.chapter.id === chapter.id && item.position === snippets[0].position)); }}><strong>{chapter.title}</strong><small>{count} 处匹配 · {chapter.wordCount} 字</small></button>
+                            {snippets.map(snippet => <button className="book-search-snippet" key={`${chapter.id}-${snippet.position}`} onClick={() => focusBookSearchMatch(bookSearchMatches.findIndex(item => item.chapter.id === chapter.id && item.position === snippet.position))}>{snippet.text}</button>)}
+                          </article>)}
+                        </> : <span>没有找到匹配章节</span>}
+                      </div>}
                     </section>
                   )}
                   <input
