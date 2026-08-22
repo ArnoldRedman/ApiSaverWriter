@@ -29,6 +29,7 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -48,9 +49,9 @@ jobs:
             package-lock.json
             desktop-app/package-lock.json
       - uses: dtolnay/rust-toolchain@stable
-      - name: Add Android Rust targets
+      - name: Add Android Rust target
         if: matrix.kind == 'android'
-        run: rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+        run: rustup target add aarch64-linux-android
       - name: Add iOS Rust target
         if: matrix.kind == 'ios'
         run: rustup target add aarch64-apple-ios
@@ -101,7 +102,6 @@ jobs:
       - name: Build Android
         if: matrix.kind == 'android'
         working-directory: desktop-app
-        timeout-minutes: 35
         run: |
           npx tauri android init --ci
           # 发布包只构建 arm64-v8a：它覆盖当前绝大多数 Android 手机，
