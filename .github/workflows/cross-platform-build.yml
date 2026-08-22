@@ -4,6 +4,23 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      platform:
+        description: "构建平台"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - macos-arm
+          - macos-intel
+          - android
+          - ios
+      release_tag:
+        description: "发布版本，例如 v0.1.4"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -11,6 +28,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.label }}
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == matrix.kind }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -128,13 +146,14 @@ jobs:
         with: { path: release-assets, merge-multiple: true }
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           generate_release_notes: true
           files: release-assets/*
       - name: Publish install packages to public distribution repository
         env:
           GH_TOKEN: ${{ secrets.DISTRIBUTION_GITHUB_TOKEN }}
           DISTRIBUTION_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian' }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then
@@ -152,7 +171,7 @@ jobs:
           FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
           FEISHU_DOC_URL: ${{ secrets.FEISHU_DOC_URL || 'https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa' }}
           FEISHU_AS: bot
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           DOWNLOAD_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
