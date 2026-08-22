@@ -7,6 +7,7 @@
   "scripts": {
     "test": "npm --workspace @apisaverwriter/agent-runtime test",
     "typecheck": "npm --workspace @apisaverwriter/agent-runtime run typecheck",
-    "dev:agent": "npm --workspace @apisaverwriter/agent-runtime run dev"
+    "dev:agent": "npm --workspace @apisaverwriter/agent-runtime run dev",
+    "sync:feishu-release": "node scripts/sync-feishu-release.mjs"
   }
 }

@@ -130,3 +130,17 @@ jobs:
         with:
           generate_release_notes: true
           files: release-assets/*
+      - name: Sync release notes to Feishu
+        if: ${{ secrets.FEISHU_APP_ID != '' && secrets.FEISHU_APP_SECRET != '' }}
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_DOC_URL: ${{ secrets.FEISHU_DOC_URL || 'https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa' }}
+          FEISHU_AS: bot
+          RELEASE_TAG: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm install -g @larksuite/cli@1.0.89
+          printf '%s' "$FEISHU_APP_SECRET" | lark-cli profile add --name apisaverwriter-release --app-id "$FEISHU_APP_ID" --app-secret-stdin
+          npm run sync:feishu-release
