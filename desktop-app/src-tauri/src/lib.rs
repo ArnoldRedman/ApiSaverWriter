@@ -87,6 +87,36 @@ fn node_executable() -> Result<PathBuf, String> {
     Err(format!("找不到可用的 Node.js 运行时（已检查 {}）。可设置 APISAVERWRITER_NODE 指向 node 可执行文件。", attempted.join("、")))
 }
 
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
+        return Err("仅允许打开 http/https 链接".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut value = Command::new("open");
+        value.arg(trimmed);
+        value
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut value = Command::new("cmd");
+        value.args(["/C", "start", "", trimmed]);
+        value
+    };
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let mut value = Command::new("xdg-open");
+        value.arg(trimmed);
+        value
+    };
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    return Err("移动端使用系统链接回退".to_string());
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    command.spawn().map(|_| ()).map_err(|error| format!("打开外部链接失败：{error}"))
+}
+
 fn spawn_agent_runtime() -> Result<AgentRuntimeProcess, String> {
     let script = agent_runtime_script()?;
     let node = node_executable()?;
@@ -1855,6 +1885,7 @@ pub fn run() {
             open_outline_location,
             open_card_location,
             open_graph_node_location,
+            open_external_url,
             detect_system_proxy
         ])
         .run(tauri::generate_context!())

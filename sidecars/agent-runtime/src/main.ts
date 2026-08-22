@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createChapterGraph } from "./graphs/chapter-write.graph.js";
+import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
 import { ApiSaverClient, getRuntimeUsageSummary } from "./models/api-saver.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
@@ -133,6 +133,87 @@ function appendAgentSession(state: AgentSessionState, instruction: string, concl
 // instructions and the editable outline are deliberately sent afterwards.
 const outlineWriterSystemPrompt = `你是长篇网络小说总策划与章节规划 Agent。根据作品资料编写可直接执行的 Markdown 大纲。
 世界观与作品设定是作者确认的只读固定规则，只能引用，不得自动改写、补全或推断变化；保持人物、时间线、设定和知识图谱一致。不要输出解释性前言。未知信息标记为待揭示，不能编造为既定事实。`;
+
+// Chapter outlines have one canonical contract. A user-provided outline may
+// supply facts or writing density, but it cannot replace these fields.
+const chapterOutlineOutputProtocol = `## 番茄小说章纲生成器输出协议（必须严格遵守）
+仅当类型为“章纲”时使用。参考章纲只能借鉴叙事密度，不能替换以下栏目或字段。
+
+# 章纲｜第X章 标题
+
+## 核心爽点类型
+主：从打脸、升级、得宝、揭秘、装逼、复仇、收女、差异感、低调装逼、异性倾慕中选择。
+副：从上述类型中选择。
+
+## 情绪曲线
+压抑：____（20%）
+爆发：____（50%）
+余韵：____（20%，必须明确本章释放点）
+新危机：____（10%）
+
+## 场景划分
+场景一：
+- 地点：
+- 人物：
+- 目标：
+- 冲突：
+- 转折：
+
+场景二（如需要）：
+- 地点：
+- 人物：
+- 目标：
+- 冲突：
+- 转折：
+
+场景三（如需要）：
+- 地点：
+- 人物：
+- 目标：
+- 冲突：
+- 转折：
+
+## 人物功能
+逐人说明行动、独立作用和状态变化，禁止工具人。
+
+## 信息揭示与伏笔
+新信息：至少1条。
+伏笔：至少1条，必须明确标注“待揭示”，并写出可回收方向。
+
+## 爽点拆解
+至少填写其中两项：
+- 差异感：
+- 低调装逼：
+- 异性倾慕：
+- 因果铺陈：
+
+## 章末钩子
+必须落在具体动作、对话或画面上，形成追读钩子；不得写“欲知后事如何”。
+
+硬性限制：不设固定字数上限，必须优先完整输出所有必要场景、人物功能、信息伏笔、爽点拆解与章末钩子；不得因长度裁剪或半途结束。只输出 Markdown 章纲正文，不输出技能名、知识图谱、实体关系、JSON、分析过程、前言或后记。未知信息写“待揭示”，不得虚构。`;
+
+function normalizeChapterOutlineOutput(value: string): string {
+  let content = String(value || "").trim()
+    .replace(/^```(?:markdown|md|text)?\s*/iu, "")
+    .replace(/```$/u, "")
+    .trim();
+  const graphTail = content.search(/^##\s*(?:实体与关系更新|知识图谱更新)\s*$/imu);
+  if (graphTail >= 0) content = content.slice(0, graphTail).trim();
+  const lines = content.split(/\r?\n/u);
+  const seenHeadings = new Set<string>();
+  const kept: string[] = [];
+  for (const line of lines) {
+    const heading = line.match(/^#{1,6}\s+(.+?)\s*$/u)?.[1]?.trim();
+    if (heading) {
+      const key = heading.replace(/[：:｜|]/gu, "").replace(/\s+/gu, "");
+      if (seenHeadings.has(key)) break;
+      seenHeadings.add(key);
+    }
+    kept.push(line);
+  }
+  content = kept.join("\n").replace(/\n{3,}/gu, "\n\n").trim();
+  return content;
+}
 
 // Kept byte-stable and paired with a separately sent project packet so card
 // requests for the same novel can reuse compatible upstream prompt caches.
@@ -542,11 +623,11 @@ const downloadFanqieChapter = async (chapter: FanqieChapterLink, number: number,
   };
 };
 
-const downloadFanqieBook = async (bookUrl: string, sourceBookId: string, params?: Record<string, unknown>, maxChapters = 200): Promise<Array<Record<string, unknown>>> => {
+const downloadFanqieBook = async (bookUrl: string, sourceBookId: string, params?: Record<string, unknown>, maxChapters = Number.MAX_SAFE_INTEGER): Promise<Array<Record<string, unknown>>> => {
   const bookId = sourceBookId || bookUrl.match(/\/page\/(\d+)/u)?.[1] || "";
   if (!bookId) throw new Error("无法识别番茄书籍 ID");
   const pageHtml = await fetchWebText(bookUrl, params);
-  const chapterLinks = fanqieChapterLinksFromPage(pageHtml, Math.max(1, Math.min(500, maxChapters)));
+  const chapterLinks = fanqieChapterLinksFromPage(pageHtml, Math.max(1, Math.floor(maxChapters)));
   if (!chapterLinks.length) throw new Error("未找到章节目录，书籍页面可能已变更");
   return concurrentMap(chapterLinks, 4, async (chapter, index) => {
     try {
@@ -712,6 +793,23 @@ const parseQianyueRequest = (raw: string, source: QianyueSource, item: unknown, 
   return { url, method: String(descriptor.method || (body ? "POST" : "GET")).toUpperCase() === "POST" ? "POST" : "GET", body, encoding: charset, headers: { ...baseHeaders, ...extraHeaders } };
 };
 
+const isExpiredBearerToken = (value: string): boolean => {
+  const token = value.replace(/^Bearer\s+/iu, "").trim();
+  const parts = token.split(".");
+  if (parts.length < 2) return false;
+  try {
+    const payload = JSON.parse(Buffer.from(parts[1].replace(/-/gu, "+").replace(/_/gu, "/"), "base64").toString("utf8")) as Record<string, unknown>;
+    const exp = Number(payload.exp);
+    return Number.isFinite(exp) && exp > 0 && exp <= Math.floor(Date.now() / 1000);
+  } catch {
+    return false;
+  }
+};
+
+const withoutExpiredAuthorization = (headers: Record<string, string>): Record<string, string> => Object.fromEntries(
+  Object.entries(headers).filter(([key, value]) => key.toLowerCase() !== "authorization" || !isExpiredBearerToken(String(value))),
+);
+
 const fetchQianyueResource = async (request: ReturnType<typeof parseQianyueRequest>, params?: Record<string, unknown>): Promise<string> => {
   const proxyEnabled = params?.proxyEnabled === true;
   const proxyURL = typeof params?.proxyURL === "string" ? params.proxyURL.trim() : "";
@@ -723,18 +821,26 @@ const fetchQianyueResource = async (request: ReturnType<typeof parseQianyueReque
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8_000);
   try {
-    const response = await fetch(request.url, {
+    const requestHeaders = withoutExpiredAuthorization(request.headers);
+    const execute = async (headers: Record<string, string>) => fetch(request.url, {
       method: request.method,
       headers: {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
         Accept: "text/html,application/json;q=0.9,*/*;q=0.8",
         ...(request.body ? { "Content-Type": "application/x-www-form-urlencoded; charset=utf-8" } : {}),
-        ...request.headers,
+        ...headers,
       },
       ...(request.body ? { body: request.body } : {}),
       ...(dispatcher ? { dispatcher } : {}),
       signal: controller.signal,
     } as RequestInit);
+    let response = await execute(requestHeaders);
+    if (response.status === 401 || response.status === 403) {
+      const hasAuthorization = Object.keys(requestHeaders).some(key => key.toLowerCase() === "authorization");
+      if (hasAuthorization) {
+        response = await execute(Object.fromEntries(Object.entries(requestHeaders).filter(([key]) => key.toLowerCase() !== "authorization")));
+      }
+    }
     if (!response.ok) throw new Error(`书源返回 HTTP ${response.status}`);
     const bytes = Buffer.from(await response.arrayBuffer());
     return request.encoding.toLowerCase().includes("gb") ? iconv.decode(bytes, "gbk") : bytes.toString("utf-8");
@@ -840,7 +946,7 @@ type QianyueChapterLink = {
   url: string;
 };
 
-const qianyueChapterLinks = async (source: QianyueSource, bookUrl: string, params?: Record<string, unknown>, maxChapters = 200): Promise<QianyueChapterLink[]> => {
+const qianyueChapterLinks = async (source: QianyueSource, bookUrl: string, params?: Record<string, unknown>, maxChapters = Number.MAX_SAFE_INTEGER): Promise<QianyueChapterLink[]> => {
   const infoRequest = parseQianyueRequest(bookUrl, source, {}, { key: "", page: "1", baseUrl: bookUrl });
   const infoPayload = await fetchQianyueResource(infoRequest, params);
   const infoJson = parseMaybeJson(infoPayload);
@@ -848,7 +954,7 @@ const qianyueChapterLinks = async (source: QianyueSource, bookUrl: string, param
   const tocRule = String(source.ruleBookInfo.tocUrl || bookUrl);
   const tocRequest = parseQianyueRequest(tocRule, source, info, { key: "", page: "1", baseUrl: bookUrl });
   const tocPayload = await fetchQianyueResource(tocRequest, params);
-  const tocItems = qianyueRuleValues(tocPayload, source.ruleToc.chapterList).slice(0, Math.max(1, Math.min(500, maxChapters)));
+  const tocItems = qianyueRuleValues(tocPayload, source.ruleToc.chapterList).slice(0, Math.max(1, Math.floor(maxChapters)));
   if (!tocItems.length) throw new Error("书源没有返回章节目录");
   const chapterRule = String(source.ruleToc.chapterUrl || "");
   const titleRule = source.ruleToc.chapterName;
@@ -859,7 +965,7 @@ const qianyueChapterLinks = async (source: QianyueSource, bookUrl: string, param
   }));
 };
 
-const downloadQianyueSource = async (source: QianyueSource, bookUrl: string, params?: Record<string, unknown>, maxChapters = 200): Promise<Array<Record<string, unknown>>> => {
+const downloadQianyueSource = async (source: QianyueSource, bookUrl: string, params?: Record<string, unknown>, maxChapters = Number.MAX_SAFE_INTEGER): Promise<Array<Record<string, unknown>>> => {
   const links = await qianyueChapterLinks(source, bookUrl, params, maxChapters);
   return concurrentMap(links, 4, async (chapter, index) => {
     if (!chapter.url) return { id: `${source.id}:chapter:${index}`, number: chapter.number, title: chapter.title, url: "", content: "", wordCount: 0, downloaded: false };
@@ -1018,7 +1124,7 @@ const searchAllBookSources = async (query: string, params?: Record<string, unkno
   };
 };
 
-const downloadConfiguredBookSource = async (source: BookSourceDefinition, bookUrl: string, params?: Record<string, unknown>, maxChapters = 200): Promise<Array<Record<string, unknown>>> => {
+const downloadConfiguredBookSource = async (source: BookSourceDefinition, bookUrl: string, params?: Record<string, unknown>, maxChapters = Number.MAX_SAFE_INTEGER): Promise<Array<Record<string, unknown>>> => {
   let directoryUrl = bookUrl;
   if (source.directoryUrlTemplate) {
     const match = new URL(bookUrl).pathname.match(/\/([^/]+)\/?$/u);
@@ -1037,7 +1143,7 @@ const downloadConfiguredBookSource = async (source: BookSourceDefinition, bookUr
     seen.add(url);
     links.push({ title, url });
   });
-  const targets = links.slice(0, Math.max(1, Math.min(500, maxChapters)));
+  const targets = links.slice(0, Math.max(1, Math.floor(maxChapters)));
   if (!targets.length) throw new Error("书源没有返回章节目录");
   const chapters: Array<Record<string, unknown>> = [];
   for (let index = 0; index < targets.length; index += 1) {
@@ -1303,6 +1409,15 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
     if (req.method === "usage.summary") {
       return { id: req.id, result: getRuntimeUsageSummary() };
     }
+    if (req.method === "gateway.usage") {
+      const { apiKey, apiKeys, proxyEnabled, proxyURL, proxyBypassLocal } = req.params ?? {};
+      if (!apiKey) return { id: req.id, error: { code: -32602, message: "请先在设置中填写 API Key。" } };
+      const client = new ApiSaverClient({
+        apiKey: String(apiKey), apiKeys: stringList(apiKeys, 12),
+        proxyEnabled: Boolean(proxyEnabled), proxyURL: String(proxyURL || ""), proxyBypassLocal: proxyBypassLocal === true,
+      });
+      return { id: req.id, result: await client.getGatewayUsageSnapshot() };
+    }
     if (req.method === "models.list") {
       const { apiKey, apiKeys, baseURL, apiMode, reasoningMode, contextWindow, proxyEnabled, proxyURL, proxyBypassLocal } = req.params ?? {};
       if (!apiKey) {
@@ -1336,7 +1451,10 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
-      await client.chat([{ role: "user", content: "请只回复 OK" }], { max_tokens: 8, temperature: 0, retryAttempts: 2 });
+      // Some relay models spend hidden reasoning tokens before emitting the
+      // two-character answer. Keep this probe generous so a valid model is
+      // not mistaken for an empty response when the gateway reports length.
+      await client.chat([{ role: "user", content: "请只回复 OK" }], { max_tokens: 256, temperature: 0, retryAttempts: 2 });
       return { id: req.id, result: { tested: true, model: String(model) } };
     }
     if (req.method === "project.generate") {
@@ -1626,16 +1744,16 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       if (sourceId.startsWith("qianyue-")) {
         const definition = qianyueSources.find(item => item.id === sourceId);
         if (!definition) return { id: req.id, error: { code: -32602, message: "未知千阅小说书源" } };
-        const chapters = await downloadQianyueSource(definition, String(url), req.params, Number(maxChapters) || 200);
+        const chapters = await downloadQianyueSource(definition, String(url), req.params, Number(maxChapters) || Number.MAX_SAFE_INTEGER);
         return { id: req.id, result: { title: String(title || "未命名书籍"), author: String(author || "未知作者"), sourceId, sourceName: definition.name, sourceBookId: String(sourceBookId || url), chapters } };
       }
       if (sourceId !== "fanqie") {
         const definition = webBookSources.find(item => item.id === sourceId);
         if (!definition) return { id: req.id, error: { code: -32602, message: "未知书源" } };
-        const chapters = await downloadConfiguredBookSource(definition, String(url), req.params, Number(maxChapters) || 200);
+        const chapters = await downloadConfiguredBookSource(definition, String(url), req.params, Number(maxChapters) || Number.MAX_SAFE_INTEGER);
         return { id: req.id, result: { title: String(title || "未命名书籍"), author: String(author || "未知作者"), sourceId, sourceName: definition.name, sourceBookId: String(sourceBookId || url), chapters } };
       }
-      const chapters = await downloadFanqieBook(String(url), String(sourceBookId || ""), req.params, Number(maxChapters) || 200);
+      const chapters = await downloadFanqieBook(String(url), String(sourceBookId || ""), req.params, Number(maxChapters) || Number.MAX_SAFE_INTEGER);
       const downloadedChapterCount = chapters.filter(chapter => String(chapter.content || "").trim()).length;
       if (!downloadedChapterCount) throw new Error("番茄正文没有返回有效内容，未保存空章节；请稍后重试或导入 TXT");
       const completedChapterCount = chapters.filter(chapter => chapter.downloaded === true).length;
@@ -1917,7 +2035,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       }
     }
     if (req.method === "outline.write") {
-      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, skills, preferredSkillNames, sessionId, previousSessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !kind || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
@@ -1934,48 +2052,106 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
       const emitter = new StreamEmitter();
       emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
-      emitter.progress("plan", 20, "正在整理大纲资料");
+      emitter.progress("intent", 5, "步骤 1/5：识别大纲目标、正文依据与格式要求");
       const cardSection = Array.isArray(cards) && cards.length > 0
         ? `\n## 相关知识卡片\n${cards.slice(0, 8).map(card => card as Record<string, unknown>).sort((a, b) => String(a.title || "").localeCompare(String(b.title || ""), "zh-CN")).map(item => `### ${compactText(item.title || "卡片", 80)}\n${compactText(item.content || "", 700)}`).join("\n\n")}`
         : "";
       const graphSection = knowledgeGraph && typeof knowledgeGraph === "object"
         ? `\n## 知识图谱约束\n${compactKnowledgeGraph(knowledgeGraph, String(projectTitle), 2800)}\n请保持已有实体和关系一致，新增关系标注为“待揭示”。`
         : "";
+      const worldSettingSection = Array.isArray(worldSetting) && worldSetting.length > 0
+        ? `\n## 世界观与作品设定（作者确认的固定资料，只可引用，不得改写）\n${worldSetting
+          .slice(0, 2)
+          .map(item => item && typeof item === "object"
+            ? `### ${compactText((item as Record<string, unknown>).title || "世界观与作品设定", 100)}\n${compactText((item as Record<string, unknown>).content || "", 12000)}`
+            : "")
+          .filter(Boolean)
+          .join("\n\n")}\n请以该固定设定为首章创作和后续章纲承接的边界，未知内容标记为“待揭示”。`
+        : "";
       const outlineSkillName = kind === "总纲" ? "outline-total-planner" : kind === "章纲" ? "小说章纲生成器" : "world-setting-planner";
-      const matchedSkills = Array.isArray(skills) ? skills
-        .map(skill => skill as Record<string, unknown>)
-        .filter(item => String(item.name || "") === outlineSkillName)
+      const skillCatalog = Array.isArray(skills) ? skills
+        .filter((skill): skill is Record<string, unknown> => Boolean(skill && typeof skill === "object"))
+        .map(item => ({
+          name: String(item.name || ""), displayName: String(item.displayName || item.name || ""), category: String(item.category || "write"),
+          description: String(item.description || ""), tags: stringList(item.tags, 12), content: String(item.content || ""),
+        })).filter(item => Boolean(item.name)) as SkillDefinition[]
         : [];
+      const targetChapterRecord = targetChapter && typeof targetChapter === "object" ? targetChapter as Record<string, unknown> : undefined;
+      const sourceChapterRecord = sourceChapter && typeof sourceChapter === "object" ? sourceChapter as Record<string, unknown> : undefined;
+      const formatOutlineRecord = formatOutline && typeof formatOutline === "object" ? formatOutline as Record<string, unknown> : undefined;
+      const targetChapterNumber = Number(targetChapterRecord?.number || 0);
+      const sourceChapterNumber = Number(sourceChapterRecord?.number || 0);
+      const isFirstChapter = kind === "章纲" && targetChapterNumber === 1 && !sourceChapterRecord;
+      // The handoff skill is only appropriate for the immediate previous chapter.
+      // Current-chapter input is a reverse outline of already written events.
+      const isNextChapterHandoff = Boolean(targetChapterNumber && sourceChapterNumber === targetChapterNumber - 1);
+      const automaticSelection = selectSkillsByIntent(String(instruction || ""), skillCatalog);
+      const preferredNames = stringList(preferredSkillNames, 6);
+      const continuityNames = kind === "章纲" && isNextChapterHandoff ? ["章纲承接规范", "next-chapter-plan", "conflict-escalation", "foreshadowing-manager", "ending-hook", "setting-consistency"] : [];
+      const matchedSkills = [
+        skillCatalog.find(item => item.name === outlineSkillName),
+        ...skillCatalog.filter(item => preferredNames.includes(item.name)),
+        ...skillCatalog.filter(item => automaticSelection.skills.some(selected => selected.name === item.name) && (item.category === "setup" || continuityNames.includes(item.name))),
+        ...(sourceChapter && isNextChapterHandoff ? skillCatalog.filter(item => continuityNames.includes(item.name)) : []),
+      ].filter((item, index, list): item is SkillDefinition => Boolean(item) && list.findIndex(candidate => candidate?.name === item?.name) === index).slice(0, 4);
+      const recognizedIntent = kind === "章纲" && isNextChapterHandoff
+        ? "上一章正文承接并规划下一章"
+        : kind === "章纲" && sourceChapterRecord && sourceChapterNumber === targetChapterNumber
+          ? "根据本章正文反推本章章纲"
+          : kind === "章纲" && sourceChapterRecord ? "根据指定章节正文生成章纲"
+            : isFirstChapter ? "首章创作：根据世界观、作品简介与作者指令生成" : automaticSelection.intent;
+      emitter.progress("intent", 14, `步骤 1/5：意图识别完成：${recognizedIntent}`);
+      emitter.context("intent", `已选技能：${matchedSkills.map(item => item.displayName || item.name).join("、") || "默认大纲规则"}`, { source: "OutlineSkillRouter", status: "selected", items: matchedSkills.length });
       const skillSection = matchedSkills.length
         ? `\n## 本次匹配技能\n${matchedSkills.map(item => `### ${compactText(item.displayName || item.name || "技能", 80)}\n${compactText(item.content || item.description || "", 700)}`).join("\n\n")}`
         : "";
-      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${skillSection}${graphSection}${cardSection}`;
-      const outlineSessionKey = stableHash({ scope: "outline", sessionId: String(sessionId || "default"), projectTitle, kind, model, apiMode, stableProjectPacket });
+      const stableProjectPacket = `## 作品资料\n书名：${String(projectTitle)}\n作品简介：${compactText(synopsis || "暂无", 1400)}${worldSettingSection}${skillSection}${graphSection}${cardSection}`;
+      const outlineSessionKey = stableHash({ scope: "outline", outlineId: String(outlineId || "active"), sessionId: String(sessionId || "default"), projectTitle, kind, model, apiMode, targetChapterId: targetChapterRecord?.id, sourceChapterId: sourceChapterRecord?.id, formatOutlineId: formatOutlineRecord?.id, stableProjectPacket });
       const storedOutlineSession = await readPersistentContext<unknown>(`outline-session-${outlineSessionKey}`);
       const inheritedOutlineSession = outlineSessionCache.get(outlineSessionKey)
         || (storedOutlineSession !== undefined ? normalizeAgentSession(storedOutlineSession) : undefined);
       const previousOutlineSessionState = previousSessionId && !inheritedOutlineSession
-        ? await readPersistentContext<unknown>(`outline-session-${stableHash({ scope: "outline", sessionId: String(previousSessionId), projectTitle, kind, model, apiMode, stableProjectPacket })}`)
+        ? await readPersistentContext<unknown>(`outline-session-${stableHash({ scope: "outline", outlineId: String(outlineId || "active"), sessionId: String(previousSessionId), projectTitle, kind, model, apiMode, targetChapterId: targetChapterRecord?.id, sourceChapterId: sourceChapterRecord?.id, formatOutlineId: formatOutlineRecord?.id, stableProjectPacket })}`)
         : undefined;
       const outlineDocumentSummary = await readPersistentDocument(`outline-session-${outlineSessionKey}`);
       const outlineSession = compactAgentSession(outlineDocumentSummary ? { ...(inheritedOutlineSession || { version: 1, recentTurns: [] }), summary: outlineDocumentSummary } : (inheritedOutlineSession || (previousOutlineSessionState !== undefined ? normalizeAgentSession(previousOutlineSessionState) : undefined) || { version: 1, summary: "", recentTurns: [] }), contextWindow, byteLength(stableProjectPacket)).state;
       const outlineHistorySummary = renderSessionSummary(outlineSession);
       const outlineRecentTurns = renderRecentTurns(outlineSession);
-      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n## 当前待完善文档\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。必须落实人物动机、冲突升级、关键事件、伏笔与结尾钩子。`;
+      emitter.progress("retrieve", 32, "步骤 2/5：装载唯一正文依据、上一章结尾与格式参考");
+      emitter.context("retrieve", "已装载唯一正文依据", { source: sourceChapterRecord ? `第 ${String(sourceChapterRecord.number || "")} 章正文` : "无正文依据", status: "loaded", bytes: byteLength(String(sourceChapterRecord?.content || "")), items: sourceChapterRecord ? 1 : 0 });
+      if (formatOutlineRecord) emitter.context("retrieve", "已装载格式参考章纲", { source: String(formatOutlineRecord.title || "参考章纲"), status: "loaded", bytes: byteLength(String(formatOutlineRecord.content || "")), items: 1 });
+      const targetSection = targetChapterRecord
+        ? `## 目标章（本次要生成的章纲）\n第 ${String(targetChapterRecord.number || "")} 章《${compactText(targetChapterRecord.title || "未命名", 120)}》\n`
+        : "";
+      const sourceContent = String(sourceChapterRecord?.content || "");
+      const sourceHandoff = sourceContent.length > 7000 ? sourceContent.slice(-7000) : sourceContent;
+      const sourceSection = sourceChapterRecord
+        ? `## 唯一正文依据（优先级最高）\n依据模式：${compactText(sourceChapterRecord.mode || "作者指定", 80)}\n第 ${String(sourceChapterRecord.number || "")} 章《${compactText(sourceChapterRecord.title || "未命名", 120)}》正文：\n${compactText(sourceContent, 26000)}\n\n${isNextChapterHandoff ? `## 章节交接状态（最高优先级，目标章必须从此处之后开始）\n以下是上一章结尾原文：\n${compactText(sourceHandoff, 7000)}\n\n硬性要求：目标章开场只能发生在上述结尾状态之后。上一章已发生的行动、战斗、跟踪发现、资源消耗、人物位置与情绪不得重新规划或倒退；必须承接其结果并推进新的事件。` : sourceChapterNumber === targetChapterNumber ? `## 本章复盘规则\n这是“根据本章正文生成本章章纲”。章纲必须忠实概括正文中已发生的事件、人物状态、冲突、伏笔与结尾；不得把正文结尾之后的计划写成已发生事实，也不得使用“下一章承接”规则。` : `## 指定正文参考规则\n这是指定章节正文的参考分析。只提取该正文可证实的事实；不要把它误当作目标章的上一章，也不要强行制造章节承接。`}\n\n章纲事件、人物状态和结尾承接必须来自这段正文；不得引用其他章节正文，不得把历史会话中的旧章节当作事实。`
+        : `## 正文依据\n本次没有提供可用正文。只能生成通用结构，不得声称承接任何具体章节。`;
+      const formatSection = formatOutlineRecord
+        ? `## 格式参考章纲（仅参考表达密度，不得覆盖固定输出协议）\n参考模式：${compactText(formatOutlineRecord.mode || "上一章章纲格式", 100)}\n${compactText(formatOutlineRecord.title || "参考章纲", 120)}\n${compactText(formatOutlineRecord.content || "", 9000)}\n\n硬性要求：固定输出协议的栏目、顺序和字段名优先；只能参考这份章纲的详略和语气，不得照抄其人物、事件、数字、旧栏目或结尾。`
+        : `## 格式要求\n没有可用的参考章纲，请严格使用“小说章纲生成器”技能定义的固定模板。`;
+      const dynamicTask = `## 本次大纲任务\n类型：${String(kind)}\n作者指令：${compactText(instruction || "补全结构并强化可执行性", 1800)}\n\n${targetSection}${sourceSection}\n${formatSection}\n${kind === "章纲" ? chapterOutlineOutputProtocol : ""}\n## 当前待完善文档（可被替换的旧草稿，不是事实来源）\n${compactText(existingContent || "暂无", 5000)}\n\n输出该类型的大纲 Markdown 正文。章纲必须严格逐项填写固定输出协议，不能使用旧的“核心主线与目标”“核心冲突与节奏”“分段剧情梗概”“实体与关系更新”等替代栏目。旧草稿若与唯一正文依据或章节交接状态冲突，必须完全丢弃冲突部分并重写。若作者指令与历史会话冲突，以本次目标章、唯一正文依据、固定输出协议和作者指令为准。不要输出分析过程、格式说明或额外前言。`;
+      emitter.progress("plan", 48, isNextChapterHandoff ? "步骤 3/5：根据交接状态规划本章事件链与冲突升级" : sourceChapterNumber === targetChapterNumber ? "步骤 3/5：从本章正文提取事件链、冲突与伏笔" : "步骤 3/5：校验指定正文与目标章的事实边界");
+      emitter.context("plan", isNextChapterHandoff ? "正在校验上一章结束状态，阻止重复事件" : sourceChapterNumber === targetChapterNumber ? "正在从本章正文提取已发生事件，避免虚构后续" : "正在校验指定正文与目标章的事实边界", { source: isNextChapterHandoff ? "章纲承接规范" : "正文事实校验", status: "loaded", bytes: byteLength(sourceHandoff), items: sourceChapterRecord ? 1 : 0 });
+      emitter.progress("draft", 62, "步骤 4/5：调用模型生成章纲正文");
       const response = await client.chatStream([
         { role: "system", content: outlineWriterSystemPrompt },
         { role: "user", content: stableProjectPacket },
         ...(outlineHistorySummary ? [{ role: "user" as const, content: compactText(outlineHistorySummary, 7000) }] : []),
-        { role: "user", content: dynamicTask },
         ...(outlineRecentTurns ? [{ role: "user" as const, content: compactText(outlineRecentTurns, 7000) }] : []),
-      ], { max_tokens: kind === "章纲" ? 2200 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+        // Keep the current target/source packet last so stale session turns
+        // cannot override the chapter the author just selected.
+        { role: "user", content: dynamicTask },
+      ], { max_tokens: kind === "章纲" ? 5000 : 3000, temperature: 0.45, retryAttempts: 2 }, chunk => emitter.chunk(chunk));
+      emitter.progress("review", 92, "步骤 5/5：校验章节承接、格式与章末钩子");
       emitter.complete("大纲内容生成完成");
       const nextOutlineSession = appendAgentSession(outlineSession, String(instruction || "补全结构并强化可执行性"), response.content, contextWindow, byteLength(stableProjectPacket));
       outlineSessionCache.set(outlineSessionKey, nextOutlineSession.state);
       void writePersistentContext(`outline-session-${outlineSessionKey}`, nextOutlineSession.state);
       void writePersistentDocument(`outline-session-${outlineSessionKey}`, `# 大纲会话摘要\n\n${nextOutlineSession.state.summary || "暂无压缩摘要"}`);
       if (nextOutlineSession.compressed) emitter.progress("plan", 90, "会话动态上下文已超过 80%，已自动压缩为摘要并保留最近两轮");
-      return { id: req.id, result: { content: response.content } };
+      return { id: req.id, result: { content: kind === "章纲" ? normalizeChapterOutlineOutput(response.content) : response.content } };
     }
     if (req.method === "chapter.write") {
       const {

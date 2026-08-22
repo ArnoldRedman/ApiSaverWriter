@@ -443,9 +443,18 @@ interface AgentDraftResult {
  * time. Keep the JSON transport out of the writer-facing preview while still
  * allowing ordinary (non-JSON) provider fallbacks to render immediately.
  */
-const chapterDraftFromStream = (raw: string): string => {
+const chapterDraftFromStream = (raw: string, depth = 0): string => {
+  if (depth > 4) return raw.trim();
   const trimmed = raw.trimStart();
   if (!trimmed.startsWith('{') && !trimmed.startsWith('```')) return raw;
+  const withoutFence = trimmed.replace(/^```(?:json|markdown|text)?\s*/iu, '').replace(/\s*```$/u, '').trim();
+  try {
+    const parsed = JSON.parse(withoutFence) as Record<string, unknown>;
+    const nested = typeof parsed.draftContent === 'string' ? parsed.draftContent : typeof parsed.content === 'string' ? parsed.content : '';
+    if (nested) return chapterDraftFromStream(nested, depth + 1);
+  } catch {
+    // SSE commonly arrives mid-JSON; decode the visible content field below.
+  }
   const field = /"(?:draftContent|content)"\s*:\s*"/u.exec(raw);
   if (!field) return '';
 
@@ -470,7 +479,9 @@ const chapterDraftFromStream = (raw: string): string => {
     value += escaped[escape] ?? escape;
     index += 1;
   }
-  return value;
+  return value.trimStart().startsWith('{') || value.trimStart().startsWith('```')
+    ? chapterDraftFromStream(value, depth + 1)
+    : value;
 };
 
 interface RuntimeUsageSummary {
@@ -484,6 +495,30 @@ interface RuntimeUsageSummary {
   startedAt: string;
 }
 interface UsageDay extends RuntimeUsageSummary { date: string }
+interface GatewayUsageAccount {
+  keyIndex: number;
+  keyHint: string;
+  usage?: Record<string, unknown>;
+  logs: Array<Record<string, unknown>>;
+  pricing?: Array<Record<string, unknown>>;
+  group?: string;
+  groupRatios?: Record<string, number>;
+  usableGroups?: Record<string, unknown>;
+  error?: string;
+}
+interface GatewayUsageSnapshot {
+  fetchedAt: string;
+  status?: Record<string, unknown>;
+  pricing?: Array<Record<string, unknown>>;
+  accounts: GatewayUsageAccount[];
+  errors: string[];
+}
+interface GatewayPricingEntry extends Record<string, unknown> {
+  __account: GatewayUsageAccount;
+  __group?: string;
+  __groupRatio?: number;
+  __groupKnown: boolean;
+}
 interface AgentChatMessage { role: 'user' | 'assistant'; content: string; createdAt: string }
 
 interface AgentMemoryResult {
@@ -521,6 +556,9 @@ interface AgentConfig {
   baseURL: string;
   apiKey: string;
   apiKeys: string[];
+  // Model IDs returned by /v1/models are scoped to the authenticated key.
+  // Keep the relationship so calls never default to an unrelated first key.
+  modelKeyMap: Record<string, string[]>;
   model: string;
   contextWindow: number;
   reasoningMode: ReasoningMode;
@@ -563,7 +601,7 @@ interface AgentProgressItem {
 
 interface AgentProgressEvent {
   runId?: string;
-  type?: 'progress' | 'chunk' | 'complete' | 'error';
+  type?: 'progress' | 'context' | 'chunk' | 'complete' | 'error';
   data?: {
     step?: string;
     progress?: number;
@@ -621,15 +659,25 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
     ...(Array.isArray(parsed.apiKeys) ? parsed.apiKeys : []),
   ].filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())));
+  const savedModelKeyMap = parsed.modelKeyMap && typeof parsed.modelKeyMap === 'object' ? parsed.modelKeyMap as Record<string, unknown> : {};
+  const modelKeyMap = Object.fromEntries(Object.entries(savedModelKeyMap).flatMap(([model, values]) => {
+    const mappedKeys = Array.isArray(values)
+      ? values.filter((key): key is string => typeof key === 'string' && apiKeys.includes(key))
+      : [];
+    return mappedKeys.length ? [[model, Array.from(new Set(mappedKeys))]] : [];
+  }));
   return {
     serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : '帅apiGPT0.06',
     enabled: parsed.enabled !== false,
-    apiMode: parsed.apiMode === 'responses' || parsed.apiMode === 'anthropic' ? parsed.apiMode : 'openai',
+    // ApiSaverWriter is a managed OpenAI-compatible gateway. Model selection
+    // chooses its matching key; it must not also switch the wire protocol.
+    apiMode: 'openai',
     // ApiSaverWriter uses one managed gateway. Keep legacy/custom values from
     // leaking into requests or making the settings UI appear configurable.
     baseURL: defaultBaseURL,
     apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
     apiKeys,
+    modelKeyMap,
     model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
     contextWindow: Number((parsed as Record<string, unknown>).contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
     reasoningMode: parsed.reasoningMode === 'off' || parsed.reasoningMode === 'low' || parsed.reasoningMode === 'medium' || parsed.reasoningMode === 'high' || parsed.reasoningMode === 'max' || parsed.reasoningMode === 'custom' ? parsed.reasoningMode : 'auto',
@@ -643,6 +691,15 @@ const agentNetworkParams = (config: AgentConfig) => ({
   proxyURL: config.proxyURL.trim(),
   proxyBypassLocal: config.proxyBypassLocal,
 });
+const orderApiKeysForModel = (config: Pick<AgentConfig, 'apiKey' | 'apiKeys' | 'modelKeyMap'>, model: string) => {
+  const all = Array.from(new Set([config.apiKey, ...(config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+  const preferred = (config.modelKeyMap?.[model] || []).filter(key => all.includes(key));
+  return Array.from(new Set([...preferred, ...all]));
+};
+const applyModelKeyRouting = <T extends AgentConfig>(config: T, model: string): T => {
+  const keys = orderApiKeysForModel(config, model);
+  return { ...config, model, apiKey: keys[0] || '', apiKeys: keys };
+};
 const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
 const outlineKinds: OutlineKind[] = ['总纲', '章纲', '世界观与作品设定'];
 const memoryDocumentKinds: MemoryDocumentKind[] = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'];
@@ -658,7 +715,9 @@ const localResourceId = (prefix: string) => `${prefix}-${Date.now()}-${Math.rand
 const splitTxtIntoDismantleChapters = (text: string): Array<{ title: string; sourceContent: string }> => {
   const cleaned = text.replace(/^\uFEFF/u, '').replace(/\r\n/gu, '\n').trim();
   if (!cleaned) return [];
-  const heading = /^\s*(?:第\s*[0-9一二三四五六七八九十百千万零〇两]+\s*[章节卷回部].*|(?:chapter|chap\.)\s*\d+.*)$/gimu;
+  // 兼容网文 TXT 常见的标题行：第X章、Chapter X、1、标题、1. 标题、1 标题。
+  // 仅识别独立行，避免正文中的普通数字被错误切分。
+  const heading = /^[\t 　]*(?:第[\t 　]*[0-9０-９一二三四五六七八九十百千万零〇两]+[\t 　]*[章节卷回部篇集].*|(?:chapter|chap\.?)[\t 　]*[0-9０-９]+(?:[\t 　]*[-—:：、.．][\t 　]*.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\t 　]*[、.．:：-—][\t 　]*(?:\S.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\t 　]*$|[0-9０-９]{1,5}[\t 　]+\S.*)$/gimu;
   const matches = Array.from(cleaned.matchAll(heading));
   if (!matches.length) return [{ title: '第1章', sourceContent: cleaned }];
   const chapters: Array<{ title: string; sourceContent: string }> = [];
@@ -798,6 +857,25 @@ const recentMemoryIds = (memories: ChapterMemory[], limit = 1) => [...memories]
   .map(memory => memory.id);
 
 const memoryListMarkdown = (items: string[]) => items.length ? items.map(item => `- ${item}`).join('\n') : '- 暂无';
+
+const readableChapterPlan = (value?: string): string => {
+  const text = String(value || '').trim().replace(/^```(?:json|markdown|text)?\s*/iu, '').replace(/\s*```$/u, '').trim();
+  if (!text) return '';
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const plan = parsed.plan ?? parsed.content ?? parsed;
+    if (typeof plan === 'string') return readableChapterPlan(plan);
+    if (plan && typeof plan === 'object' && !Array.isArray(plan)) {
+      const labels: Record<string, string> = { opening: '开篇承接', openingAnchor: '开篇承接', handoff: '下一章交接', continuity: '承接锚点', story: '这章的故事', plot: '核心事件链', events: '核心事件链', characters: '这章的人物', characterGoals: '人物目标与动机', conflict: '冲突升级', pacing: '节奏安排', rhythm: '节奏安排', newInformation: '本章新增信息', foreshadowing: '伏笔推进', ending: '章末钩子', hook: '章末钩子', style: '写法与禁区' };
+      return Object.entries(plan as Record<string, unknown>).map(([key, entry]) => {
+        const label = labels[key] || key;
+        const detail = Array.isArray(entry) ? entry.map(item => `- ${String(item)}`).join('\n') : typeof entry === 'object' && entry ? Object.entries(entry as Record<string, unknown>).map(([subKey, subValue]) => `- ${subKey}：${String(subValue)}`).join('\n') : String(entry ?? '');
+        return detail ? `## ${label}\n${detail}` : '';
+      }).filter(Boolean).join('\n\n');
+    }
+  } catch { /* Plain Markdown plans are already suitable for display. */ }
+  return text;
+};
 
 const snapshotMarkdown = (memory: ChapterMemory) => `# ${memory.chapterTitle} 记忆快照
 
@@ -1363,6 +1441,9 @@ function App() {
   const [projectFormMode, setProjectFormMode] = useState<'create' | 'edit'>('create');
   const [projectEditingId, setProjectEditingId] = useState<number | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
+  const [showSupportAnnouncement, setShowSupportAnnouncement] = useState(false);
+  const [announcementTab, setAnnouncementTab] = useState<'notice' | 'timeline'>('notice');
+  const [announcementDontShow, setAnnouncementDontShow] = useState(false);
   const [showMobileMore, setShowMobileMore] = useState(false);
   const [showOutlineTypeModal, setShowOutlineTypeModal] = useState(false);
   const [showTagPicker, setShowTagPicker] = useState(false);
@@ -1446,6 +1527,7 @@ function App() {
   const [cardPreviousSessionId, setCardPreviousSessionId] = useState('');
   const newAgentSessionId = (kind: string) => `${kind}-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const [outlineStreamContent, setOutlineStreamContent] = useState('');
+  const [outlineAgentActivity, setOutlineAgentActivity] = useState<Array<{ id: string; step: string; message: string; status: 'active' | 'complete' | 'error'; source?: string }>>([]);
   const [cardStreamContent, setCardStreamContent] = useState('');
   const outlineRunRef = useRef('');
   const cardRunRef = useRef('');
@@ -1460,7 +1542,7 @@ function App() {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
   const [usageDays, setUsageDays] = useState<UsageDay[]>(() => { try { const value = JSON.parse(localStorage.getItem('writer-runtime-usage-days') || '[]'); return Array.isArray(value) ? value : []; } catch { return []; } });
-  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync'>('model');
+  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync' | 'support' | 'tutorial'>('model');
   const [cloudRemotePath, setCloudRemotePath] = useState(() => {
     const saved = localStorage.getItem('cloud-remote-path');
     return !saved || saved === 'ApiSaverWriter/projects' ? 'ApiSaverWriter/backup' : saved;
@@ -1475,6 +1557,9 @@ function App() {
   const [usageDateFilter, setUsageDateFilter] = useState('all');
   const [usageStartDate, setUsageStartDate] = useState('');
   const [usageEndDate, setUsageEndDate] = useState('');
+  const [gatewayUsage, setGatewayUsage] = useState<GatewayUsageSnapshot | null>(null);
+  const [gatewayUsageLoading, setGatewayUsageLoading] = useState(false);
+  const [gatewayUsageError, setGatewayUsageError] = useState('');
   const activeAgentRunRef = useRef('');
   const runtimeUsageSessionRef = useRef<RuntimeUsageSummary | null>(null);
   const syncRuntimeUsage = async () => {
@@ -1507,9 +1592,45 @@ function App() {
   };
   useEffect(() => { void invoke<string>('start_agent_runtime').then(() => syncRuntimeUsage()); }, []);
   useEffect(() => {
+    const key = 'apisaverwriter-support-announcement-seen';
+    if (localStorage.getItem(key) !== '1') {
+      const timer = window.setTimeout(() => { setAnnouncementDontShow(false); setShowSupportAnnouncement(true); }, 650);
+      return () => window.clearTimeout(timer);
+    }
+    return undefined;
+  }, []);
+  useEffect(() => {
     const timer = window.setInterval(() => { void syncRuntimeUsage(); }, 5000);
     return () => window.clearInterval(timer);
   }, []);
+  const refreshGatewayUsage = async () => {
+    const key = settingsDraft.apiKey.trim() || agentConfig.apiKey.trim();
+    if (!key) {
+      setGatewayUsageError('请先在 AI 模型配置中填写并保存 API Key。');
+      return;
+    }
+    setGatewayUsageLoading(true);
+    setGatewayUsageError('');
+    try {
+      await invoke<string>('start_agent_runtime');
+      const result = await invoke<GatewayUsageSnapshot>('call_agent_rpc', {
+        method: 'gateway.usage',
+        params: {
+          apiKey: key,
+          apiKeys: settingsDraft.apiKeys,
+          ...agentNetworkParams(settingsDraft),
+        },
+      });
+      setGatewayUsage(result);
+    } catch (error) {
+      setGatewayUsageError(String(error));
+    } finally {
+      setGatewayUsageLoading(false);
+    }
+  };
+  useEffect(() => {
+    if (showSettingsModal && settingsSection === 'usage' && !gatewayUsageLoading) void refreshGatewayUsage();
+  }, [showSettingsModal, settingsSection]);
   const [chapterSaving, setChapterSaving] = useState(false);
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [showSearchPanel, setShowSearchPanel] = useState(false);
@@ -1593,12 +1714,29 @@ function App() {
       const payload = event.payload;
       if (!payload) return;
       const data = payload.data ?? {};
+      if (payload.runId === outlineRunRef.current) {
+        if (payload.type === 'chunk' && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
+        if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
+          const step = String(data.step || (payload.type === 'complete' ? 'complete' : payload.type === 'error' ? 'error' : 'progress'));
+          const message = String(data.message || data.context?.action || data.error || '正在处理大纲任务');
+          const source = data.context?.source;
+          setOutlineAgentActivity(current => {
+            const id = `${step}:${message}`;
+            const status = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
+            const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
+            const existing = previous.findIndex(item => item.id === id);
+            if (existing >= 0) return previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item).slice(-12);
+            return [...previous, { id, step, message, status, source }].slice(-12);
+          });
+          return;
+        }
+      }
       if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
       if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
       if (payload.runId !== activeAgentRunRef.current) return;
       if (payload.type === 'context' && data.context) {
-        setContextTrace(current => [...current, {
-          id: `${Date.now()}-${current.length}`,
+        const trace = {
+          id: `${String(data.step || 'context')}:${String(data.context.source || data.context.action)}`,
           step: String(data.step || 'context'),
           action: data.context?.action || data.message || '更新上下文',
           source: data.context?.source,
@@ -1606,7 +1744,12 @@ function App() {
           bytes: data.context?.bytes,
           items: data.context?.items,
           timestamp: Date.now(),
-        }].slice(-40));
+        };
+        setContextTrace(current => {
+          const existing = current.findIndex(item => item.id === trace.id);
+          if (existing < 0) return [...current, trace].slice(-40);
+          return current.map((item, index) => index === existing ? { ...item, ...trace } : item);
+        });
         return;
       }
       if (payload.type === 'chunk' && data.text) {
@@ -1676,9 +1819,43 @@ function App() {
       const payload = (event as CustomEvent<AgentProgressEvent>).detail;
       if (!payload) return;
       const data = payload.data ?? {};
+      if (payload.runId === outlineRunRef.current) {
+        if (payload.type === 'chunk' && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
+        if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
+          const step = String(data.step || (payload.type === 'complete' ? 'complete' : payload.type === 'error' ? 'error' : 'progress'));
+          const message = String(data.message || data.context?.action || data.error || '正在处理大纲任务');
+          const source = data.context?.source;
+          setOutlineAgentActivity(current => {
+            const id = `${step}:${message}`;
+            const status = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
+            const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
+            const existing = previous.findIndex(item => item.id === id);
+            return (existing >= 0 ? previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item) : [...previous, { id, step, message, status, source }]).slice(-12);
+          });
+          return;
+        }
+      }
       if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
       if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
       if (payload.runId !== activeAgentRunRef.current) return;
+      if (payload.type === 'context' && data.context) {
+        const trace = {
+          id: `${String(data.step || 'context')}:${String(data.context.source || data.context.action)}`,
+          step: String(data.step || 'context'),
+          action: data.context.action || data.message || '更新上下文',
+          source: data.context.source,
+          status: data.context.status,
+          bytes: data.context.bytes,
+          items: data.context.items,
+          timestamp: Date.now(),
+        };
+        setContextTrace(current => {
+          const existing = current.findIndex(item => item.id === trace.id);
+          if (existing < 0) return [...current, trace].slice(-40);
+          return current.map((item, index) => index === existing ? { ...item, ...trace } : item);
+        });
+        return;
+      }
       if (payload.type === 'chunk' && data.text) {
         agentStreamRawContentRef.current += String(data.text);
         setAgentDisplayContent(chapterDraftFromStream(agentStreamRawContentRef.current));
@@ -1924,7 +2101,10 @@ function App() {
         if (!override) return skill;
         const isLegacyWorldSetting = skill.name === 'world-setting-planner'
           && /标记已确认与待揭示内容/u.test(String(override.content || ''));
-        return isLegacyWorldSetting
+        const isLegacyChapterOutline = skill.name === '小说章纲生成器'
+          && (!/#\s*番茄小说章纲生成器 Skill/u.test(String(override.content || ''))
+            || /(?:800\s*[-~到至]\s*1000|章纲总字数控制)/u.test(String(override.content || '')));
+        return isLegacyWorldSetting || isLegacyChapterOutline
           ? { ...skill, builtin: true }
           : { ...skill, ...override, displayName: skill.displayName, builtin: true };
       });
@@ -2255,7 +2435,8 @@ function App() {
         method: 'book.download',
         params: {
           title: downloadable.title, author: downloadable.author, source: downloadable.sourceId || 'fanqie', sourceBookId: downloadable.sourceBookId || downloadable.id, url: downloadable.url,
-          maxChapters: 200, ...agentNetworkParams(agentConfig),
+          // 不设置人为上限，按书源完整目录下载全部章节。
+          ...agentNetworkParams(agentConfig),
         },
       });
       const downloadedChapterCount = Number(result.completedChapterCount) || (result.chapters || []).filter(chapter => chapter.downloaded === true && typeof chapter.content === 'string' && chapter.content.trim()).length;
@@ -3711,23 +3892,118 @@ function App() {
     setProjects(current => current.map(project => project.id === updated.id ? updated : project));
   };
 
+  const parseChineseChapterNumber = (value: string): number | undefined => {
+    const normalized = value.replace(/\s+/gu, '');
+    if (/^\d+$/u.test(normalized)) return Number(normalized);
+    const digits: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+    let total = 0;
+    let pendingDigit = 0;
+    let hasDigit = false;
+    for (const char of normalized) {
+      if (digits[char] !== undefined) {
+        pendingDigit = digits[char];
+        hasDigit = true;
+        continue;
+      }
+      const unit = char === '十' ? 10 : char === '百' ? 100 : char === '千' ? 1000 : 0;
+      if (!unit) return undefined;
+      total += (pendingDigit || 1) * unit;
+      pendingDigit = 0;
+    }
+    return hasDigit || total ? total + pendingDigit : undefined;
+  };
+
+  const chapterNumberFromText = (value: string) => {
+    const match = value.match(/第\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章/u);
+    return match ? parseChineseChapterNumber(match[1]) : undefined;
+  };
+
+  /** Old chapter outlines may not have a chapterId. Recover it from their title
+   * before an agent run, rather than letting the model infer a chapter from
+   * unrelated outline history. */
+  const chapterBoundToOutline = (project: Project, outline: OutlineDocument): Chapter | undefined => {
+    const byId = typeof outline.chapterId === 'number'
+      ? project.chapters.find(chapter => chapter.id === outline.chapterId)
+      : undefined;
+    if (byId) return byId;
+    const chapterNumber = chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`);
+    if (!chapterNumber) return undefined;
+    return project.chapters.find(chapter => chapterNumberFromText(chapter.title) === chapterNumber)
+      || project.chapters[chapterNumber - 1];
+  };
+
+  const chapterByNumber = (project: Project, number: number | undefined): Chapter | undefined => {
+    if (!number || number < 1) return undefined;
+    return project.chapters.find(chapter => chapterNumberFromText(chapter.title) === number)
+      || project.chapters[number - 1];
+  };
+
+  const outlineByChapterNumber = (project: Project, number: number | undefined): OutlineDocument | undefined => {
+    if (!number || number < 1) return undefined;
+    return project.outlines.find(outline => outline.kind === '章纲'
+      && chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`) === number)
+      || project.outlines.find(outline => outline.kind === '章纲'
+        && String(outline.chapterId ?? '') === String(project.chapters[number - 1]?.id ?? ''));
+  };
+
+  const instructionChapterNumber = (instruction: string, pattern: RegExp): number | undefined => {
+    const matched = instruction.match(pattern)?.slice(1).find(Boolean);
+    return matched ? parseChineseChapterNumber(matched) : undefined;
+  };
+
+  const resolveOutlineGenerationIntent = (project: Project, activeOutline: OutlineDocument, instruction: string) => {
+    const sourcePattern = /(?:根据|基于|参考|按|以)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:正文|内容)|第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:正文|内容)\s*(?:生成|编写|补全|整理|反推|制作)/u;
+    const sourceMatched = instruction.match(sourcePattern);
+    const explicitSourceNumber = sourceMatched
+      ? parseChineseChapterNumber(sourceMatched[1] || sourceMatched[2])
+      : undefined;
+    const targetNumber = chapterNumberFromText(`${activeOutline.title}\n${activeOutline.content.slice(0, 500)}`);
+    const explicitTargetNumber = instructionChapterNumber(instruction, /(?:生成|编写|补全|制作|整理|反推)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)|(?:为|给)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)/u)
+      || instructionChapterNumber(instruction, /第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)\s*(?:生成|编写|补全|制作|整理|反推)/u);
+    const redirectedOutline = explicitTargetNumber && explicitTargetNumber !== targetNumber
+      ? project.outlines.find(outline => outline.kind === '章纲' && chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`) === explicitTargetNumber)
+      : undefined;
+    const targetOutline = redirectedOutline || activeOutline;
+    const targetChapter = chapterBoundToOutline(project, targetOutline);
+    const targetIndex = targetChapter ? project.chapters.findIndex(chapter => chapter.id === targetChapter.id) : -1;
+    const explicitFormatNumber = instructionChapterNumber(instruction, /(?:参考|按照|依照|沿用|模仿)\s*第?\s*(\d+|[零〇一二三四五六七八九十百千]+)\s*章(?:的)?(?:章纲|大纲)(?:格式|结构|模板)/u);
+    const formatOutline = explicitFormatNumber
+      ? outlineByChapterNumber(project, explicitFormatNumber)
+      : targetIndex > 0 ? outlineByChapterNumber(project, targetIndex) : undefined;
+    const formatMode = explicitFormatNumber
+      ? (formatOutline ? `作者指定参考第 ${explicitFormatNumber} 章章纲格式` : `未找到第 ${explicitFormatNumber} 章章纲格式`)
+      : formatOutline ? '默认参考上一章章纲格式' : '无可用格式参考';
+    const useCurrent = /(?:本章|当前章)(?:的)?(?:正文|内容)/u.test(instruction);
+    const usePrevious = /(?:上一章|前一章)(?:的)?(?:正文|内容)/u.test(instruction);
+    const sourceChapter = explicitSourceNumber ? chapterByNumber(project, explicitSourceNumber)
+      : useCurrent ? targetChapter
+        : (usePrevious || targetIndex > 0) ? project.chapters[targetIndex - 1]
+          : undefined;
+    const isFirstChapter = !explicitSourceNumber && !useCurrent && !usePrevious
+      && (targetNumber === 1 || targetIndex === 0);
+    const sourceMode = explicitSourceNumber
+      ? `作者指定第 ${explicitSourceNumber} 章正文`
+      : useCurrent ? '作者指定本章正文'
+        : sourceChapter ? '默认上一章正文'
+          : isFirstChapter ? '首章：根据世界观、作品简介与作者指令生成'
+          : '未找到可用正文';
+    return { targetOutline, targetChapter, sourceChapter, sourceMode, isFirstChapter, formatOutline, formatMode, explicitTargetNumber, targetRedirectFound: Boolean(redirectedOutline) };
+  };
+
   const handleCreateOutline = (kind: OutlineKind) => {
     if (!editingProject) return;
     const now = new Date().toISOString();
     // 章纲按项目内已有章节/章纲的最大序号递增，避免新建时重复落在当前选中章节。
-    const chapterNumberFromText = (value: string) => {
-      const match = value.match(/第\s*(\d+)\s*章/u);
-      return match ? Number(match[1]) : 0;
-    };
+    const chapterNumber = (value: string) => chapterNumberFromText(value) || 0;
     const nextChapterNumber = kind === '章纲'
       ? Math.max(
         0,
-        ...editingProject.chapters.map(chapter => chapterNumberFromText(chapter.title)),
-        ...editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => chapterNumberFromText(`${outline.title}\n${outline.content}`)),
+        ...editingProject.chapters.map(chapter => chapterNumber(chapter.title)),
+        ...editingProject.outlines.filter(outline => outline.kind === '章纲').map(outline => chapterNumber(`${outline.title}\n${outline.content}`)),
       ) + 1
       : 0;
     const nextChapter = kind === '章纲'
-      ? editingProject.chapters.find(chapter => chapterNumberFromText(chapter.title) === nextChapterNumber)
+      ? editingProject.chapters.find(chapter => chapterNumber(chapter.title) === nextChapterNumber)
       : undefined;
     const chapterId = nextChapter?.id;
     const chapterTitle = kind === '章纲' ? (nextChapter?.title || `第 ${nextChapterNumber} 章`) : undefined;
@@ -3783,24 +4059,64 @@ function App() {
     setAgentError('');
     setOutlineGenerating(true);
     const runId = `outline-${Date.now()}`; outlineRunRef.current = runId; setOutlineStreamContent('');
+    setOutlineAgentActivity([{ id: 'starting', step: 'starting', message: '正在启动大纲智能体', status: 'active' }]);
     setOutlineChatMessages(current => [...current, { role: 'user', content: outlineAgentInstruction.trim(), createdAt: new Date().toISOString() }]);
     try {
       await invoke<string>('start_agent_runtime');
       const activeStyle = editingProject.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) : undefined;
+      const intent = outline.kind === '章纲' ? resolveOutlineGenerationIntent(editingProject, outline, outlineAgentInstruction) : undefined;
+      const targetOutline = intent?.targetOutline || outline;
+      const targetChapter = intent?.targetChapter;
+      const sourceChapter = intent?.sourceChapter;
+      const formatOutline = intent?.formatOutline;
+      if (outline.kind === '章纲' && intent?.explicitTargetNumber && !intent.targetRedirectFound && intent.explicitTargetNumber !== chapterNumberFromText(`${outline.title}\n${outline.content.slice(0, 500)}`)) {
+        throw new Error(`没有找到第 ${intent.explicitTargetNumber} 章的章纲文档，请先新建或选择该章纲。`);
+      }
+      if (outline.kind === '章纲' && !sourceChapter && !intent?.isFirstChapter) {
+        throw new Error('未找到上一章正文。请先保存上一章正文，或在指令中明确写“根据本章正文”或“根据第 N 章正文”。');
+      }
+      if (outline.kind === '章纲' && targetChapter && targetOutline.chapterId !== targetChapter.id) {
+        updateEditorProject(project => ({
+          ...project,
+          outlines: project.outlines.map(item => item.id === targetOutline.id ? { ...item, chapterId: targetChapter.id, updatedAt: new Date().toISOString() } : item),
+        }));
+      }
       const result = await invoke<{ content?: string; title?: string }>('call_agent_rpc', {
         method: 'outline.write',
         params: {
           runId,
           sessionId: outlineSessionId,
           previousSessionId: outlinePreviousSessionId,
+          outlineId: targetOutline.id,
           projectId: String(editingProject.id),
           projectTitle: editingProject.title,
           kind: outline.kind,
-          existingContent: outline.content,
+          existingContent: targetOutline.content,
+          targetChapter: targetChapter ? {
+            id: targetChapter.id,
+            number: chapterNumberFromText(targetChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === targetChapter.id) + 1,
+            title: targetChapter.title,
+          } : undefined,
+          sourceChapter: sourceChapter ? {
+            id: sourceChapter.id,
+            number: chapterNumberFromText(sourceChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === sourceChapter.id) + 1,
+            title: sourceChapter.title,
+            content: sourceChapter.content,
+            mode: intent?.sourceMode,
+          } : undefined,
+          formatOutline: formatOutline ? {
+            id: formatOutline.id,
+            title: formatOutline.title,
+            content: formatOutline.content,
+            mode: intent?.formatMode,
+          } : undefined,
           instruction: activeStyle ? `${outlineAgentInstruction.trim()}\n采用绑定文风 Skill「${activeStyle.name}」，只遵循抽象写作约束。` : outlineAgentInstruction.trim(),
           synopsis: editingProject.synopsis,
           cards: editingProject.cards.filter(card => selectedOutlineCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
+          worldSetting: editingProject.outlines
+            .filter(item => item.kind === '世界观与作品设定' && item.content.trim())
+            .map(item => ({ id: item.id, title: item.title, content: item.content })),
           authorPreferences: editingProject.authorPreferences || [],
           writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
           skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
@@ -3815,11 +4131,18 @@ function App() {
           ...agentNetworkParams(agentConfig),
         },
       });
-      updateActiveOutline({ content: result.content || outline.content });
-      setOutlineChatMessages(current => [...current, { role: 'assistant', content: result.content || outline.content, createdAt: new Date().toISOString() }]);
-      setNotice({ title: '大纲已生成', content: `${outline.kind} 已由智能体生成，可继续手动编辑。` });
+      const generatedContent = result.content || targetOutline.content;
+      updateEditorProject(project => ({
+        ...project,
+        outlines: project.outlines.map(item => item.id === targetOutline.id ? { ...item, content: generatedContent, updatedAt: new Date().toISOString() } : item),
+        updatedAt: new Date().toISOString(),
+      }));
+      setActiveOutlineId(targetOutline.id);
+      setOutlineChatMessages(current => [...current, { role: 'assistant', content: generatedContent, createdAt: new Date().toISOString() }]);
+      setNotice({ title: '大纲已生成', content: `${targetOutline.title} 已依据${sourceChapter ? `第 ${chapterNumberFromText(sourceChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === sourceChapter.id) + 1} 章正文` : '作品资料'}生成。` });
     } catch (error) {
       setAgentError(String(error));
+      setOutlineAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, step: 'error', message: String(error), status: 'error' }].slice(-12));
       setNotice({ title: '大纲生成失败', content: String(error) });
     } finally {
       setOutlineGenerating(false);
@@ -4111,6 +4434,45 @@ function App() {
     setSettingsSection('model');
   };
 
+  const openSupportLink = async (url: string, label: string, fallbackText: string) => {
+    try {
+      await invoke('open_external_url', { url });
+    } catch {
+      // Web preview and mobile builds do not expose the desktop opener.
+      const opened = window.open(url, '_blank', 'noopener,noreferrer');
+      if (!opened) window.location.href = url;
+    }
+    setNotice({ title: `正在打开${label}`, content: `${fallbackText} 已复制，正在跳转 QQ 官方页面。` });
+  };
+
+  const openQQGroup = async () => {
+    const groupNumber = '1019592334';
+    try { await navigator.clipboard.writeText(groupNumber); } catch { /* Clipboard permission is optional. */ }
+    await openSupportLink('https://qm.qq.com/q/Oc3ZAaU08K', 'QQ 群', `QQ群号 ${groupNumber}`);
+  };
+
+  const openCustomerQQ = async () => {
+    const customerQQ = '2805099052';
+    try { await navigator.clipboard.writeText(customerQQ); } catch { /* Clipboard permission is optional. */ }
+    await openSupportLink('https://qm.qq.com/q/BJKvbHWSK4', '客服 QQ', `客服 QQ ${customerQQ}`);
+  };
+
+  const openTutorial = async () => {
+    const url = 'https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb?from=from_copylink';
+    try {
+      await invoke('open_external_url', { url });
+    } catch {
+      const opened = window.open(url, '_blank', 'noopener,noreferrer');
+      if (!opened) window.location.href = url;
+    }
+    setNotice({ title: '正在打开使用教程', content: '已在浏览器打开飞书使用教程。' });
+  };
+
+  const dismissSupportAnnouncement = (permanent = false) => {
+    if (permanent) localStorage.setItem('apisaverwriter-support-announcement-seen', '1');
+    setShowSupportAnnouncement(false);
+  };
+
   const checkCloudSyncStatus = async () => {
     setCloudSyncRunning(true);
     setCloudSyncMessage('正在检查百度网盘登录状态...');
@@ -4372,15 +4734,23 @@ function App() {
     setModelsLoading(true);
     try {
       await invoke<string>('start_agent_runtime');
-      const responses = await Promise.allSettled(keys.map(apiKey => invoke<{ models?: string[] }>('call_agent_rpc', {
+      const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await invoke<{ models?: string[] }>('call_agent_rpc', {
         method: 'models.list',
         params: { baseURL: defaultBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
-      })));
-      const successful = responses.filter((response): response is PromiseFulfilledResult<{ models?: string[] }> => response.status === 'fulfilled');
-      const models = Array.from(new Set(successful.flatMap(response => Array.isArray(response.value.models) ? response.value.models : []).filter((model): model is string => typeof model === 'string' && Boolean(model))));
+      }) })));
+      const successful = responses.filter((response): response is PromiseFulfilledResult<{ apiKey: string; result: { models?: string[] } }> => response.status === 'fulfilled');
+      const modelKeyMap = successful.reduce<Record<string, string[]>>((map, response) => {
+        (Array.isArray(response.value.result.models) ? response.value.result.models : []).forEach(model => {
+          if (typeof model !== 'string' || !model.trim()) return;
+          map[model] = Array.from(new Set([...(map[model] || []), response.value.apiKey]));
+        });
+        return map;
+      }, {});
+      const models = Object.keys(modelKeyMap);
       if (models.length === 0) throw new Error('接口没有返回可用模型');
       setFetchedModels(models);
       localStorage.setItem('agent-fetched-models', JSON.stringify(models));
+      setSettingsDraft(current => applyModelKeyRouting({ ...current, modelKeyMap: { ...current.modelKeyMap, ...modelKeyMap } }, current.model));
       const failed = responses.length - successful.length;
       setModelListMessage(`已从 ${successful.length}/${keys.length} 个 Key 获取 ${models.length} 个模型${failed ? `，${failed} 个 Key 请求失败` : ''}${settingsDraft.proxyEnabled ? `，请求已通过代理 ${settingsDraft.proxyURL}` : ''}，勾选模型即可启用。`);
     } catch (error) {
@@ -4398,15 +4768,17 @@ function App() {
     setModelsTesting(true);
     setModelListMessage('正在测试当前模型...');
     try {
+      const selectedModel = settingsDraft.model.trim() || fallbackModels[0];
+      const orderedKeys = orderApiKeysForModel(settingsDraft, selectedModel);
       await invoke<string>('start_agent_runtime');
       await invoke('call_agent_rpc', {
         method: 'models.test',
         params: {
-          apiKey: settingsDraft.apiKey.trim(),
-          apiKeys: settingsDraft.apiKeys,
+          apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
+          apiKeys: orderedKeys,
           baseURL: defaultBaseURL,
           apiMode: settingsDraft.apiMode,
-          model: settingsDraft.model.trim() || fallbackModels[0],
+          model: selectedModel,
           reasoningMode: settingsDraft.reasoningMode,
           contextWindow: settingsDraft.contextWindow,
           ...agentNetworkParams(settingsDraft),
@@ -4450,7 +4822,7 @@ function App() {
     const normalized = model.trim();
     if (!normalized) return;
     setSettingsModels(current => current.includes(normalized) ? current : [...current, normalized]);
-    setSettingsDraft(current => ({ ...current, model: normalized }));
+    setSettingsDraft(current => applyModelKeyRouting(current, normalized));
   };
 
   const addCustomModel = () => {
@@ -4510,15 +4882,16 @@ function App() {
     const apiKeys = Array.from(new Set([settingsDraft.apiKey, ...(settingsDraft.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
     setAvailableModels(enabledModels);
     localStorage.setItem('agent-models', JSON.stringify(enabledModels));
-    setAgentConfig({
+    setAgentConfig(applyModelKeyRouting({
       ...settingsDraft,
       serviceName: settingsDraft.serviceName.trim() || '帅apiGPT0.06',
+      apiMode: 'openai',
       baseURL: defaultBaseURL,
       apiKey: apiKeys[0] || '',
       apiKeys,
       model: selectedModel,
       contextWindow: Math.max(16, Number(settingsDraft.contextWindow) || 128),
-    });
+    }, selectedModel));
     setAgentError('');
     setAgentStage('idle');
     setShowSettingsModal(false);
@@ -4637,6 +5010,9 @@ function App() {
   };
 
   const activeOutline = editingProject?.outlines.find(outline => outline.id === activeOutlineId) ?? null;
+  const outlineIntentPreview = editingProject && activeOutline?.kind === '章纲'
+    ? resolveOutlineGenerationIntent(editingProject, activeOutline, outlineAgentInstruction)
+    : null;
   const activeCard = editingProject?.cards.find(card => card.id === activeCardId) ?? null;
   const activeWritingStyle = editingProject?.styleProfileId ? writingStyles.find(style => style.id === editingProject.styleProfileId) ?? null : null;
   const activeMemoryDocument = editingProject?.memoryDocuments.find(document => document.id === activeMemoryDocumentId) ?? null;
@@ -4805,6 +5181,66 @@ function App() {
   });
   const emptyUsage: RuntimeUsageSummary = { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: '' };
   const usageView = (usageStartDate || usageEndDate || usageDateFilter !== 'all') ? usageRows.reduce((total, day) => ({ ...total, inputTokens: total.inputTokens + day.inputTokens, outputTokens: total.outputTokens + day.outputTokens, totalTokens: total.totalTokens + day.totalTokens, cachedInputTokens: total.cachedInputTokens + day.cachedInputTokens, cacheWriteTokens: total.cacheWriteTokens + day.cacheWriteTokens, reasoningTokens: total.reasoningTokens + day.reasoningTokens, requests: total.requests + day.requests }), emptyUsage) : runtimeUsage;
+  const gatewayLogTime = (log: Record<string, unknown>) => {
+    const value = Number(log.created_at || 0);
+    return value > 10_000_000_000 ? value : value * 1000;
+  };
+  const gatewayLogs = (gatewayUsage?.accounts || []).flatMap(account => account.logs.map(log => ({ ...log, __keyHint: account.keyHint, __keyIndex: account.keyIndex }))).filter(log => {
+    const timestamp = gatewayLogTime(log);
+    if (!timestamp) return true;
+    const date = new Date(timestamp);
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+    if (usageStartDate || usageEndDate) return (!usageStartDate || key >= usageStartDate) && (!usageEndDate || key <= usageEndDate);
+    if (usageDateFilter === 'all') return true;
+    if (usageDateFilter === 'today') return key === localToday;
+    const from = new Date(); from.setHours(0, 0, 0, 0); from.setDate(from.getDate() - Number(usageDateFilter) + 1);
+    return timestamp >= from.getTime();
+  }).sort((left, right) => gatewayLogTime(right) - gatewayLogTime(left));
+  const enabledGatewayModels = new Set([settingsDraft.model, ...settingsModels].filter(Boolean));
+  const gatewayPricing = (gatewayUsage?.accounts || []).flatMap(account => (account.pricing || [])
+    .filter(item => enabledGatewayModels.size === 0 || enabledGatewayModels.has(String(item.model_name || '')))
+    .flatMap(item => {
+      const configuredRatio = account.group && account.groupRatios?.[account.group];
+      if (Number.isFinite(Number(configuredRatio))) {
+        return [{ ...item, __account: account, __group: account.group, __groupRatio: Number(configuredRatio), __groupKnown: true } as GatewayPricingEntry];
+      }
+      // New API's read-only usage endpoint does not expose Token.Group. Do not
+      // silently price an unknown key at 1x: show each usable group instead.
+      const enabledGroups = Array.isArray(item.enable_groups) ? item.enable_groups.map(String) : [];
+      const groups = enabledGroups.filter(group => !account.usableGroups || Object.prototype.hasOwnProperty.call(account.usableGroups, group));
+      return groups.map(group => ({ ...item, __account: account, __group: group, __groupRatio: Number(account.groupRatios?.[group]), __groupKnown: false } as GatewayPricingEntry))
+        .filter(entry => Number.isFinite(entry.__groupRatio));
+    }));
+  const gatewayQuotaPerUnit = Number(gatewayUsage?.status?.quota_per_unit || 500000);
+  const gatewayCurrency = String(gatewayUsage?.status?.quota_display_type || 'CNY');
+  const gatewayExchangeRate = Number(gatewayUsage?.status?.usd_exchange_rate || 1);
+  const gatewayCurrencySymbol = gatewayCurrency === 'CNY' ? '¥' : gatewayCurrency === 'USD' ? '$' : String(gatewayUsage?.status?.custom_currency_symbol || gatewayCurrency);
+  const formatGatewayCurrency = (usd: number, suffix = '') => `${gatewayCurrencySymbol}${Number((usd * (gatewayCurrency === 'USD' ? 1 : gatewayExchangeRate)).toFixed(6)).toLocaleString('zh-CN', { maximumFractionDigits: 6 })}${suffix}`;
+  const formatGatewayPrice = (usd: number) => `${formatGatewayCurrency(usd)} / 1M tokens`;
+  const parseDynamicTiers = (expression: string) => Array.from(expression.matchAll(/tier\(\s*["']([^"']+)["']\s*,\s*([^)]*)\)/gu)).map(match => ({ label: match[1], formula: match[2] }));
+  const dynamicTierPrice = (formula: string, name: string, groupRatio: number) => {
+    const variable = name === '输入' ? 'p' : name === '输出' ? 'c' : name === '缓存读取' ? 'cr' : 'cw';
+    const pattern = new RegExp(`(?:^|[+\\s])${variable}\\s*\\*\\s*([\\d.]+)`, 'u');
+    const multiplier = Number(formula.match(pattern)?.[1] || 0);
+    return multiplier > 0 ? formatGatewayPrice(multiplier * groupRatio) : '-';
+  };
+  const staticGatewayPrice = (item: Record<string, unknown>, type: 'input' | 'output' | 'cache' | 'write', groupRatio: number) => {
+    if (Number(item.quota_type) === 1) return type === 'input' ? `${formatGatewayCurrency(Number(item.model_price || 0) * groupRatio)} / 次` : '-';
+    // This is New API's published model-square formula for non-tiered
+    // token models. Dynamic expressions and pay-per-request models bypass it.
+    const input = Number(item.model_ratio || 0) * 2 * groupRatio;
+    const multiplier = type === 'output' ? Number(item.completion_ratio || 1) : type === 'cache' ? Number(item.cache_ratio ?? 1) : type === 'write' ? Number(item.create_cache_ratio ?? 1) : 1;
+    return Number.isFinite(input) && input > 0 ? formatGatewayPrice(input * multiplier) : '-';
+  };
+  const gatewayInputPrice = (item: GatewayPricingEntry) => {
+    const groupRatio = Number(item.__groupRatio);
+    if (String(item.billing_mode || '') === 'tiered_expr') {
+      const tier = parseDynamicTiers(String(item.billing_expr || ''))[0];
+      return Number(tier?.formula.match(/(?:^|[+\s])p\s*\*\s*([\d.]+)/u)?.[1] || Number.POSITIVE_INFINITY) * groupRatio;
+    }
+    return Number(item.quota_type) === 1 ? Number(item.model_price || Number.POSITIVE_INFINITY) * groupRatio : Number(item.model_ratio || Number.POSITIVE_INFINITY) * 2 * groupRatio;
+  };
+  gatewayPricing.sort((left, right) => gatewayInputPrice(left) - gatewayInputPrice(right));
 
   return (
     <div className="app">
@@ -5288,7 +5724,7 @@ function App() {
                 <select
                   className="agent-model-select"
                   value={agentConfig.model}
-                  onChange={(event) => setAgentConfig(current => ({ ...current, model: event.target.value }))}
+                  onChange={(event) => setAgentConfig(current => applyModelKeyRouting(current, event.target.value))}
                   aria-label="选择写作模型"
                 >
                   {Array.from(new Set([agentConfig.model, ...availableModels])).filter(Boolean).map(model => <option key={model} value={model}>{model}</option>)}
@@ -5300,12 +5736,19 @@ function App() {
                   <section className="agent-task-section">
                     <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlinePreviousSessionId(outlineSessionId); setOutlineSessionId(newAgentSessionId('outline')); setOutlineChatMessages([]); setOutlineStreamContent(''); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={outlineAgentInstruction} onChange={event => setOutlineAgentInstruction(event.target.value)} placeholder="描述要补全的结构、节奏、冲突和章节安排" />
+                    {outlineIntentPreview && <div className={`outline-intent-preview ${outlineIntentPreview.sourceChapter || outlineIntentPreview.isFirstChapter ? '' : 'warning'}`}>
+                      <strong>意图识别</strong>
+                      <span>目标：{outlineIntentPreview.targetOutline.title || '未命名章纲'}</span>
+                      <span>依据：{outlineIntentPreview.sourceChapter ? `第 ${chapterNumberFromText(outlineIntentPreview.sourceChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === outlineIntentPreview.sourceChapter?.id) + 1} 章正文` : outlineIntentPreview.isFirstChapter ? '世界观与作品简介（首章无需上一章正文）' : '未找到正文'}</span>
+                      <small>{outlineIntentPreview.sourceMode} · 格式：{outlineIntentPreview.formatMode}</small>
+                    </div>}
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择大纲技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><p>不选时由智能体按大纲创作意图自动选择技能。</p><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
                     <div className="agent-card-picker"><div className="agent-card-picker-title">大纲带入卡片 <small>{selectedOutlineCardIds.length} 张</small></div>{editingProject.cards.length === 0 ? <p className="empty-hint compact">没有可带入的知识卡</p> : editingProject.cards.map(card => <label key={card.id} className="agent-card-option"><input type="checkbox" checked={selectedOutlineCardIds.includes(card.id)} onChange={() => setSelectedOutlineCardIds(current => current.includes(card.id) ? current.filter(id => id !== card.id) : [...current, card.id])} /><span><strong>{card.title}</strong><small>{card.type}</small></span></label>)}</div>
+                    {(outlineGenerating || outlineAgentActivity.length > 0) && <section className="outline-agent-activity" aria-live="polite"><div className="outline-activity-heading"><strong>大纲智能体执行过程</strong><small>{outlineGenerating ? '运行中' : '已完成'}</small></div>{outlineAgentActivity.map(item => <div key={item.id} className={`outline-activity-row ${item.status}`}><span className="outline-activity-dot" /><div><strong>{item.step === 'intent' ? '意图识别' : item.step === 'retrieve' ? '上下文装载' : item.step === 'plan' ? '事件规划' : item.step === 'draft' ? '生成章纲' : item.step === 'review' ? '承接校验' : item.step === 'complete' ? '任务完成' : item.step === 'error' ? '运行失败' : '准备运行'}</strong><span>{item.message}</span>{item.source && <small>{item.source}</small>}</div></div>)}</section>}
                     {outlineChatMessages.length > 0 && <div className="agent-chat-history">{outlineChatMessages.map((message, index) => <article key={`${message.createdAt}-${index}`} className={`agent-chat-bubble ${message.role}`}><small>{message.role === 'user' ? '你' : '大纲智能体'}</small><p>{message.content}</p></article>)}</div>}
                     {outlineGenerating && <article className="agent-chat-bubble assistant"><small>大纲智能体正在回复</small><p>{outlineStreamContent || '正在连接模型...'}</p></article>}
                     <div className="outline-agent-actions"><button className="btn-primary" disabled={outlineGenerating || !activeOutline} onClick={() => void generateOutline()}>{outlineGenerating ? '生成大纲中...' : '生成当前大纲'}</button></div>
-                    {outlineGenerating && <div className="outline-agent-progress"><span className="agent-progress-dot active" /><span>正在分析作品设定、卡片和知识图谱...</span></div>}
+                    {outlineGenerating && <div className="outline-agent-progress"><span className="agent-progress-dot active" /><span>{outlineAgentActivity.at(-1)?.message || '正在分析作品设定、卡片和知识图谱...'}</span></div>}
                     {agentError && <div className="agent-error">{agentError}</div>}
                   </section>
                   <p className="outline-agent-hint">大纲智能体会读取作品简介、卡片、知识图谱和当前大纲内容，生成结果会直接回填左侧文本编辑区。</p>
@@ -5422,7 +5865,7 @@ function App() {
                     {agentDraft.chapterPlan && <details className="agent-chapter-plan" open>
                       <summary>下一章执行计划</summary>
                       <div className="agent-plan-meta">已交给正文节点执行，接受草稿前可先核对承接与钩子。</div>
-                      <pre>{agentDraft.chapterPlan}</pre>
+                      <div className="agent-plan-content">{readableChapterPlan(agentDraft.chapterPlan).split(/\n{2,}/u).map((section, index) => <p key={`${index}-${section.slice(0, 24)}`}>{section}</p>)}</div>
                     </details>}
                     {agentDraft.contextReport && <div className="agent-context-report">
                       <span>本地上下文包{agentDraft.contextReport.cache === 'hit' ? '缓存命中' : '缓存未命中'}</span>
@@ -5657,8 +6100,10 @@ function App() {
               <nav className="settings-sidebar" aria-label="设置分类">
                 <button className={settingsSection === 'model' ? 'active' : ''} onClick={() => setSettingsSection('model')}><strong>AI 模型配置</strong><small>服务、接口、密钥与模型参数</small></button>
                 <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
-                <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>总计与按天统计</small></button>
+                <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>余额、模型价格与个人日志</small></button>
                 <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘云端备份与恢复</small></button>
+                <button className={settingsSection === 'support' ? 'active' : ''} onClick={() => setSettingsSection('support')}><strong>联系与支持</strong><small>加入 QQ 群，获取帮助与公告</small></button>
+                <button className={settingsSection === 'tutorial' ? 'active' : ''} onClick={() => setSettingsSection('tutorial')}><strong>使用教程</strong><small>快速了解核心工作流</small></button>
               </nav>
             <div className="modal-body settings-content">
               {settingsSection === 'model' && <>
@@ -5682,7 +6127,7 @@ function App() {
                   <div className="form-group">
                     <label>API 模式</label>
                     <div className="settings-segmented-control">
-                      {([['openai', 'OpenAI 兼容'], ['responses', 'Responses API'], ['anthropic', 'Anthropic 兼容']] as Array<[ApiMode, string]>).map(([mode, label]) => <button key={mode} className={settingsDraft.apiMode === mode ? 'active' : ''} onClick={() => setSettingsDraft({ ...settingsDraft, apiMode: mode })}>{label}</button>)}
+                      <span className="settings-fixed-mode">OpenAI 兼容接口（所有模型统一使用）</span>
                     </div>
                   </div>
                   <div className="form-group">
@@ -5731,9 +6176,31 @@ function App() {
               </section>}
               {settingsSection === 'usage' && <section className="usage-dashboard">
                 <div className="usage-filter-bar"><div className="usage-range-checks">{[['all', '全部时间'], ['today', '今天'], ['1', '近 1 天'], ['7', '近 7 天'], ['14', '近 14 天'], ['30', '近 30 天']].map(([value, label]) => <button type="button" key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''} onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }}>{label}</button>)}</div><div className="usage-date-controls"><label>开始<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>重置</button></div></div>
-                <div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间真实消耗 Tokens' : '筛选时间真实消耗 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div>
-                <div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div>
-                <div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div>
+                <div className="gateway-usage-heading"><div><strong>ApiSaver 中转站用量</strong><small>余额、模型广场定价与日志均直接来自中转站；仅使用当前配置的 API Key 查询。</small></div><button className="btn-secondary" disabled={gatewayUsageLoading} onClick={() => void refreshGatewayUsage()}>{gatewayUsageLoading ? '刷新中...' : '刷新中转站数据'}</button></div>
+                {gatewayUsageError && <p className="model-list-message error">{gatewayUsageError}</p>}
+                {gatewayUsage?.errors.length ? <p className="model-list-message error">{gatewayUsage.errors.join('；')}</p> : null}
+                {gatewayUsage && <>
+                  <div className="gateway-balance-grid">{gatewayUsage.accounts.map(account => {
+                    const available = Number(account.usage?.total_available ?? 0);
+                    const used = Number(account.usage?.total_used ?? 0);
+                    const unlimited = account.usage?.unlimited_quota === true;
+                    const amount = (quota: number) => gatewayCurrency === 'TOKENS' ? quota.toLocaleString() : formatGatewayCurrency(quota / gatewayQuotaPerUnit);
+                    return <article key={`${account.keyHint}-${account.keyIndex}`} className="gateway-balance-card"><header><strong>Key {account.keyIndex + 1}</strong><span>{account.keyHint}</span></header>{account.error ? <small className="gateway-card-error">{account.error}</small> : <><b>{unlimited ? '不限额' : amount(available)}</b><small>可用余额 · 已用 {amount(used)}</small><small>{String(account.usage?.name || '当前 API Key')}</small></>}</article>;
+                  })}</div>
+                  <section className="gateway-pricing"><div className="gateway-section-heading"><h4>当前启用模型价格</h4><small>直接按中转站的模型定价与分组倍率计算 · 已按输入价从低到高排序</small></div>{gatewayPricing.length ? <div className="gateway-price-table"><div className="gateway-price-row gateway-price-head"><span>模型 / Key</span><span>分组</span><span>计费类型</span><span>输入</span><span>输出</span><span>缓存读取</span><span>缓存写入</span></div>{gatewayPricing.map(item => {
+                    const account = item.__account;
+                    const group = item.__group || '未返回';
+                    const groupRatio = Number(item.__groupRatio);
+                    const dynamicTiers = String(item.billing_mode || '') === 'tiered_expr' ? parseDynamicTiers(String(item.billing_expr || '')) : [];
+                    const dynamic = dynamicTiers.length > 0;
+                    const primaryTier = dynamicTiers[0];
+                    const price = (kind: 'input' | 'output' | 'cache' | 'write', dynamicName: string) => dynamic ? dynamicTierPrice(primaryTier.formula, dynamicName, groupRatio) : staticGatewayPrice(item, kind, groupRatio);
+                    return <div key={`${String(item.model_name)}-${String(account.keyIndex)}-${group}`} className="gateway-price-row"><strong>{String(item.model_name || '-')}<small>{account.keyHint || ''}</small></strong><span title={item.__groupKnown ? '中转站返回的 Key 分组' : '中转站的只读 API 未返回该 Key 固定分组，列出该模型可用分组价格'}>{group} · {groupRatio}x{item.__groupKnown ? '' : '（可用）'}</span><span>{dynamic ? `动态分档${dynamicTiers.length > 1 ? `（${primaryTier.label}）` : ''}` : Number(item.quota_type) === 1 ? '按次' : '按 Token'}</span><span>{price('input', '输入')}</span><span>{price('output', '输出')}</span><span>{price('cache', '缓存读取')}</span><span>{price('write', '缓存写入')}</span>{dynamic && <small className="gateway-dynamic-formula" title={String(item.billing_expr || '')}>{dynamicTiers.map(tier => `${tier.label}: ${tier.formula}`).join(' | ')}</small>}</div>;
+                  })}</div> : <p className="empty-hint compact">中转站暂未返回已启用模型的定价。请先刷新模型列表或检查 Key 权限。</p>}<small className="gateway-fetched-at">说明：中转站公开的 API Key 用量接口未公开 Token 固定分组时，以上会列出该模型的可用分组价格，不会错误按 1x 伪造为实际价格。</small></section>
+                  <section className="gateway-logs"><div className="gateway-section-heading"><h4>中转站使用日志</h4><small>只显示当前 API Key 的日志 · {gatewayLogs.length} 条</small></div>{gatewayLogs.length ? <div className="gateway-log-table"><div className="gateway-log-row gateway-log-head"><span>时间</span><span>令牌</span><span>模型</span><span>流</span><span>Tokens</span><span>费用</span><span>耗时</span><span>详情</span></div>{gatewayLogs.map((log, index) => <div key={`${String(log.__keyIndex)}-${String(log.id || index)}-${String(log.created_at || '')}`} className="gateway-log-row"><span>{gatewayLogTime(log) ? new Date(gatewayLogTime(log)).toLocaleString('zh-CN', { hour12: false }) : '-'}</span><span>{String(log.token_name || log.__keyHint || '-')}</span><strong>{String(log.model_name || '-')}</strong><span>{log.is_stream === true ? '流' : '非流'}</span><span>{Number(log.prompt_tokens || 0).toLocaleString()} / {Number(log.completion_tokens || 0).toLocaleString()}</span><span>{gatewayCurrency === 'TOKENS' ? Number(log.quota || 0).toLocaleString() : formatGatewayCurrency(Number(log.quota || 0) / gatewayQuotaPerUnit)}</span><span>{Number(log.use_time || 0).toFixed(1)}s</span><span title={String(log.other || log.content || '')}>{String(log.content || log.group || '-')}</span></div>)}</div> : <p className="empty-hint compact">筛选时间内没有中转站使用日志，或该 Key 未开放日志查询。</p>}</section>
+                  <small className="gateway-fetched-at">中转站数据更新于 {new Date(gatewayUsage.fetchedAt).toLocaleString('zh-CN', { hour12: false })}；本机统计仅作为离线回退，不参与上方账单。</small>
+                </>}
+                <details className="local-usage-details"><summary>本机应用统计（离线回退）</summary><div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间本机处理 Tokens' : '筛选时间本机处理 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div><div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div><div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div></details>
               </section>}
               {settingsSection === 'sync' && <section className="settings-sync-card">
                 <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
@@ -5743,6 +6210,16 @@ function App() {
                 {cloudSyncMessage && <p className={`model-list-message ${/失败|错误|未找到|未登录/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
                 <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
               </section>}
+              {settingsSection === 'support' && <section className="settings-support-card">
+                <div className="settings-support-hero"><div className="settings-support-icon" aria-hidden="true">群</div><div><strong>联系与支持</strong><small>加入官方 QQ 群，获取版本更新、使用帮助和问题反馈支持。</small></div></div>
+                <div className="settings-support-group"><div><span>官方 QQ 交流群</span><strong>1019592334</strong><small>点击后打开官方 QQ 群页面，并自动复制群号。</small></div><button className="btn-primary" onClick={() => void openQQGroup()}>加入 QQ 群</button></div>
+                <div className="settings-support-group settings-customer-group"><div><span>唯一客服 QQ</span><strong>2805099052</strong><small>充值或账号问题请联系唯一客服，谨防冒充。</small></div><button className="btn-secondary" onClick={() => void openCustomerQQ()}>联系客服</button></div>
+                <div className="settings-support-notice"><strong>系统公告</strong><p>请在反馈问题时附上应用版本、运行平台和可复现步骤。我们会在群公告同步版本变更与维护通知。若网站无法充值，请联系客服充值。</p></div>
+              </section>}
+              {settingsSection === 'tutorial' && <section className="settings-tutorial-card">
+                <div className="settings-tutorial-heading"><strong>使用教程</strong><small>官方飞书文档会持续更新最新功能说明与操作步骤。</small></div>
+                <div className="settings-support-group settings-tutorial-link"><div><span>ApiSaverWriter 使用教程</span><strong>飞书文档</strong><small>点击后在浏览器打开完整教程。</small></div><button className="btn-primary" onClick={() => void openTutorial()}>打开教程</button></div>
+              </section>}
               <p className="settings-hint">保存后，编辑器中的 AI 智能体会使用模型与网络配置。密钥仅保存到本机。</p>
             </div>
             </div>
@@ -5750,6 +6227,19 @@ function App() {
               <button className="btn-secondary" onClick={() => setShowSettingsModal(false)}>取消</button>
               <button className="btn-primary" onClick={saveSettings}>保存设置</button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {showSupportAnnouncement && (
+        <div className="modal-overlay support-announcement-overlay" onClick={() => dismissSupportAnnouncement()}>
+          <div className="modal support-announcement-modal" role="dialog" aria-modal="true" aria-labelledby="support-announcement-title" onClick={(event) => event.stopPropagation()}>
+            <div className="support-announcement-brand"><span className="support-announcement-mark" aria-hidden="true">ASW</span><div><strong>ApiSaverWriter</strong><small>系统公告</small></div><button className="modal-close" aria-label="关闭" onClick={() => dismissSupportAnnouncement()}>×</button></div>
+            <div className="support-announcement-tabs" role="tablist" aria-label="公告栏目"><button role="tab" aria-selected={announcementTab === 'notice'} className={announcementTab === 'notice' ? 'active' : ''} onClick={() => setAnnouncementTab('notice')}>公告</button><button role="tab" aria-selected={announcementTab === 'timeline'} className={announcementTab === 'timeline' ? 'active' : ''} onClick={() => setAnnouncementTab('timeline')}>更新记录</button></div>
+            <div className="support-announcement-body">
+              {announcementTab === 'notice' ? <><span className="support-announcement-kicker">欢迎使用 ApiSaverWriter</span><h3 id="support-announcement-title">写作资料、智能体与备份，都在一个工作台完成</h3><p>建议首次使用先在设置中完成模型配置，再创建作品并生成世界观。遇到模型、同步或数据恢复问题，可加入官方 QQ 群获得支持。</p><div className="support-announcement-callout"><strong>官方支持群</strong><span>1019592334</span><button className="btn-primary" onClick={() => void openQQGroup()}>加入 QQ 群</button></div><div className="support-announcement-contact"><span>唯一客服 QQ：<strong>2805099052</strong></span><button className="btn-secondary" onClick={() => void openCustomerQQ()}>联系客服</button></div></> : <><span className="support-announcement-kicker">最近更新</span><div className="support-announcement-timeline"><div><b>设置中心</b><span>新增联系与支持、使用教程入口。</span></div><div><b>数据安全</b><span>百度网盘支持完整应用备份与手动选择恢复版本。</span></div><div><b>智能写作</b><span>章节、大纲和卡片支持连续会话与流式生成。</span></div></div></>}
+            </div>
+            <div className="support-announcement-footer"><label><input type="checkbox" checked={announcementDontShow} onChange={(event) => setAnnouncementDontShow(event.target.checked)} /> 下次不再自动显示</label><button className="btn-secondary" onClick={() => dismissSupportAnnouncement(announcementDontShow)}>稍后查看</button><button className="btn-primary" onClick={() => { dismissSupportAnnouncement(true); setShowSettingsModal(true); setSettingsSection('support'); }}>打开联系与支持</button></div>
           </div>
         </div>
       )}

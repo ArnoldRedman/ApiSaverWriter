@@ -31,6 +31,9 @@ type MobileQianyueSource = {
 const mobileRuntime = () => '__TAURI_INTERNALS__' in window && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
 
 let httpFetchPromise: Promise<typeof globalThis.fetch> | null = null;
+// `/v1/models` is scoped to one API Key. Keep the association on mobile too,
+// otherwise a merged model list can route Gemini through a Claude-only key.
+const mobileModelsByApiKey = new Map<string, Set<string>>();
 const httpFetch = async (): Promise<typeof globalThis.fetch> => {
   if (!httpFetchPromise) {
     httpFetchPromise = import('@tauri-apps/plugin-http')
@@ -784,9 +787,17 @@ const mobileResponseText = (value: unknown, depth = 0): string => {
 
 async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk?: (chunk: string) => void, jsonMode = false): Promise<{ content: string; usage?: unknown }> {
   const fetcher = await httpFetch();
-  const apiMode = stringValue(params.apiMode, 'openai');
+  // Keep mobile on the same verified OpenAI-compatible wire as desktop.
+  const apiMode = 'openai';
   const model = stringValue(params.model, 'gpt-4o-mini');
-  const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+  // ApiSaver's Gemini-compatible routes can reject OpenAI's response_format
+  // option upstream. The prompt still asks for JSON, so parsing remains safe.
+  const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
+  const configuredKeys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+  const knownModelKeys = configuredKeys.filter(key => mobileModelsByApiKey.get(key)?.has(model));
+  const allKeysKnown = configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(key));
+  if (!knownModelKeys.length && allKeysKnown) throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请重新拉取模型并选择该模型对应的 API Key。`);
+  const keys = knownModelKeys.length ? knownModelKeys : configuredKeys;
   if (!keys.length) throw new Error('请先在设置中填写 API Key。');
   const base = baseURL(params.baseURL);
   let endpoint = `${base}/chat/completions`;
@@ -794,26 +805,14 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const maxTokens = jsonMode ? 1300 : 6000;
   const temperature = jsonMode ? 0.2 : 0.7;
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: onChunk ? 'text/event-stream' : 'application/json' };
-  if (apiMode === 'responses') {
-    endpoint = `${base}/responses`;
-    body = { model, input: messages.map(message => ({ role: message.role, content: message.content })), max_output_tokens: maxTokens, temperature, stream: Boolean(onChunk) };
-    headers.Authorization = `Bearer ${keys[0]}`;
-  } else if (apiMode === 'anthropic') {
-    endpoint = `${base}/messages`;
-    body = { model, system: messages.filter(message => message.role === 'system').map(message => message.content).join('\n\n'), messages: messages.filter(message => message.role !== 'system'), max_tokens: maxTokens, temperature };
-    headers['x-api-key'] = keys[0];
-    headers['anthropic-version'] = '2023-06-01';
-  } else {
-    body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk ? { stream_options: { include_usage: true } } : {}), ...(jsonMode ? { response_format: { type: 'json_object' } } : {}) };
-    headers.Authorization = `Bearer ${keys[0]}`;
-  }
+  body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk ? { stream_options: { include_usage: true } } : {}), ...(jsonMode && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}) };
+  headers.Authorization = `Bearer ${keys[0]}`;
   let response: Response | null = null;
   let lastError = '';
   for (const key of keys) {
     const requestHeaders = { ...headers };
-    if (apiMode === 'anthropic') requestHeaders['x-api-key'] = key;
-    else requestHeaders.Authorization = `Bearer ${key}`;
-    const candidate = await fetcher(endpoint, { method: 'POST', headers: requestHeaders, body: JSON.stringify(body) });
+    requestHeaders.Authorization = `Bearer ${key}`;
+    let candidate = await fetcher(endpoint, { method: 'POST', headers: requestHeaders, body: JSON.stringify(body) });
     if (candidate.ok) {
       response = candidate;
       break;
@@ -878,16 +877,22 @@ const mobileFetchHTML = async (url: string, encoding = 'utf-8', init: RequestIni
   const fetcher = await httpFetch();
   const controller = new AbortController();
   const timer = window.setTimeout(() => controller.abort(), 8_000);
+  const initialHeaders = {
+    Accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
+    ...(init.headers as Record<string, string> || {}),
+  };
+  const withoutAuthorization = Object.fromEntries(Object.entries(initialHeaders).filter(([key]) => key.toLowerCase() !== 'authorization'));
   try {
-    const response = await fetcher(url, {
+    const execute = (headers: Record<string, string>) => fetcher(url, {
       ...init,
-      headers: {
-        Accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148',
-        ...(init.headers as Record<string, string> || {}),
-      },
+      headers,
       signal: controller.signal,
     });
+    let response = await execute(initialHeaders);
+    if ((response.status === 401 || response.status === 403) && Object.keys(initialHeaders).some(key => key.toLowerCase() === 'authorization')) {
+      response = await execute(withoutAuthorization);
+    }
     if (!response.ok) throw new Error(`书源返回 HTTP ${response.status}`);
     return new TextDecoder(encoding).decode(await response.arrayBuffer());
   } finally {
@@ -1056,7 +1061,20 @@ const mobileSourceHeaders = (source: MobileQianyueSource): Record<string, string
   if (!raw) return {};
   try {
     const parsed = JSON.parse(raw.replace(/'/gu, '"')) as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+    const headers = Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
+    const authorization = Object.entries(headers).find(([key]) => key.toLowerCase() === 'authorization');
+    if (authorization) {
+      const token = authorization[1].replace(/^Bearers+/iu, '').trim();
+      const payload = token.split('.')[1];
+      if (payload) {
+        try {
+          const normalized = payload.replace(/-/gu, '+').replace(/_/gu, '/');
+          const exp = Number(JSON.parse(atob(normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '='))).exp);
+          if (Number.isFinite(exp) && exp > 0 && exp <= Math.floor(Date.now() / 1000)) delete headers[authorization[0]];
+        } catch { /* Keep opaque non-JWT authorization headers. */ }
+      }
+    }
+    return headers;
   } catch { return {}; }
 };
 
@@ -1267,7 +1285,7 @@ const mobileConcurrentMap = async <Item, Result>(items: Item[], concurrency: num
   return results;
 };
 
-const mobileQianyueDownload = async (source: MobileQianyueSource & { id: string; name: string }, title: string, author: string, sourceBookId: string, bookUrl: string, maxChapters = 200): Promise<Record<string, unknown>> => {
+const mobileQianyueDownload = async (source: MobileQianyueSource & { id: string; name: string }, title: string, author: string, sourceBookId: string, bookUrl: string, maxChapters = Number.MAX_SAFE_INTEGER): Promise<Record<string, unknown>> => {
   const info = await mobileFetchSourceRule(source, bookUrl, {});
   const infoRoot = info.json !== null && source.ruleBookInfo?.init ? mobileJsonPath(info.json, source.ruleBookInfo.init)[0] || info.json : info.json;
   const tocRule = source.ruleBookInfo?.tocUrl || bookUrl;
@@ -1276,7 +1294,7 @@ const mobileQianyueDownload = async (source: MobileQianyueSource & { id: string;
     ? mobileJsonPath(toc.json, source.ruleToc?.chapterList)
     : mobileHtmlNodes(new DOMParser().parseFromString(toc.text, 'text/html'), String(source.ruleToc?.chapterList || ''));
   if (!chapterItems.length) throw new Error(`${source.name} 没有返回章节目录`);
-  const selected = chapterItems.slice(0, Math.max(1, Math.min(500, maxChapters)));
+  const selected = chapterItems.slice(0, Math.max(1, maxChapters));
   const chapters = await mobileConcurrentMap(selected, 4, async (item, index): Promise<Record<string, unknown>> => {
     const chapterTitle = mobileSourceValue(toc, item, source.ruleToc?.chapterName) || `第 ${index + 1} 章`;
     const chapterRule = String(source.ruleToc?.chapterUrl || '').trim();
@@ -1364,7 +1382,7 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     const sourceId = stringValue(params.source, 'fanqie');
     const source = mobileQianyueSources.find(item => item.id === sourceId);
     if (!source) throw new Error(sourceId === 'fanqie' ? '番茄移动端下载规则暂不可用，请从可下载书源结果中选择其它来源。' : '未知小说书源');
-    return mobileQianyueDownload(source, stringValue(params.title), stringValue(params.author), stringValue(params.sourceBookId), stringValue(params.url), Number(params.maxChapters) || 200) as T;
+    return mobileQianyueDownload(source, stringValue(params.title), stringValue(params.author), stringValue(params.sourceBookId), stringValue(params.url), Number(params.maxChapters) || Number.MAX_SAFE_INTEGER) as T;
   }
   if (method === 'book.chapter.download') {
     const sourceId = stringValue(params.source);
@@ -1377,6 +1395,45 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   if (method === 'book.sources.list') {
     return { sources: [{ id: 'fanqie', name: '番茄小说' }, ...mobileQianyueSources.map(source => ({ id: source.id, name: source.name }))], defaultSourceId: mobileQianyueSources[0]?.id || 'fanqie' } as T;
   }
+  if (method === 'gateway.usage') {
+    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+    if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+    const root = baseURL(params.baseURL).replace(/\/v1\/?$/u, '');
+    const getJSON = async (path: string, key?: string): Promise<Record<string, unknown>> => {
+      const response = await fetcher(`${root}${path}`, { headers: { Accept: 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) } });
+      const body = await response.text();
+      if (!response.ok) throw new Error(`${path} 请求失败（${response.status}）：${body.replace(/\s+/gu, ' ').slice(0, 180)}`);
+      return JSON.parse(body) as Record<string, unknown>;
+    };
+    const [statusResult, accounts] = await Promise.all([
+      getJSON('/api/status').catch(error => ({ __error: String(error) })),
+      Promise.all(keys.map(async (key, keyIndex) => {
+        const [usage, logs, pricing] = await Promise.allSettled([getJSON('/api/usage/token', key), getJSON('/api/log/token', key), getJSON('/api/pricing', key)]);
+        const errors = [usage, logs].filter((result): result is PromiseRejectedResult => result.status === 'rejected').map(result => String(result.reason));
+        const usagePayload = usage.status === 'fulfilled' ? usage.value : undefined;
+        const logsPayload = logs.status === 'fulfilled' ? logs.value : undefined;
+        const pricingPayload = pricing.status === 'fulfilled' ? pricing.value : undefined;
+        return {
+          keyIndex, keyHint: `${key.slice(0, 4)}••••${key.slice(-4)}`,
+          usage: usagePayload?.data && typeof usagePayload.data === 'object' ? usagePayload.data : undefined,
+          logs: Array.isArray(logsPayload?.data) ? logsPayload.data : [],
+          pricing: Array.isArray(pricingPayload?.data) ? pricingPayload.data : [],
+          group: typeof usagePayload?.data?.group === 'string' ? usagePayload.data.group : undefined,
+          groupRatios: pricingPayload?.group_ratio && typeof pricingPayload.group_ratio === 'object' ? pricingPayload.group_ratio as Record<string, number> : undefined,
+          usableGroups: pricingPayload?.usable_group && typeof pricingPayload.usable_group === 'object' ? pricingPayload.usable_group as Record<string, unknown> : undefined,
+          ...(errors.length ? { error: errors.join('；') } : {}),
+        };
+      })),
+    ]);
+    const pricing = accounts.flatMap(account => account.pricing || []).filter((item, index, all) => all.findIndex(other => String(other.model_name) === String(item.model_name)) === index);
+    return {
+      fetchedAt: new Date().toISOString(),
+      status: statusResult.data && typeof statusResult.data === 'object' ? statusResult.data : undefined,
+      pricing,
+      accounts,
+      errors: [statusResult.__error].filter((value): value is string => typeof value === 'string'),
+    } as T;
+  }
   if (method === 'models.list') {
     const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
     if (!keys.length) throw new Error('请先在设置中填写 API Key。');
@@ -1384,7 +1441,9 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
       const response = await fetcher(`${baseURL(params.baseURL)}/models`, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' } });
       if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）`);
       const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
-      return (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
+      const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
+      mobileModelsByApiKey.set(key, new Set(models));
+      return models;
     }));
     const models = Array.from(new Set(responses.flatMap(result => result.status === 'fulfilled' ? result.value : [])));
     if (!models.length) throw new Error('所有 API Key 拉取模型失败');

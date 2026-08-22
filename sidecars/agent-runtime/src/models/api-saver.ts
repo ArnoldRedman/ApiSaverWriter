@@ -32,13 +32,24 @@ const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolv
 const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
 const API_SAVER_BASE_URL = "https://api.apisaver.com/v1";
 
-function apiErrorMessage(status: number, detail: string, statusText: string, attempts: number, routeHint = ""): string {
+function supportsOpenAIJsonMode(model: string): boolean {
+  // Gemini's OpenAI-compatible adapters commonly reject response_format at
+  // the upstream gateway, even though a plain chat completion works.
+  return !/^gemini(?:[-:/]|$)/iu.test(model.trim());
+}
+
+function supportsOpenAIReasoning(model: string): boolean {
+  return /^(?:gpt-|o\d|chatgpt-)/iu.test(model.trim());
+}
+
+function apiErrorMessage(status: number, detail: string, statusText: string, attempts: number, routeHint = "", requestHint = ""): string {
   const retrySuffix = attempts > 1 ? `，已自动重试 ${attempts - 1} 次` : "";
   if (isQuotaExceeded(detail)) {
     return `API 中转服务额度已用尽${routeHint}。章节正文已保存，本章记忆将在额度恢复后再更新。`;
   }
   if ([502, 503, 504, 524].includes(status)) {
-    return `API 中转服务当前返回 ${status}（可能来自代理或 API 上游网关）${routeHint}${retrySuffix}，请稍后再试、测试模型，或在设置中切换模型。`;
+    const compact = detail.trim().startsWith("<") ? "" : detail.trim().replace(/\s+/g, " ").slice(0, 180);
+    return `API 中转服务当前返回 ${status}（可能来自代理或 API 上游网关）${requestHint}${routeHint}${retrySuffix}${compact ? `：${compact}` : ""}`;
   }
   if (status === 429) return `API 中转服务请求过于频繁${routeHint}${retrySuffix}，请稍后再试。`;
   if (status === 401 || status === 403) return `API Key 或模型权限校验失败（${status}）${routeHint}，请在设置中检查配置。`;
@@ -124,6 +135,14 @@ export interface RuntimeUsageSummary extends Required<ApiUsage> {
   startedAt: string;
 }
 
+export interface GatewayUsageSnapshot {
+  fetchedAt: string;
+  status?: Record<string, unknown>;
+  pricing?: Array<Record<string, unknown>>;
+  accounts: Array<{ keyIndex: number; keyHint: string; usage?: Record<string, unknown>; logs: Array<Record<string, unknown>>; error?: string }>;
+  errors: string[];
+}
+
 const runtimeUsage: RuntimeUsageSummary = {
   inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0,
   cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString(),
@@ -169,7 +188,55 @@ function parseUsage(value: unknown): ApiUsage | undefined {
   return Object.values(result).some(value => value !== undefined) ? result : undefined;
 }
 
+function extractText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    return value.map(item => extractText(item)).filter(Boolean).join("\n");
+  }
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  if (typeof record.text === "string") return record.text;
+  if (typeof record.content === "string") return record.content;
+  return "";
+}
+
+function emptyCompletionError(data: Record<string, unknown>, maxTokens: number): Error {
+  const choice = Array.isArray(data.choices) && data.choices[0] && typeof data.choices[0] === "object"
+    ? data.choices[0] as Record<string, unknown>
+    : undefined;
+  const message = choice?.message && typeof choice.message === "object"
+    ? choice.message as Record<string, unknown>
+    : undefined;
+  const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : "";
+  if (finishReason === "length") {
+    return new Error(`API Saver 模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限`);
+  }
+  const reasoningLength = [message?.reasoning_content, message?.reasoning]
+    .find(value => typeof value === "string");
+  if (typeof reasoningLength === "string" && reasoningLength.length > 0) {
+    return new Error("API Saver 只返回了推理内容，没有正文；请关闭推理模式或提高输出上限");
+  }
+  const topKeys = Object.keys(data).slice(0, 12).join(",");
+  const choiceKeys = choice ? Object.keys(choice).slice(0, 12).join(",") : "";
+  return new Error(`API Saver 返回内容为空（响应字段：${topKeys || "无"}；choice：${choiceKeys || "无"}）`);
+}
+
 const proxyAgents = new Map<string, ProxyAgent>();
+// API keys can belong to different relay groups. `/v1/models` is scoped to
+// the authenticated key, so retain this association instead of flattening all
+// models into one list and accidentally sending a Gemini model through a
+// Claude-only key.
+const modelsByApiKey = new Map<string, Set<string>>();
+const modelLookupInFlight = new Map<string, Promise<Set<string> | undefined>>();
+
+export function resetModelKeyRoutingCache(): void {
+  modelsByApiKey.clear();
+  modelLookupInFlight.clear();
+}
+
+export function seedModelKeyRoutingCache(key: string, models: string[]): void {
+  modelsByApiKey.set(key, new Set(models));
+}
 
 const isPrivateOrLocalHost = (hostname: string) => {
   const host = hostname.toLowerCase();
@@ -242,24 +309,64 @@ export class ApiSaverClient {
     this.config = config;
   }
 
+  private async modelsForKey(key: string): Promise<Set<string> | undefined> {
+    const cached = modelsByApiKey.get(key);
+    if (cached) return cached;
+    const inflight = modelLookupInFlight.get(key);
+    if (inflight) return inflight;
+    const endpoint = `${API_SAVER_BASE_URL}/models`;
+    const lookup = (async () => {
+      try {
+        const dispatcher = proxyDispatcherFor(endpoint, this.config);
+        const response = await fetch(endpoint, {
+          headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+          ...(dispatcher ? { dispatcher } : {}),
+        } as RequestInit);
+        if (!response.ok) return undefined;
+        const payload = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
+        const models = new Set((payload.data ?? payload.models ?? [])
+          .map(item => typeof item === "string" ? item : item.id)
+          .filter((model): model is string => Boolean(model)));
+        modelsByApiKey.set(key, models);
+        return models;
+      } catch {
+        // Do not turn a temporary models endpoint failure into a hard writing
+        // failure. The real completion request still has its normal retries.
+        return undefined;
+      } finally {
+        modelLookupInFlight.delete(key);
+      }
+    })();
+    modelLookupInFlight.set(key, lookup);
+    return lookup;
+  }
+
+  private async keysForModel(keys: string[], model: string): Promise<string[]> {
+    if (keys.length <= 1) return keys;
+    // This happens once per key per runtime and survives all later chapter,
+    // outline, card and streaming calls. It also works after an app restart,
+    // before the user has manually pressed “拉取模型”.
+    const known = await Promise.all(keys.map(async key => ({ key, models: await this.modelsForKey(key) })));
+    const matched = known.filter(item => item.models?.has(model)).map(item => item.key);
+    if (matched.length) return matched;
+    const unavailable = known.filter(item => !item.models).map(item => item.key);
+    if (!unavailable.length) {
+      throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请在模型配置中重新拉取模型，并选择该模型所在分组对应的 API Key。`);
+    }
+    // A transient model-list outage must not stop a request outright. Only
+    // unverified keys remain as a last-resort fallback; known wrong keys are
+    // explicitly excluded.
+    return unavailable;
+  }
+
   async listModels(): Promise<string[]> {
     const endpoint = `${API_SAVER_BASE_URL}/models`;
     const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
     if (!keys.length) throw new Error("缺少 API Key");
     const results = await Promise.allSettled(keys.map(async key => {
-      const dispatcher = proxyDispatcherFor(endpoint, this.config);
-      const response = await fetch(endpoint, {
-        headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-        ...(dispatcher ? { dispatcher } : {}),
-      } as RequestInit);
-      if (!response.ok) {
-        const detail = await response.text();
-        throw new Error(apiErrorMessage(response.status, detail, response.statusText, 1, proxyRouteHint(endpoint, this.config)));
-      }
-      const payload = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
-      return (payload.data ?? payload.models ?? [])
-        .map(item => typeof item === "string" ? item : item.id)
-        .filter((model): model is string => Boolean(model));
+      const models = await this.modelsForKey(key);
+      if (!models) throw new Error(`模型列表请求失败：${endpoint}`);
+      return [...models];
     }));
     const models = Array.from(new Set(results.flatMap(result => result.status === "fulfilled" ? result.value : [])));
     if (!models.length) {
@@ -269,18 +376,88 @@ export class ApiSaverClient {
     return models;
   }
 
+  /** Read-only dashboard data exposed by New API for the currently configured
+   * relay keys. These endpoints deliberately authenticate each key on its own,
+   * so the app never needs a dashboard cookie and cannot see another user. */
+  async getGatewayUsageSnapshot(): Promise<GatewayUsageSnapshot> {
+    const root = "https://api.apisaver.com";
+    const endpoint = (path: string) => `${root}${path}`;
+    const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])]
+      .map(key => key.trim()).filter(Boolean)));
+    if (!keys.length) throw new Error("请先在设置中填写 API Key。");
+    const requestJSON = async (path: string, key?: string): Promise<Record<string, unknown>> => {
+      const url = endpoint(path);
+      const dispatcher = proxyDispatcherFor(url, this.config);
+      const response = await fetch(url, {
+        headers: {
+          Accept: "application/json",
+          ...(key ? { Authorization: `Bearer ${key}` } : {}),
+        },
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit);
+      const body = await response.text();
+      if (!response.ok) throw new Error(`${path} 请求失败（${response.status}）：${body.replace(/\s+/g, " ").slice(0, 180)}`);
+      try { return JSON.parse(body) as Record<string, unknown>; }
+      catch { throw new Error(`${path} 没有返回 JSON 数据`); }
+    };
+    const [statusResult, accountResults] = await Promise.all([
+      requestJSON("/api/status").catch(error => ({ __error: String(error) })),
+      Promise.all(keys.map(async (key, keyIndex) => {
+        const keyHint = `${key.slice(0, 4)}••••${key.slice(-4)}`;
+        const [usageResult, logsResult, pricingResult] = await Promise.allSettled([
+          requestJSON("/api/usage/token", key),
+          requestJSON("/api/log/token", key),
+          requestJSON("/api/pricing", key),
+        ]);
+        const failures = [usageResult, logsResult, pricingResult]
+          .filter((result): result is PromiseRejectedResult => result.status === "rejected")
+          .map(result => String(result.reason));
+        const usagePayload = usageResult.status === "fulfilled" ? usageResult.value : undefined;
+        const logsPayload = logsResult.status === "fulfilled" ? logsResult.value : undefined;
+        const pricingPayload = pricingResult.status === "fulfilled" ? pricingResult.value : undefined;
+        const logs = Array.isArray(logsPayload?.data) ? logsPayload.data.filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [];
+        return {
+          keyIndex,
+          keyHint,
+          usage: usagePayload && typeof usagePayload.data === "object" && usagePayload.data ? usagePayload.data as Record<string, unknown> : undefined,
+          logs,
+          pricing: Array.isArray(pricingPayload?.data) ? pricingPayload.data.filter((item: unknown): item is Record<string, unknown> => Boolean(item && typeof item === "object")) : [],
+          group: usagePayload?.data && typeof usagePayload.data === "object" && typeof (usagePayload.data as Record<string, unknown>).group === "string" ? String((usagePayload.data as Record<string, unknown>).group) : undefined,
+          groupRatios: pricingPayload?.group_ratio && typeof pricingPayload.group_ratio === "object" ? pricingPayload.group_ratio as Record<string, number> : undefined,
+          usableGroups: pricingPayload?.usable_group && typeof pricingPayload.usable_group === "object" ? pricingPayload.usable_group as Record<string, unknown> : undefined,
+          ...(failures.length ? { error: failures.join("；") } : {}),
+        };
+      })),
+    ]);
+    const errors = [statusResult.__error].filter((value): value is string => typeof value === "string");
+    const statusPayload = statusResult as Record<string, unknown>;
+    const statusData = statusPayload["data"];
+    const pricing = accountResults.flatMap(account => account.pricing || []).filter((item, index, all) => all.findIndex(other => String(other.model_name) === String(item.model_name)) === index);
+    return {
+      fetchedAt: new Date().toISOString(),
+      status: statusData && typeof statusData === "object" ? statusData as Record<string, unknown> : undefined,
+      pricing,
+      accounts: accountResults,
+      errors,
+    };
+  }
+
   async chat(
     messages: ChatMessage[],
     options: ChatOptions = {}
   ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
     const baseURL = API_SAVER_BASE_URL;
-    const apiMode = this.config.apiMode || "openai";
+    // All managed ApiSaver models use the verified OpenAI-compatible wire.
+    // A stale settings value must not route a normal write request to a
+    // different endpoint with a different response schema.
+    const apiMode = "openai";
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
-    const apiKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    const apiKeys = await this.keysForModel(configuredKeys, model);
     const maxTokens = options.max_tokens ?? 4000;
     const reasoningMode = this.config.reasoningMode;
-    const reasoning = reasoningMode && !["auto", "off"].includes(reasoningMode)
+    const reasoning = supportsOpenAIReasoning(model) && reasoningMode && !["auto", "off"].includes(reasoningMode)
       ? { effort: reasoningMode === "custom" ? "medium" : reasoningMode }
       : undefined;
     let endpoint = `${baseURL}/chat/completions`;
@@ -290,41 +467,16 @@ export class ApiSaverClient {
     };
     let body: string;
 
-    if (apiMode === "responses") {
-      endpoint = `${baseURL}/responses`;
-      body = JSON.stringify({
-        model,
-        input: contextMessages.map(message => ({ role: message.role, content: message.content })),
-        temperature: options.temperature ?? 0.7,
-        max_output_tokens: maxTokens,
-        text: options.response_format?.type === "json_object" ? { format: { type: "json_object" } } : undefined,
-        reasoning,
-      });
-    } else if (apiMode === "anthropic") {
-      endpoint = `${baseURL}/messages`;
-      const system = contextMessages.filter(message => message.role === "system").map(message => message.content).join("\n\n");
-      body = JSON.stringify({
-        model,
-        system: system || undefined,
-        messages: contextMessages.filter(message => message.role !== "system").map(message => ({ role: message.role === "assistant" ? "assistant" : "user", content: message.content })),
-        max_tokens: maxTokens,
-        temperature: options.temperature ?? 0.7,
-      });
-        headers = {
-        "Content-Type": "application/json",
-        "x-api-key": this.config.apiKey,
-        "anthropic-version": "2023-06-01",
-      };
-    } else {
-      body = JSON.stringify({
-        model,
-        messages: contextMessages,
-        temperature: options.temperature ?? 0.7,
-        max_tokens: maxTokens,
-        response_format: options.response_format,
-        reasoning,
-      });
-    }
+    body = JSON.stringify({
+      model,
+      messages: contextMessages,
+      temperature: options.temperature ?? 0.7,
+      max_tokens: maxTokens,
+      // Gemini models use this same route but do not consistently implement
+      // response_format. Prompt-level JSON rules remain in place.
+      response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined,
+      reasoning,
+    });
     const maxAttempts = Math.max(1, Math.min(5, options.retryAttempts ?? 3));
     let lastNetworkError = "";
 
@@ -332,8 +484,7 @@ export class ApiSaverClient {
       try {
         const requestKey = apiKeys[(attempt - 1) % Math.max(1, apiKeys.length)] || this.config.apiKey;
         const requestHeaders = { ...headers };
-        if (apiMode === "anthropic") requestHeaders["x-api-key"] = requestKey;
-        else requestHeaders.Authorization = `Bearer ${requestKey}`;
+        requestHeaders.Authorization = `Bearer ${requestKey}`;
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
         const response = await fetch(endpoint, {
           method: "POST",
@@ -344,17 +495,10 @@ export class ApiSaverClient {
         if (response.ok) {
           const data = await response.json() as Record<string, unknown>;
           const choices = Array.isArray(data.choices) ? data.choices as Array<Record<string, unknown>> : [];
-          const firstMessage = choices[0]?.message as Record<string, unknown> | undefined;
-          const anthropicContent = Array.isArray(data.content) ? data.content as Array<Record<string, unknown>> : [];
-          const outputItems = Array.isArray(data.output) ? data.output as Array<Record<string, unknown>> : [];
-          const outputText = outputItems.flatMap(item => Array.isArray(item.content) ? item.content as Array<Record<string, unknown>> : [])
-            .map(item => typeof item.text === "string" ? item.text : "").filter(Boolean).join("\n");
-          const content = apiMode === "anthropic"
-            ? anthropicContent.map(item => typeof item.text === "string" ? item.text : "").filter(Boolean).join("\n")
-            : apiMode === "responses"
-              ? (typeof data.output_text === "string" ? data.output_text : outputText)
-              : (typeof firstMessage?.content === "string" ? firstMessage.content : "");
-          if (!content) throw new Error("API Saver 返回内容为空");
+          const firstChoice = choices[0];
+          const firstMessage = firstChoice?.message as Record<string, unknown> | undefined;
+          const content = extractText(firstMessage?.content) || extractText(firstChoice?.text);
+          if (!content) throw emptyCompletionError(data, maxTokens);
           const usage = parseUsage(data.usage);
           recordRuntimeUsage(usage);
           return { content, model: typeof data.model === "string" ? data.model : model, usage };
@@ -363,10 +507,20 @@ export class ApiSaverClient {
         const detail = await response.text();
         const retryable = [408, 429, 500, 502, 503, 504, 524].includes(response.status) && !isQuotaExceeded(detail);
         if (retryable && attempt < maxAttempts) {
+          // Some upstream OpenAI-compatible adapters turn unsupported optional
+          // fields into a 503. Retry the same task once with only core fields.
+          if (response.status === 503 && apiMode === "openai" && attempt === 1) {
+            try {
+              const compatibilityBody = JSON.parse(body) as Record<string, unknown>;
+              delete compatibilityBody.response_format;
+              delete compatibilityBody.reasoning;
+              body = JSON.stringify(compatibilityBody);
+            } catch { /* The original request remains valid for the next retry. */ }
+          }
           await sleep(800 * 2 ** (attempt - 1));
           continue;
         }
-        throw new Error(apiErrorMessage(response.status, detail, response.statusText, attempt, proxyRouteHint(endpoint, this.config)));
+        throw new Error(apiErrorMessage(response.status, detail, response.statusText, attempt, proxyRouteHint(endpoint, this.config), `，模型 ${model} · ${endpoint}`));
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (message.startsWith("API ")) throw error;
@@ -381,19 +535,16 @@ export class ApiSaverClient {
   }
 
   async chatStream(messages: ChatMessage[], options: ChatOptions = {}, onChunk?: (chunk: string) => void): Promise<{ content: string; model: string; usage?: ApiUsage }> {
-    // OpenAI-compatible SSE gives the UI genuine incremental text. Other modes
-    // retain the same response contract and degrade to one final chunk.
-    if ((this.config.apiMode || "openai") !== "openai") {
-      const response = await this.chat(messages, options);
-      onChunk?.(response.content);
-      return response;
-    }
+    // All managed models use the same OpenAI-compatible SSE transport.
+    // Never let a stale protocol selection silently degrade writing to a
+    // non-streaming request.
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
     const baseURL = API_SAVER_BASE_URL;
     const endpoint = `${baseURL}/chat/completions`;
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
-    const apiKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    const apiKeys = await this.keysForModel(configuredKeys, model);
     if (!apiKeys.length) throw new Error("缺少 API Key");
     let response: Response | null = null;
     let lastStreamError = "";
@@ -401,7 +552,7 @@ export class ApiSaverClient {
       const candidate = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: options.response_format, stream: true, stream_options: { include_usage: true } }),
+        body: JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: options.max_tokens ?? 4000, response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined, stream: true, stream_options: { include_usage: true } }),
         ...(dispatcher ? { dispatcher } : {}),
       } as RequestInit);
       if (candidate.ok && candidate.body) {
@@ -409,13 +560,13 @@ export class ApiSaverClient {
         break;
       }
       const detail = await candidate.text();
-      lastStreamError = apiErrorMessage(candidate.status, detail, candidate.statusText, 1, proxyRouteHint(endpoint, this.config));
+      lastStreamError = apiErrorMessage(candidate.status, detail, candidate.statusText, 1, proxyRouteHint(endpoint, this.config), `，模型 ${model} · ${endpoint}`);
     }
     const responseBody = response?.body;
     if (!responseBody) throw new Error(lastStreamError || "所有 API Key 的流式请求均失败");
     const reader = responseBody.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
     try {
-      while (true) {
+      streamLoop: while (true) {
         const next = await Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error("SSE 首个响应超时")), content ? 45000 : 30000)),
@@ -423,8 +574,22 @@ export class ApiSaverClient {
         buffer += decoder.decode(next.value, { stream: true });
         const lines = buffer.split("\n"); buffer = lines.pop() || "";
         for (const line of lines) {
-          const text = line.trim().replace(/^data:\s*/, ""); if (!text || text === "[DONE]") continue;
-          try { const event = JSON.parse(text) as Record<string, unknown>; const choice = Array.isArray(event.choices) ? event.choices[0] as Record<string, unknown> : undefined; const delta = choice?.delta as Record<string, unknown> | undefined; const chunk = typeof delta?.content === "string" ? delta.content : ""; if (chunk) { content += chunk; onChunk?.(chunk); } usage = parseUsage(event.usage) || usage; } catch { /* Ignore proxy keep-alives. */ }
+          const text = line.trim().replace(/^data:\s*/, "");
+          if (!text) continue;
+          if (text === "[DONE]") break streamLoop;
+          try {
+            const event = JSON.parse(text) as Record<string, unknown>;
+            const choice = Array.isArray(event.choices) ? event.choices[0] as Record<string, unknown> : undefined;
+            const delta = choice?.delta as Record<string, unknown> | undefined;
+            const chunk = typeof delta?.content === "string" ? delta.content : "";
+            if (chunk) { content += chunk; onChunk?.(chunk); }
+            usage = parseUsage(event.usage) || usage;
+            // A number of OpenAI-compatible relays omit the terminal [DONE]
+            // event but do provide choice.finish_reason. Stop as soon as the
+            // model reports completion so the UI cannot remain stuck waiting
+            // for another read from an otherwise open connection.
+            if (typeof choice?.finish_reason === "string" && choice.finish_reason.trim()) break streamLoop;
+          } catch { /* Ignore proxy keep-alives. */ }
         }
       }
     } catch (error) {

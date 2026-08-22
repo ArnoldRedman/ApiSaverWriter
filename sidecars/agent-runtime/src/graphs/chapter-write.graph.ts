@@ -50,13 +50,99 @@ const chapterAgentSystemPrompt = `你是专业长篇网络小说创作 Agent。�
 
 const chapterWriterTaskPrompt = `你正在执行“章节正文”阶段。返回严格 JSON 对象，不要代码围栏或额外说明：{"content":"章节正文 Markdown","summary":"200 字以内章节摘要"}。`;
 
+/** JSON 传输信封绝不能成为展示给作者的章节正文。 */
+function unwrapChapterDraft(value: unknown, depth = 0): string {
+  if (typeof value !== "string") return "";
+  const text = value.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
+  if (depth >= 4 || !text.startsWith("{")) return value.trim();
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const nested = typeof parsed.draftContent === "string" ? parsed.draftContent : typeof parsed.content === "string" ? parsed.content : "";
+    return nested ? unwrapChapterDraft(nested, depth + 1) : value.trim();
+  } catch {
+    return value.trim();
+  }
+}
+
+function chapterSummaryFromEnvelope(value: unknown, depth = 0): string {
+  if (typeof value !== "string" || depth >= 4) return "";
+  try {
+    const parsed = JSON.parse(value.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "")) as Record<string, unknown>;
+    if (typeof parsed.summary === "string") return parsed.summary.trim();
+    const nested = typeof parsed.draftContent === "string" ? parsed.draftContent : typeof parsed.content === "string" ? parsed.content : "";
+    return nested ? chapterSummaryFromEnvelope(nested, depth + 1) : "";
+  } catch {
+    return "";
+  }
+}
+
 const chapterReviewSystemPrompt = `你是长篇小说一致性编辑。审查时只依据给出的约束与章节正文，不做文风重写，也不虚构问题。
 
 重点检查：人物状态、已知信息、时间线、实体关系、物品归属和剧情因果。返回严格 JSON 对象，不要代码围栏或解释：{"consistent":true,"issues":["明确矛盾"],"suggestions":["可执行修订建议"]}。没有明确问题时 issues 和 suggestions 返回空数组。`;
 
 const chapterPlanSystemPrompt = `你是长篇网络小说主编。先为下一章制作一份短小、可执行的写作计划，不写正文，不输出隐藏思考。
-只依据给定资料，优先处理上一章结尾。返回严格 JSON 对象：{"plan":"Markdown 计划","handoff":"下一章交接"}。
+只依据给定资料，优先处理上一章结尾。返回严格 JSON 对象：{"plan":"人类可读的 Markdown 计划","handoff":"下一章交接"}。plan 字段必须直接是普通 Markdown 文字，绝不能在 plan 字段中再次嵌套 JSON、JSON 字符串、代码围栏或字段对象。
 计划必须包含：承接锚点（人物位置、情绪、未解决事件、道具/线索、时间线、伏笔、章末钩子）、人物目标与动机、核心事件链、冲突升级、四段节奏（开场/发展/转折/收束）、本章新增信息、伏笔推进、结尾钩子、下一章交接。未知项标为待确认，不能凭空补设定。`;
+
+const planFieldLabels: Record<string, string> = {
+  opening: "开篇承接", openingAnchor: "开篇承接", handoff: "下一章交接", continuity: "承接锚点", continuityAnchor: "承接锚点",
+  story: "这章的故事", plot: "核心事件链", events: "核心事件链", characters: "这章的人物", characterGoals: "人物目标与动机",
+  conflict: "冲突升级", pacing: "节奏安排", rhythm: "节奏安排", newInformation: "本章新增信息", foreshadowing: "伏笔推进",
+  ending: "章末钩子", hook: "章末钩子", style: "写法与禁区",
+};
+
+function cleanPlanText(value: string): string {
+  return value.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
+}
+
+function formatPlanValue(value: unknown): string {
+  if (typeof value === "string") return cleanPlanText(value);
+  if (Array.isArray(value)) return value.map(formatPlanValue).filter(Boolean).join("；");
+  if (value && typeof value === "object") return Object.entries(value as Record<string, unknown>)
+    .map(([key, entry]) => `${planFieldLabels[key] || key}：${formatPlanValue(entry)}`)
+    .filter(entry => !entry.endsWith("：")).join("\n");
+  return value === undefined || value === null ? "" : String(value);
+}
+
+function planObjectToMarkdown(value: Record<string, unknown>): string {
+  const lines: string[] = [];
+  for (const [key, entry] of Object.entries(value)) {
+    if (entry === undefined || entry === null || key === "plan" || key === "content") continue;
+    const label = planFieldLabels[key] || key.replace(/([a-z])([A-Z])/gu, "$1 $2");
+    if (typeof entry === "string") {
+      const text = cleanPlanText(entry);
+      if (text) lines.push(`## ${label}\n${text}`);
+      continue;
+    }
+    if (Array.isArray(entry)) {
+      const items = entry.map(item => typeof item === "string" ? item.trim() : formatPlanValue(item)).filter(Boolean);
+      if (items.length) lines.push(`## ${label}\n${items.map(item => `- ${item}`).join("\n")}`);
+      continue;
+    }
+    const text = formatPlanValue(entry);
+    if (text) lines.push(`## ${label}\n${text}`);
+  }
+  return lines.join("\n\n");
+}
+
+/** Providers sometimes encode the plan object twice despite JSON mode. Never expose that envelope to the author. */
+export function normalizeChapterPlan(value: unknown): string {
+  if (typeof value === "string") {
+    const text = cleanPlanText(value);
+    if (!text) return "";
+    try { return normalizeChapterPlan(JSON.parse(text) as unknown); }
+    catch { return text; }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  const object = value as Record<string, unknown>;
+  if (object.plan !== undefined) {
+    const plan = normalizeChapterPlan(object.plan);
+    const handoff = normalizeChapterPlan(object.handoff);
+    return [plan, handoff && !plan.includes(handoff) ? `## 下一章交接\n${handoff}` : ""].filter(Boolean).join("\n\n");
+  }
+  if (object.content !== undefined && Object.keys(object).length === 1) return normalizeChapterPlan(object.content);
+  return planObjectToMarkdown(object);
+}
 
 function buildPrewriteCheck(state: ChapterStateType): { blockers: string[]; warnings: string[]; summary: string } {
   const blockers: string[] = [];
@@ -214,16 +300,28 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     .addNode("retrieve", async (state: ChapterStateType) => {
       emitter?.progress("retrieve", 10, "正在检索相关记忆...");
       emitter?.context("retrieve", "检索章节记忆、人物状态和时间线", { source: "StoryStore.searchHybrid", status: "searching" });
+
+      // 首章没有可检索的历史章节或结构化记忆时，直接跳过数据库检索。
+      // 这样不会把“空记忆”误显示成持续检索，也避免空 FTS/向量请求阻塞正文生成。
+      const hasPreviousChapter = Boolean(state.previousChapters?.some(chapter => chapter?.content?.trim()));
+      const hasStoredMemory = store.listConfirmed(state.projectId, 1).length > 0;
+      if (!hasPreviousChapter && !hasStoredMemory) {
+        emitter?.progress("retrieve", 25, "首章暂无历史记忆，已跳过检索");
+        emitter?.context("retrieve", "首章无历史记忆，使用世界观、章纲和作者指令", { source: "StoryStore.searchHybrid", status: "selected", items: 0 });
+        return { retrievedContext: [], contextReport: state.contextReport ? { ...state.contextReport, retrievedBytes: 0 } : undefined };
+      }
       
       // 从指令和细纲中提取关键词
       const query = [state.instruction, state.outline].filter(Boolean).join(" ");
       
       // 使用混合检索：FTS5 + 向量语义（如果已启用）
       let results;
+      let retrievalSource = "StoryStore.searchHybrid";
       try {
         results = await store.searchHybrid(state.projectId, query, 5);
       } catch {
         // 如果向量检索未启用，降级到 FTS5
+        retrievalSource = "StoryStore.searchExact";
         results = store.searchExact(state.projectId, query, 5).map(r => ({
           ...r,
           similarity: 0.5,
@@ -257,6 +355,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const contextReport = state.contextReport ? { ...state.contextReport, retrievedBytes } : undefined;
       
       emitter?.progress("retrieve", 25, `工具 StoryStore.searchHybrid：找到 ${context.length} 条相关记忆${contextReport ? `；${formatContextReport(contextReport)}` : ""}`);
+      emitter?.context("retrieve", `记忆检索完成：${context.length} 条`, { source: retrievalSource, status: "loaded", bytes: retrievedBytes, items: context.length });
       return { retrievedContext: context, contextReport };
     })
     .addNode("continuity", async (state: ChapterStateType) => {
@@ -303,10 +402,9 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       let chapterPlan = "";
       try {
         const result = JSON.parse(response.content) as Record<string, unknown>;
-        chapterPlan = typeof result.plan === "string" ? result.plan.trim() : "";
-        if (!chapterPlan && typeof result.content === "string") chapterPlan = String(result.content).trim();
+        chapterPlan = normalizeChapterPlan(result);
       } catch {
-        chapterPlan = response.content.trim();
+        chapterPlan = normalizeChapterPlan(response.content);
       }
       if (!chapterPlan) chapterPlan = "1. 开篇承接：确认上一章人物位置与情绪。\n2. 这章的故事：推进当前目标并制造有效阻力。\n3. 这章的人物：每人按动机行动。\n4. 怎么写更顺：用动作、因果和对话推进，避免解释。\n5. 收在哪里：以有因果依据的未解行动或风险收尾。";
       emitter?.progress("plan", 42, `模型规划完成（${chapterPlan.length.toLocaleString()} 字）；已交给正文节点执行`);
@@ -347,7 +445,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       // chapter-specific material follows so upstream prefix caches remain stable.
       const dynamicPacket = [mutableProjectContext, continuitySection, planSection, contextSection].filter(Boolean).join("");
       emitter?.context("draft", "组装稳定设定与动态上下文", { source: "ContextAssembler", status: "loaded", bytes: byteLength(dynamicPacket), items: state.selectedSkills.length + (state.cards?.length || 0) });
-      const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：先承接上一章最后的动作、位置和情绪，再推进计划中的事件；不要复述计划或解释过程。`;
+      const hasPreviousChapter = Boolean(state.previousChapters?.some(chapter => chapter?.content?.trim()));
+      const continuityInstruction = hasPreviousChapter
+        ? "先承接上一章最后的动作、位置和情绪，再推进计划中的事件"
+        : "这是第一章，没有上一章正文；先依据世界观、章纲和作者指令建立场景、人物与初始冲突";
+      const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：${continuityInstruction}；不要复述计划或解释过程。`;
       const draftInputBytes = byteLength(chapterAgentSystemPrompt) + byteLength(stablePacket) + byteLength(dynamicPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
       if (contextReport?.cache === "hit") emitter?.context("draft", "命中本地资料指纹缓存", { source: "持久化上下文缓存", status: "cached", bytes: draftInputBytes });
@@ -365,17 +467,12 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       ], { response_format: { type: "json_object" } }, chunk => emitter?.chunk(chunk));
       emitter?.progress("draft", 70, "章节生成完成");
 
-      try {
-        const result = JSON.parse(response.content);
-        return {
-          draftContent: result.content || response.content,
-          summary: result.summary,
-          contextReport,
-          upstreamUsage: addUsage(state.upstreamUsage, response.usage),
-        };
-      } catch {
-        return { draftContent: response.content, contextReport, upstreamUsage: addUsage(state.upstreamUsage, response.usage) };
-      }
+      return {
+        draftContent: unwrapChapterDraft(response.content),
+        summary: chapterSummaryFromEnvelope(response.content),
+        contextReport,
+        upstreamUsage: addUsage(state.upstreamUsage, response.usage),
+      };
     })
     .addNode("review", async (state: ChapterStateType) => {
       emitter?.progress("review", 75, "工具 ConsistencyChecker：正在审查人物、设定、时间线和因果...");
