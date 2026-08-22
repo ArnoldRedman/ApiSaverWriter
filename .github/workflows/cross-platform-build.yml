@@ -101,9 +101,12 @@ jobs:
       - name: Build Android
         if: matrix.kind == 'android'
         working-directory: desktop-app
+        timeout-minutes: 35
         run: |
           npx tauri android init --ci
-          npm run android:build -- --ci --apk --aab
+          # 发布包只构建 arm64-v8a：它覆盖当前绝大多数 Android 手机，
+          # 也避免一次性编译四个 Rust ABI 造成 CI 长时间无输出。
+          npm run android:build -- --ci --target aarch64 --apk --aab
       - name: Package Android assets
         if: matrix.kind == 'android'
         shell: bash
