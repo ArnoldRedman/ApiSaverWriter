@@ -130,6 +130,19 @@ jobs:
         with:
           generate_release_notes: true
           files: release-assets/*
+      - name: Publish install packages to public distribution repository
+        if: ${{ secrets.DISTRIBUTION_GITHUB_TOKEN != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.DISTRIBUTION_GITHUB_TOKEN }}
+          DISTRIBUTION_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian' }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$DISTRIBUTION_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "$RELEASE_TAG" --repo "$DISTRIBUTION_REPOSITORY" \
+              --title "$RELEASE_TAG" \
+              --notes "AI写小说软件 $RELEASE_TAG 安装包。本仓库只提供安装包，不包含源代码。"
+          gh release upload "$RELEASE_TAG" --repo "$DISTRIBUTION_REPOSITORY" release-assets/* --clobber
       - name: Sync release notes to Feishu
         if: ${{ secrets.FEISHU_APP_ID != '' && secrets.FEISHU_APP_SECRET != '' }}
         env:
@@ -139,6 +152,7 @@ jobs:
           FEISHU_AS: bot
           RELEASE_TAG: ${{ github.ref_name }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          DOWNLOAD_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           npm install -g @larksuite/cli@1.0.89

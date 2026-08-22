@@ -717,7 +717,7 @@ const splitTxtIntoDismantleChapters = (text: string): Array<{ title: string; sou
   if (!cleaned) return [];
   // 兼容网文 TXT 常见的标题行：第X章、Chapter X、1、标题、1. 标题、1 标题。
   // 仅识别独立行，避免正文中的普通数字被错误切分。
-  const heading = /^[\t 　]*(?:第[\t 　]*[0-9０-９一二三四五六七八九十百千万零〇两]+[\t 　]*[章节卷回部篇集].*|(?:chapter|chap\.?)[\t 　]*[0-9０-９]+(?:[\t 　]*[-—:：、.．][\t 　]*.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\t 　]*[、.．:：-—][\t 　]*(?:\S.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\t 　]*$|[0-9０-９]{1,5}[\t 　]+\S.*)$/gimu;
+  const heading = new RegExp('^[\\t 　]*(?:第[\\t 　]*[0-9０-９一二三四五六七八九十百千万零〇两]+[\\t 　]*[章节卷回部篇集].*|(?:chapter|chap\\.?)\\s*[0-9０-９]+(?:[\\t 　]*[-—:：、.．][\\t 　]*.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\\t 　]*[、.．:：\\-—][\\t 　]*(?:\\S.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\\t 　]*$|[0-9０-９]{1,5}[\\t 　]+\\S.*)$', 'gimu');
   const matches = Array.from(cleaned.matchAll(heading));
   if (!matches.length) return [{ title: '第1章', sourceContent: cleaned }];
   const chapters: Array<{ title: string; sourceContent: string }> = [];

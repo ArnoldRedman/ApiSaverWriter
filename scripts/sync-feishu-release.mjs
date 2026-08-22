@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 const docUrl = process.env.FEISHU_DOC_URL || 'https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa';
 const tag = process.env.RELEASE_TAG || process.env.GITHUB_REF_NAME || '';
 const repository = process.env.GITHUB_REPOSITORY || 'Vaxue/ApiSaverWriter';
+const downloadRepository = process.env.DOWNLOAD_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian';
 const token = process.env.GITHUB_TOKEN || '';
 const identity = process.env.FEISHU_AS || 'bot';
 if (!tag) throw new Error('缺少 RELEASE_TAG 或 GITHUB_REF_NAME');
@@ -20,10 +21,9 @@ const releaseResponse = await fetch(`https://api.github.com/repos/${repository}/
 if (!releaseResponse.ok) throw new Error(`GitHub Release 查询失败：HTTP ${releaseResponse.status}`);
 const release = await releaseResponse.json();
 const assets = Array.isArray(release.assets) ? release.assets : [];
+const downloadBase = `https://github.com/${downloadRepository}/releases/download/${encodeURIComponent(tag)}`;
 const lines = [
   `\n\n## ${tag}（${new Date().toISOString().slice(0, 10)}）`,
-  '',
-  `GitHub Release：${release.html_url || `https://github.com/${repository}/releases/tag/${tag}`}`,
   '',
   '### 更新内容',
   '- 使用教程改为飞书文档入口，客服入口统一为“联系客服”。',
@@ -32,7 +32,7 @@ const lines = [
   '- 猫眼看书优+书源遇到过期授权或 403 时自动清理旧授权并重试。',
   '',
   '### 安装包下载',
-  ...(assets.length ? assets.map(asset => `- [${asset.name}](${asset.browser_download_url})`) : ['- Release 构建完成后，安装包会显示在上方 GitHub Release 页面。']),
+  ...(assets.length ? assets.map(asset => `- [${asset.name}](${downloadBase}/${encodeURIComponent(asset.name)})`) : ['- 安装包正在准备中，请稍后刷新本页。']),
   '',
   '> 本节由 GitHub Actions 自动同步。重复运行不会重复追加同一版本。',
 ].join('\n');
