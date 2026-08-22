@@ -28,7 +28,6 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.label }}
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.platform == 'all' || inputs.platform == matrix.kind }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -90,10 +89,10 @@ jobs:
           [ "${{ matrix.kind }}" = "macos-intel" ] && arch="Intel"
           dmg="$(find desktop-app/src-tauri/target -path '*/release/bundle/dmg/*.dmg' -print -quit)"
           test -n "$dmg"
-          cp "$dmg" "release-assets/ApiSaverWriter_${{ github.ref_name }}_macOS_${arch}.dmg"
+          cp "$dmg" "release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_macOS_${arch}.dmg"
           app="$(find desktop-app/src-tauri/target -path '*/release/bundle/macos/*.app' -print -quit)"
           test -n "$app"
-          tar -C "$(dirname "$app")" -czf "release-assets/ApiSaverWriter_${{ github.ref_name }}_macOS_${arch}.app.tar.gz" "$(basename "$app")"
+          tar -C "$(dirname "$app")" -czf "release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_macOS_${arch}.app.tar.gz" "$(basename "$app")"
       - name: Prepare Android SDK
         if: matrix.kind == 'android'
         run: |
@@ -129,8 +128,8 @@ jobs:
           app="$(find "$archive/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$app"
           cp -R "$app" ios-package/Payload/
-          (cd ios-package && zip -qry "../release-assets/ApiSaverWriter_${{ github.ref_name }}_iOS_unsigned.ipa" Payload)
-          tar -C "$(dirname "$archive")" -czf "release-assets/ApiSaverWriter_${{ github.ref_name }}_iOS_unsigned.xcarchive.tar.gz" "$(basename "$archive")"
+          (cd ios-package && zip -qry "../release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_iOS_unsigned.ipa" Payload)
+          tar -C "$(dirname "$archive")" -czf "release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_iOS_unsigned.xcarchive.tar.gz" "$(basename "$archive")"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
