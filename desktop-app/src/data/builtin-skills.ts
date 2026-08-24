@@ -130,11 +130,6 @@ const builtinSkillDefinitions: Skill[] = [
     tags: ['百度网盘', '备份', '同步', '恢复'], rating: 5, usageCount: 0, builtin: true,
     content: '# 百度网盘备份与同步\n\n## 适用场景\n作者明确要求备份小说、恢复小说、同步本地项目或检查百度网盘登录状态时使用。\n\n## 操作规范\n1. 只操作应用自己的 `/apps/bdpan/ApiSaverWriter/` 目录，不访问其他云端路径。\n2. 备份前先保存本地小说目录，再上传 `projects` 文件夹；不要删除云端文件。\n3. 恢复前明确提示会覆盖同名本地文件；下载后合并到本地 `projects` 目录并重新加载。\n4. 未登录或 CLI 不存在时，返回登录/安装提示，不伪造成功。\n5. 不读取、输出或记录 access token、密码等凭据。\n\n## 输出格式\n报告操作、远端目录、文件数量或 CLI 返回结果；失败时保留原始错误和下一步处理建议。',
   },
-  {
-    id: 'builtin-social-promotion', name: 'social-promotion', displayName: '多平台推广内容生成器', category: 'tool',
-    description: '根据项目功能和真实截图生成 B 站、小红书、抖音三平台差异化推广内容与发布素材包。', tags: ['推广', 'B站', '小红书', '抖音', '内容营销'], rating: 5, usageCount: 0, builtin: true,
-    content: '# 多平台推广内容生成器\n\n## 技能说明\n\n把 ApiSaverWriter 的真实功能、版本更新和界面截图整理为可审核的多平台推广包，面向 AI 写作软件、AI 写小说软件和长篇网文作者。不得编造不存在的功能、用户数据、下载地址或效果承诺。\n\n## 意图识别\n\n- 用户说“推广软件/发宣传/做一套内容”：生成三平台内容包，不直接发布。\n- 用户明确指定 B 站、小红书或抖音：只生成对应平台内容与素材规格。\n- 用户说“发布/投稿”：先给出逐平台预览、标题、正文、标签、媒体文件和账号，等待用户逐平台确认；没有有效登录态或连接器时，只输出发布清单。\n- 用户说“复盘/看效果”：读取已保存的发布记录，按平台汇总状态，不臆测播放量。\n\n## 固定推广信息\n\n- 产品名：ApiSaverWriter\n- 定位：AI写作软件、AI写小说软件、长篇网文创作工作台\n- 核心卖点：世界观固定带入、总纲/章纲/正文工作流、章节记忆、人物状态与角色认知、全文检索、拆书扫榜、百度网盘完整备份、多端支持。\n- 下载入口：https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa\n- 使用教程：https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb\n- 官方 QQ 群：1019592334\n- 联系客服 QQ：2805099052\n\n## 输出步骤\n\n1. 读取当前版本、真实更新记录、README 截图和用户指定卖点。\n2. 提炼一个统一核心钩子，再按平台重写，不跨平台复制同一篇文案。\n3. 生成 B 站专栏版：标题、导语、功能分段、截图引用、教程/下载链接、3-8 个标签。\n4. 生成小红书笔记版：封面标题、正文、首图文字、图片顺序、话题标签；口吻具体、少用空泛营销词。\n5. 生成抖音短视频版：30-60 秒分镜、口播、字幕、镜头素材、封面标题、描述和话题标签。\n6. 输出媒体清单：文件名、用途、比例/尺寸、是否需要重新导出。\n7. 输出发布日历建议和 UTM/来源标记，便于统计下载转化。\n8. 最后输出“发布前检查”：链接、版本号、截图、联系方式、隐私和授权状态。\n\n## 输出格式\n\n```markdown\n# ApiSaverWriter 多平台推广包\n\n## 统一核心钩子\n...\n\n## B站专栏\n标题：...\n正文：...\n标签：...\n配图：...\n\n## 小红书笔记\n封面标题：...\n正文：...\n话题：...\n图片顺序：...\n\n## 抖音短视频\n时长：30-60 秒\n分镜与口播：...\n字幕：...\n封面标题：...\n话题：...\n\n## 发布前检查\n- [ ] 登录账号正确\n- [ ] 链接可打开\n- [ ] 版本与截图一致\n- [ ] 已确认后再发布\n```\n\n## 安全与发布边界\n\n- 只使用作者自己的平台账号和明确授权的连接器。\n- 默认生成草稿/预览，不批量自动发布，不绕过验证码、风控或平台限制。\n- 每个平台发布前必须展示最终标题、正文、媒体和可见范围，得到用户明确确认后再执行。\n- 不读取或输出 Cookie、密码、验证码、API Key；不把个人作品或备份上传到第三方素材服务。',
-  },
 ];
 
 // Keep the English names as stable routing keys while presenting every built-in
@@ -183,7 +178,6 @@ const builtinSkillDisplayNames: Record<string, string> = {
   'browser-cdp': '浏览器采集',
   'skill-creator': '技能创建器',
   'baidu-drive': '百度网盘备份与同步',
-  'social-promotion': '多平台推广内容生成器',
 };
 
 export const builtinSkills: Skill[] = builtinSkillDefinitions.map(skill => ({
