@@ -1,221 +1,111 @@
-# ApiSaverWriter - AI 小说写作助手
+# ApiSaverWriter
 
-## 下载应用
+> 面向长篇网文创作的本地优先 AI 写作工作台。
 
-当前稳定版本：[v0.1.1 Release](https://github.com/Vaxue/ApiSaverWriter/releases/tag/v0.1.1)
+[![Version](https://img.shields.io/badge/version-0.1.4-1677ff)](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
+[![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-20a162)](#下载安装)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-8a2be2)](LICENSE)
 
-| 平台 | 安装包 |
-| --- | --- |
-| Windows x64 | [EXE 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_0.1.1_x64-setup.exe) · [MSI 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_0.1.1_x64_en-US.msi) |
-| macOS Apple Silicon | [DMG 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_v0.1.1_macOS_AppleSilicon.dmg) |
-| macOS Intel | [DMG 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_v0.1.1_macOS_Intel.dmg) |
-| Android | [APK 安装包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/app-universal-release-unsigned.apk) · [AAB 包](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/app-universal-release.aab) |
-| iOS | [未签名 IPA](https://github.com/Vaxue/ApiSaverWriter/releases/download/v0.1.1/ApiSaverWriter_v0.1.1_iOS_unsigned.ipa) |
+ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记忆与写作技能组织在一个本地项目中。它面向需要持续创作、追踪设定与维持上下文一致性的长篇网文作者，而不是一次性文本生成器。
 
-> iOS IPA 与 Android APK 未签名，需要使用对应设备的安装或签名方式导入。后续版本可从 [Releases](https://github.com/Vaxue/ApiSaverWriter/releases) 页面获取。
+## 下载安装
 
-## 📖 项目简介
+最新安装包、校验值与版本更新记录统一发布在飞书文档：
 
-ApiSaverWriter 是一款功能强大的 AI 小说写作助手，参考 QMai 小说的设计理念，提供完整的小说创作工具链。
+**[下载 ApiSaverWriter](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)**
 
-## ✨ 核心功能
+当前提供 macOS、Windows、Android 与 iOS 构建版本。iOS 安装包为未签名 IPA，需使用适合设备的签名或安装方式导入。
 
-### 1. 📚 项目管理
-- 小说项目管理
-- 卷/章节组织
-- 大纲编辑
-- 人物设定
-- 世界观设定
+## 核心能力
 
-### 2. ⚡ 技能库系统
-- **内置写作技巧**：冲突开场、悬念营造、情感渲染等
-- **风格模板**：不同类型小说的写作风格
-- **情节模式**：经典情节结构和套路
-- **全文搜索**：快速查找相关技能
-- **使用统计**：追踪技能使用频率
-- **自定义技能**：添加和管理个人写作技巧
+### 长篇创作工作流
 
-### 3. 📊 扫榜工具
-- **番茄小说热榜**：实时抓取热门排行
-- **起点中文网**：经典网文平台数据
-- **多维度筛选**：按分类、标签、更新时间等
-- **趋势分析**：追踪榜单变化趋势
+- 创建和管理小说、卷、章节、总纲、章纲与世界观设定。
+- 内置中文写作 Skills，覆盖总纲、章纲、世界观、正文、文风和拆书等场景。
+- 章纲智能体识别“根据上一章生成下一章章纲”与“根据本章正文回溯章纲”等意图。
+- 正文编辑器支持搜索替换、一键格式化、章节导入与更兼容的章节标题识别。
 
-### 4. 🔍 拆书分析
-- **章节结构分析**：识别开头、发展、高潮、结尾
-- **情节节奏**：分析快慢节奏变化
-- **人物塑造**：提取人物描写技巧
-- **写作手法**：识别对话、环境、心理等技巧
-- **技能提取**：将优秀写法沉淀为可复用技能
+### 记忆、卡片与图谱
 
-## 🏗️ 技术架构
+- 保存章节后提取并维护人物状态、角色认知、时间线、设定事实、伏笔、冲突和章末钩子。
+- 固定世界观与作品设定自动参与创作上下文；总纲按工作流隔离，避免提前泄露后续剧情。
+- 作品资料指纹、持久化上下文缓存、会话摘要与上下文裁剪降低重复加载成本。
+- 卡片和知识图谱展示人物、设定与事件关系；切换节点时支持关联节点聚焦。
 
-### 后端核心 (TypeScript + SQLite)
+### 资料与研究
 
-```
-src/
-├── novel-writer.ts          # 主入口
-├── skills/
-│   └── skill-manager.ts     # 技能管理（FTS5全文搜索）
-├── scrapers/
-│   ├── base-scraper.ts      # 爬虫基类
-│   └── fanqie-scraper.ts    # 番茄小说爬虫
-└── analysis/
-    └── book-analyzer.ts     # 拆书分析引擎
-```
+- 全文检索：在章节、纲要、卡片与项目资料中定位内容。
+- 书籍搜索、下载、导入、拆书与多书源支持。
+- 番茄、起点、飞卢等榜单采集与封面展示。
 
-### 前端界面 (React + TypeScript + Tauri)
+### 同步与多端
 
-```
-desktop-app/
-├── src/
-│   ├── App.tsx              # 主界面
-│   ├── App.css              # 深色主题样式
-│   └── main.tsx             # 入口
-└── src-tauri/               # Tauri 桌面应用
+- 百度网盘完整备份与恢复，覆盖作品、记忆、大纲、卡片、拆书和扫榜资料。
+- 支持在云端选择指定备份文件恢复。
+- macOS、Windows、Android、iOS 统一通过应用内网盘 API 同步，不依赖本机 CLI 或桌面网盘客户端。
+
+## 使用方式
+
+1. 在“设置”中添加 ApiSaver API Key，拉取该 Key 所属分组可用的模型并选择模型。
+2. 新建小说，先建立世界观与作品设定，再创建总纲、章纲或正文。
+3. 保存正文后确认章节记忆，后续章节会按固定资料、历史摘要与最近对话的顺序构建上下文。
+4. 通过“设置 - 备份与同步”创建完整备份，在新设备上恢复同一份创作资料。
+
+## 架构
+
+```text
+ApiSaverWriter/
+├── desktop-app/             # React + TypeScript + Tauri 多端客户端
+│   ├── src/                 # 界面、平台适配、内置 Skills
+│   └── src-tauri/           # Rust 原生能力与移动端工程
+├── sidecars/agent-runtime/  # Node.js 写作智能体、上下文和本地存储
+├── src/                     # 技能、拆书、书源与基础能力
+├── schema/                  # 本地数据结构
+└── scripts/                 # 版本发布和飞书同步脚本
 ```
 
-### 数据库设计
+- **客户端**：React、TypeScript、Vite、Tauri 2。
+- **智能体运行时**：Node.js、TypeScript，负责会话、上下文缓存、Skill 路由和章节记忆。
+- **本地数据**：项目资料保存在用户设备本地；同步由用户主动触发。
 
-**技能表 (skills)**
-- id, name, category, description, content
-- tags (JSON), examples (JSON)
-- rating, usage_count
-- is_builtin, created_at, updated_at
+## 本地开发
 
-**全文搜索 (skills_fts)**
-- FTS5 虚拟表，支持中文分词
-- 索引 name, description, content
+### 环境要求
 
-## 🎨 设计风格
+- Node.js 20+
+- Rust stable 与 Tauri 对应平台依赖
+- 平台构建工具：Xcode（iOS/macOS）、Android SDK（Android）、Windows 构建环境（Windows）
 
-- **配色方案**：深色主题，深海蓝 (#0B0E14) + 天蓝 (#38BDF8)
-- **字体**：Inter / SF Pro 系统字体
-- **组件**：圆角卡片、悬停动效、渐变强调
-- **布局**：侧边栏导航 + 主内容区
-
-## 📦 安装与使用
-
-### 安装依赖
+### 启动
 
 ```bash
-# 安装根项目依赖
 npm install
-
-# 安装桌面应用依赖
-cd desktop-app
-npm install
+npm install --prefix desktop-app
+npm run tauri:dev --prefix desktop-app
 ```
 
-### 开发模式
+### 构建
 
 ```bash
-# 启动桌面应用开发服务器
-cd desktop-app
-npm run tauri dev
+npm run tauri:build --prefix desktop-app
 ```
 
-### 构建生产版本
+移动端构建步骤请查看 [desktop-app/MOBILE.md](desktop-app/MOBILE.md)。
 
-```bash
-cd desktop-app
-npm run tauri build
-```
+## 开源边界与隐私
 
-### 运行测试
+本仓库公开的是客户端、写作工作流和本地数据能力。以下内容不在仓库内，也不会随客户端源码提交：
 
-```bash
-npm test
-```
+- ApiSaver 的模型渠道、模型路由、余额、计费、风控与运营系统。
+- API Key、访问令牌、签名证书、个人小说内容、云端备份内容和其他用户数据。
+- 生产服务配置与服务端密钥。
 
-## 🧪 测试覆盖
+客户端默认使用 ApiSaver 服务地址，用户需在设置中配置自己的 API Key。请勿在 Issue、Pull Request、日志或截图中提交任何 Key、Cookie、备份文件或私密作品资料。
 
-- ✅ 技能搜索与管理
-- ✅ 技能分类筛选
-- ✅ 技能添加、更新、删除
-- ✅ 使用统计
-- ✅ 章节结构分析
-- ✅ 对话技巧识别
-- ✅ 节奏分析
+## 贡献
 
-## 📚 API 使用示例
+欢迎提交 Bug 报告、功能建议与 Pull Request。开始前请阅读 [贡献指南](CONTRIBUTING.md) 与 [安全策略](SECURITY.md)。
 
-### 技能管理
+## 许可证
 
-```typescript
-import { NovelWriter } from './src/novel-writer.js';
-
-const writer = new NovelWriter();
-
-// 搜索技能
-const skills = writer.skills.search({ 
-  category: 'technique',
-  limit: 10 
-});
-
-// 添加自定义技能
-const skillId = writer.skills.add({
-  name: '场景切换',
-  category: 'technique',
-  description: '流畅的场景转换技巧',
-  content: '使用时间、空间标记明确场景切换...',
-  tags: ['场景', '过渡'],
-});
-
-// 记录使用
-writer.skills.recordUsage(skillId);
-```
-
-### 拆书分析
-
-```typescript
-import { BookAnalyzer } from './src/analysis/book-analyzer.js';
-
-const analyzer = new BookAnalyzer();
-
-const result = await analyzer.analyzeChapter(
-  chapterContent,
-  '第一章 重生',
-  1
-);
-
-console.log(result.structure);  // 章节结构
-console.log(result.techniques); // 识别的技巧
-console.log(result.pacing);     // 节奏分析
-```
-
-### 扫榜工具
-
-```typescript
-import { FanqieScraper } from './src/scrapers/fanqie-scraper.js';
-
-const scraper = new FanqieScraper();
-
-const rankings = await scraper.fetchRankings({
-  category: '玄幻',
-  limit: 20,
-});
-
-rankings.forEach(novel => {
-  console.log(`${novel.rank}. ${novel.title} - ${novel.author}`);
-});
-```
-
-## 🚀 未来规划
-
-- [ ] AI 辅助写作（接入 GPT/Claude）
-- [ ] 多平台数据源（起点、晋江、17K）
-- [ ] 协同编辑功能
-- [ ] 云端同步
-- [ ] 移动端应用
-- [ ] 写作数据统计与可视化
-- [ ] 敏感词检测
-- [ ] 自动纠错与润色
-
-## 📄 License
-
-MIT
-
-## 👥 贡献
-
-欢迎提交 Issue 和 Pull Request！
+本项目以 [GNU Affero General Public License v3.0 or later](LICENSE) 发布。第三方依赖仍受各自许可证约束。

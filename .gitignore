@@ -7,8 +7,12 @@ desktop-app/src-tauri/runtime/
 desktop-app/src-tauri/gen/apple/
 desktop-app/src-tauri/gen/schemas/iOS-schema.json
 desktop-app/src-tauri/gen/schemas/mobile-schema.json
+desktop-app/src-tauri/gen/android/
+desktop-app/src-tauri/gen/schemas/android-schema.json
+desktop-app/src-tauri/gen/schemas/windows-schema.json
 desktop-app/release-assets/
 desktop-app/output-dev.png
+local-releases/
 dist/
 *.dmg
 *.app

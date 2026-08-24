@@ -29,6 +29,9 @@ type MobileQianyueSource = {
 };
 
 const mobileRuntime = () => '__TAURI_INTERNALS__' in window && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+// 百度网盘同步使用应用内 HTTP API。所有 Tauri 平台都走这条路径，避免
+// macOS/Windows 依赖外部 bdpan CLI；桌面端的小说文件仍由原生命令写入本机目录。
+const directBaiduRuntime = () => '__TAURI_INTERNALS__' in window;
 
 let httpFetchPromise: Promise<typeof globalThis.fetch> | null = null;
 // `/v1/models` is scoped to one API Key. Keep the association on mobile too,
@@ -1490,28 +1493,28 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   return { content: result.content.trim() } as T;
 };
 
-/** Desktop uses the embedded Node Agent. Mobile uses the native HTTP plugin and the same saved API configuration directly. */
+/** Agent runtime remains platform-specific; 百度网盘同步在所有 Tauri 平台统一走 HTTP API。 */
 export const invoke = async <T>(command: string, args?: InvokeArgs): Promise<T> => {
-  if (!mobileRuntime()) return nativeInvoke<T>(command, args);
-  if (command === 'start_agent_runtime') return 'Mobile direct Agent ready' as T;
-  if (command === 'cloud_sync_status') return mobileBaiduStatus() as T;
-  if (command === 'baidu_login_url') return mobileBaiduLoginURL() as T;
-  if (command === 'complete_baidu_login') {
+  if (directBaiduRuntime() && command === 'cloud_sync_status') return mobileBaiduStatus() as T;
+  if (directBaiduRuntime() && command === 'baidu_login_url') return mobileBaiduLoginURL() as T;
+  if (directBaiduRuntime() && command === 'complete_baidu_login') {
     const input = args as { code?: string } | undefined;
     return mobileBaiduCompleteLogin(stringValue(input?.code)) as T;
   }
-  if (command === 'backup_projects_to_baidu') {
+  if (directBaiduRuntime() && command === 'backup_projects_to_baidu') {
     const input = args as { remotePath?: string; clientState?: Record<string, string | null> } | undefined;
     return mobileBaiduBackup(stringValue(input?.remotePath), input?.clientState || {}) as T;
   }
-  if (command === 'list_baidu_backups') {
+  if (directBaiduRuntime() && command === 'list_baidu_backups') {
     const input = args as { remotePath?: string } | undefined;
     return mobileBaiduListBackups(stringValue(input?.remotePath)) as T;
   }
-  if (command === 'restore_projects_from_baidu') {
+  if (directBaiduRuntime() && command === 'restore_projects_from_baidu') {
     const input = args as { remotePath?: string; backupPath?: string; backupFsId?: string } | undefined;
     return mobileBaiduRestore(stringValue(input?.remotePath), stringValue(input?.backupPath), stringValue(input?.backupFsId)) as T;
   }
+  if (!mobileRuntime()) return nativeInvoke<T>(command, args);
+  if (command === 'start_agent_runtime') return 'Mobile direct Agent ready' as T;
   if (command === 'call_agent_rpc') {
     const input = args as { method?: string; params?: MobileParams } | undefined;
     if (!input?.method) throw new Error('缺少 Agent RPC 方法。');
@@ -1522,3 +1525,4 @@ export const invoke = async <T>(command: string, args?: InvokeArgs): Promise<T> 
 };
 
 export const isMobileRuntime = mobileRuntime;
+export const isDirectBaiduRuntime = directBaiduRuntime;
