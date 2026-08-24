@@ -16,6 +16,14 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 
 当前提供 macOS、Windows、Android 与 iOS 构建版本。iOS 安装包为未签名 IPA，需使用适合设备的签名或安装方式导入。
 
+## 使用教程
+
+完整的首次配置、模型选择、创建作品、章节写作、记忆维护、全文检索、拆书扫榜和百度网盘恢复流程，请查看飞书教程：
+
+**[打开 ApiSaverWriter 使用教程](https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb)**
+
+教程会随着版本更新补充操作步骤和常见问题，README 只保留项目级说明。
+
 ## 核心能力
 
 ### 长篇创作工作流
@@ -43,6 +51,18 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 - 百度网盘完整备份与恢复，覆盖作品、记忆、大纲、卡片、拆书和扫榜资料。
 - 支持在云端选择指定备份文件恢复。
 - macOS、Windows、Android、iOS 统一通过应用内网盘 API 同步，不依赖本机 CLI 或桌面网盘客户端。
+
+## 界面预览
+
+以下截图来自 v0.1.4 的实际构建，用于展示主要工作流；移动端采用独立的窄屏布局。
+
+| 首页 | 新建小说 |
+| --- | --- |
+| ![首页](docs/screenshots/home.png) | ![新建小说](docs/screenshots/new-project.png) |
+
+### 移动端章节编辑器
+
+![移动端章节编辑器](docs/screenshots/mobile-chapter-editor.png)
 
 ## 使用方式
 
