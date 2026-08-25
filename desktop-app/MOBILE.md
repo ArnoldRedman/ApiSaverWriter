@@ -18,6 +18,13 @@ npm run mobile:init -- android
 npm run android:build
 ```
 
+发布给用户安装的 APK 必须经过固定发布证书签名。CI 使用
+`ANDROID_KEYSTORE_BASE64`、`ANDROID_KEYSTORE_PASSWORD`、
+`ANDROID_KEY_ALIAS`、`ANDROID_KEY_PASSWORD` 四个仓库 Secret，并由
+`scripts/package-android-release.sh` 完成 zipalign、APK v2/v3 签名、
+包名/版本解析和签名校验。不要分发 Gradle 输出中的
+`*-release-unsigned.apk`，安卓安装器会将它识别为无效软件包。
+
 iOS 需要 Xcode、CocoaPods、Apple Development Team：
 
 ```bash

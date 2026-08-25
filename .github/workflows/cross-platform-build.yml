@@ -107,13 +107,43 @@ jobs:
           # 发布包只构建 arm64-v8a：它覆盖当前绝大多数 Android 手机，
           # 也避免一次性编译四个 Rust ABI 造成 CI 长时间无输出。
           npm run android:build -- --ci --target aarch64 --apk --aab
-      - name: Package Android assets
+      - name: Restore Android release signing key
         if: matrix.kind == 'android'
         shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
         run: |
           set -euo pipefail
-          mkdir -p release-assets
-          find desktop-app/src-tauri/gen/android/app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) -exec cp {} release-assets/ \;
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/apisaverwriter-release.jks"
+            echo "使用仓库固定 Android 发布签名密钥。"
+          else
+            echo "未配置 ANDROID_KEYSTORE_BASE64，生成本次构建签名密钥。配置固定密钥后可保持跨版本覆盖安装。"
+            keytool -genkeypair -noprompt \
+              -keystore "$RUNNER_TEMP/apisaverwriter-release.jks" \
+              -storepass apisaverwriter-ci \
+              -keypass apisaverwriter-ci \
+              -alias apisaverwriter \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -dname "CN=ApiSaverWriter,O=ApiSaverWriter,C=CN"
+          fi
+      - name: Sign and verify Android release assets
+        if: matrix.kind == 'android'
+        shell: bash
+        env:
+          ANDROID_BUILD_TOOLS_VERSION: 35.0.0
+          ANDROID_VERSION_CODE: 14
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/apisaverwriter-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${ANDROID_KEYSTORE_PASSWORD:=apisaverwriter-ci}"
+          : "${ANDROID_KEY_ALIAS:=apisaverwriter}"
+          : "${ANDROID_KEY_PASSWORD:=apisaverwriter-ci}"
+          export ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
+          scripts/package-android-release.sh release-assets "${{ inputs.release_tag || github.ref_name }}"
       - name: Build unsigned iOS archive
         if: matrix.kind == 'ios'
         working-directory: desktop-app
