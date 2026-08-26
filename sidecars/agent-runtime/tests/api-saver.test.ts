@@ -224,4 +224,186 @@ describe("API Saver model configuration", () => {
     await expect(request).rejects.toThrow("API 中转服务额度已用尽");
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it("sends the documented reasoning_effort field and saturates max at high", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
+
+    await new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test", reasoningMode: "max" })
+      .chat([{ role: "user", content: "测试" }]);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    expect(body.reasoning_effort).toBe("high");
+    expect(body).not.toHaveProperty("reasoning");
+  });
+
+  it("surfaces the upstream error message instead of a bare status code", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify({ error: { type: "invalid_request_error", message: "model: claude-x not found" } }),
+      { status: 400 },
+    ));
+
+    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "claude-x" })
+      .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
+      .rejects.toThrow("model: claude-x not found");
+  });
+
+  it("explains a 404 as a possible API format mismatch", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not found", { status: 404 }));
+
+    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
+      .rejects.toThrow("切换为 Anthropic Messages");
+  });
+});
+
+describe("Anthropic Messages wire protocol", () => {
+  const anthropicResponse = (content: unknown, extra: Record<string, unknown> = {}) => new Response(
+    JSON.stringify({ model: "claude-opus-5", content, stop_reason: "end_turn", ...extra }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+
+  it("resolves every address shape to the same messages endpoint", async () => {
+    for (const baseURL of ["https://relay.test", "https://relay.test/v1", "https://relay.test/v1/messages"]) {
+      const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([{ type: "text", text: "OK" }]));
+      await new ApiSaverClient({ apiKey: "k", baseURL, apiMode: "anthropic", defaultModel: "claude-opus-5" })
+        .chat([{ role: "user", content: "测试" }]);
+      expect(fetchMock.mock.calls[0][0]).toBe("https://relay.test/v1/messages");
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("authenticates with x-api-key and pins the anthropic version", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([{ type: "text", text: "OK" }]));
+
+    await new ApiSaverClient({ apiKey: "claude-key", apiMode: "anthropic", defaultModel: "claude-opus-5" })
+      .chat([{ role: "user", content: "测试" }]);
+
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ "x-api-key": "claude-key", "anthropic-version": "2023-06-01" });
+    expect(fetchMock.mock.calls[0][1]?.headers).not.toHaveProperty("Authorization");
+  });
+
+  it("lifts system prompts out of the turn list and merges same-role turns", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([{ type: "text", text: "OK" }]));
+
+    await new ApiSaverClient({ apiKey: "k", apiMode: "anthropic", defaultModel: "claude-opus-5" }).chat([
+      { role: "system", content: "你是写作助手" },
+      { role: "system", content: "保持人物一致" },
+      { role: "user", content: "第一段要求" },
+      { role: "user", content: "第二段要求" },
+    ]);
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    expect(body.system).toBe("你是写作助手\n\n保持人物一致");
+    expect(body.messages).toEqual([{ role: "user", content: "第一段要求\n\n第二段要求" }]);
+  });
+
+  it("turns the reasoning level into a thinking budget below max_tokens", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([{ type: "text", text: "OK" }]));
+
+    await new ApiSaverClient({ apiKey: "k", apiMode: "anthropic", defaultModel: "claude-opus-5", reasoningMode: "max" })
+      .chat([{ role: "user", content: "测试" }], { max_tokens: 4000, temperature: 0.7 });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    expect(body.thinking).toEqual({ type: "enabled", budget_tokens: 24576 });
+    expect(body.max_tokens).toBe(25600);
+    // Extended thinking requires the default temperature.
+    expect(body).not.toHaveProperty("temperature");
+  });
+
+  it("keeps thinking blocks out of the returned prose", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(anthropicResponse([
+      { type: "thinking", thinking: "内部推理不应出现在正文" },
+      { type: "text", text: "第一段" },
+      { type: "text", text: "第二段" },
+    ], { usage: { input_tokens: 120, output_tokens: 30, cache_read_input_tokens: 100 } }));
+
+    await expect(new ApiSaverClient({ apiKey: "k", apiMode: "anthropic", defaultModel: "claude-opus-5" })
+      .chat([{ role: "user", content: "测试" }]))
+      .resolves.toMatchObject({
+        content: "第一段第二段",
+        model: "claude-opus-5",
+        usage: { inputTokens: 120, outputTokens: 30, totalTokens: 150, cachedInputTokens: 100 },
+      });
+  });
+
+  it("reports truncation and thinking-only replies instead of an empty result", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(anthropicResponse([], { stop_reason: "max_tokens" }))
+      .mockResolvedValueOnce(anthropicResponse([{ type: "thinking", thinking: "只有推理" }]));
+    const client = new ApiSaverClient({ apiKey: "k", apiMode: "anthropic", defaultModel: "claude-opus-5" });
+
+    await expect(client.chat([{ role: "user", content: "测试" }], { max_tokens: 8, retryAttempts: 1 }))
+      .rejects.toThrow("模型输出被截断（max_tokens=8）");
+    await expect(client.chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
+      .rejects.toThrow("只返回了 thinking 块");
+  });
+
+  it("lists models from the Anthropic models endpoint", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ data: [{ id: "claude-opus-5" }, { id: "claude-sonnet-5" }] }), { status: 200 }));
+
+    await expect(new ApiSaverClient({ apiKey: "k", baseURL: "https://relay.test/v1", apiMode: "anthropic" }).listModels())
+      .resolves.toEqual(["claude-opus-5", "claude-sonnet-5"]);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://relay.test/v1/models");
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ "x-api-key": "k" });
+  });
+
+  it("streams text_delta events, skips thinking_delta and accumulates usage", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode([
+            "event: message_start",
+            `data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 200, output_tokens: 1 } } })}`,
+            "event: content_block_delta",
+            `data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "thinking_delta", thinking: "推理" } })}`,
+            "event: content_block_delta",
+            `data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "正文开头" } })}`,
+            "event: message_delta",
+            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 42 } })}`,
+            "event: message_stop",
+            `data: ${JSON.stringify({ type: "message_stop" })}`,
+            "",
+          ].join("\n")));
+          // Anthropic relays commonly leave the connection open after message_stop.
+        },
+      }),
+      { status: 200, headers: { "Content-Type": "text/event-stream" } },
+    ));
+    const chunks: string[] = [];
+
+    await expect(new ApiSaverClient({ apiKey: "k", apiMode: "anthropic", defaultModel: "claude-opus-5" })
+      .chatStream([{ role: "user", content: "测试" }], {}, chunk => chunks.push(chunk)))
+      .resolves.toMatchObject({
+        content: "正文开头",
+        usage: { inputTokens: 200, outputTokens: 42, totalTokens: 242 },
+      });
+    expect(chunks).toEqual(["正文开头"]);
+  });
+
+  it("reports each preflight step and names the failing one", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "claude-opus-5" }] }), { status: 200 }))
+      .mockResolvedValue(new Response(JSON.stringify({ error: { message: "credit balance is too low" } }), { status: 400 }));
+
+    const report = await new ApiSaverClient({ apiKey: "k", baseURL: "https://relay.test", apiMode: "anthropic", defaultModel: "claude-opus-5" })
+      .diagnose();
+
+    expect(report.mode).toBe("anthropic");
+    expect(report.chatEndpoint).toBe("https://relay.test/v1/messages");
+    expect(report.checks.map(check => [check.id, check.status])).toEqual([
+      ["address", "pass"], ["keys", "pass"], ["models", "pass"], ["model", "pass"], ["chat", "fail"],
+    ]);
+    expect(report.checks.at(-1)?.detail).toContain("credit balance is too low");
+  });
+
+  it("fails the address check on an unusable URL without any network call", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+
+    const report = await new ApiSaverClient({ apiKey: "k", baseURL: "ftp://relay.test", apiMode: "anthropic" }).diagnose();
+
+    expect(report.checks).toEqual([{ id: "address", label: "接口地址", status: "fail", detail: "API 地址仅支持 http:// 或 https:// 协议" }]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
 });

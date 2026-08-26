@@ -1223,7 +1223,7 @@ main {
 .settings-toggle span::after { content: ''; display: block; width: 16px; height: 16px; margin: 3px; border-radius: 50%; background: #F8FAFC; transition: transform .2s; }
 .settings-toggle input:checked + span { background: #0891B2; }
 .settings-toggle input:checked + span::after { transform: translateX(18px); }
-.settings-segmented-control { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.settings-segmented-control { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 6px; }
 .settings-segmented-control button { min-height: 34px; border: 1px solid #334155; border-radius: 6px; background: #0F172A; color: #94A3B8; font-size: 12px; cursor: pointer; }
 .settings-segmented-control button.active { border-color: #22D3EE; background: rgba(8, 145, 178, .18); color: #CFFAFE; }
 .settings-network-card { display: grid; gap: 9px; padding: 11px; border: 1px solid #1E3A5F; border-radius: 7px; background: #0F172A; }
@@ -1373,6 +1373,51 @@ main {
 .settings-model-actions button { flex: 1; }
 .settings-grid-two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(150px, .65fr); gap: 14px; }
 .settings-range { width: 100%; accent-color: #22D3EE; }
+.settings-network-note.error { color: #FDA4AF; }
+
+.settings-profile-card { display: grid; gap: 12px; margin-bottom: 14px; padding: 16px; border: 1px solid #334155; border-radius: 10px; background: #0B1220; }
+.settings-profile-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.settings-profile-header > div { display: grid; gap: 3px; }
+.settings-profile-header strong { color: #E0F2FE; font-size: 13px; }
+.settings-profile-header small { color: #64748B; font-size: 10px; }
+.settings-profile-header .btn-secondary { flex-shrink: 0; padding: 8px 11px; font-size: 11px; }
+.settings-profile-presets { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 8px; }
+.settings-profile-presets button { display: grid; gap: 3px; padding: 10px; border: 1px dashed #334155; border-radius: 8px; background: #0F172A; text-align: left; cursor: pointer; }
+.settings-profile-presets button:hover { border-color: #22D3EE; background: rgba(8, 145, 178, .12); }
+.settings-profile-presets strong { color: #CBD5E1; font-size: 12px; font-weight: 600; }
+.settings-profile-presets small { color: #64748B; font-size: 10px; }
+.settings-profile-list { display: grid; gap: 8px; }
+.settings-profile-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid #334155; border-radius: 8px; background: #0F172A; cursor: pointer; }
+.settings-profile-item:hover { border-color: #475569; }
+.settings-profile-item.active { border-color: #22D3EE; background: rgba(8, 145, 178, .14); }
+.settings-profile-item-main { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.settings-profile-item-main strong { display: flex; align-items: center; gap: 7px; color: #F8FAFC; font-size: 13px; font-weight: 600; }
+.settings-profile-item-main strong em { padding: 1px 6px; border-radius: 999px; background: rgba(34, 211, 238, .18); color: #67E8F9; font-size: 10px; font-style: normal; font-weight: 500; }
+.settings-profile-item-main small { color: #94A3B8; font-size: 11px; }
+.settings-profile-item-main code { overflow: hidden; color: #64748B; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.settings-profile-item-actions { display: flex; flex-shrink: 0; gap: 6px; }
+.settings-profile-item-actions button { padding: 5px 8px; border: 1px solid #334155; border-radius: 5px; background: transparent; color: #94A3B8; font-size: 11px; cursor: pointer; }
+.settings-profile-item-actions button:hover:not(:disabled) { border-color: #22D3EE; color: #CFFAFE; }
+.settings-profile-item-actions button:disabled { opacity: .4; cursor: not-allowed; }
+
+.settings-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.settings-chip-row button { min-width: 52px; padding: 6px 9px; border: 1px solid #334155; border-radius: 5px; background: #0F172A; color: #94A3B8; font-size: 11px; cursor: pointer; }
+.settings-chip-row button:hover { border-color: #475569; color: #CBD5E1; }
+.settings-chip-row button.active { border-color: #22D3EE; background: rgba(8, 145, 178, .18); color: #CFFAFE; }
+
+.settings-diagnostics { display: grid; gap: 7px; margin-top: 10px; padding: 12px; border: 1px solid #334155; border-radius: 8px; background: #0F172A; }
+.settings-diagnostics-head { display: flex; align-items: baseline; gap: 8px; }
+.settings-diagnostics-head strong { color: #E0F2FE; font-size: 12px; }
+.settings-diagnostics-head small { min-width: 0; flex: 1; overflow: hidden; color: #64748B; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.settings-diagnostic-row { display: grid; grid-template-columns: 16px 72px minmax(0, 1fr); align-items: baseline; gap: 8px; }
+.settings-diagnostic-row > span { font-size: 12px; font-weight: 700; text-align: center; }
+.settings-diagnostic-row b { color: #CBD5E1; font-size: 11px; font-weight: 600; }
+.settings-diagnostic-row p { margin: 0; color: #94A3B8; font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.settings-diagnostic-row.pass > span { color: #4ADE80; }
+.settings-diagnostic-row.warn > span { color: #FCD34D; }
+.settings-diagnostic-row.fail > span { color: #FDA4AF; }
+.settings-diagnostic-row.fail p { color: #FDA4AF; }
+.settings-diagnostics-summary { margin: 2px 0 0; color: #4ADE80; font-size: 11px; }
 
 .settings-hint {
   color: #64748B;
@@ -3099,6 +3144,19 @@ select.input {
   .settings-sidebar button.active strong { color: var(--m-amber); }
   .settings-content { min-height: 0; overflow-y: auto; }
   .settings-service-card, .settings-network-card, .settings-sync-card, .usage-dashboard { gap: 14px; padding: 14px; border-color: var(--m-line); border-radius: 14px; background: var(--m-panel); }
+  .settings-profile-card { gap: 12px; padding: 14px; border-color: var(--m-line); border-radius: 14px; background: var(--m-panel); }
+  .settings-profile-header strong { color: var(--m-text); }
+  .settings-profile-header small, .settings-profile-presets small, .settings-profile-item-main code { color: var(--m-muted); }
+  .settings-profile-presets { grid-template-columns: 1fr; }
+  .settings-profile-presets button, .settings-profile-item, .settings-chip-row button, .settings-diagnostics { border-color: var(--m-line); background: #1b2832; }
+  .settings-profile-item.active, .settings-chip-row button.active { border-color: rgba(232, 163, 91, .6); background: var(--m-amber-soft); }
+  .settings-profile-item.active .settings-profile-item-main strong em, .settings-chip-row button.active { color: var(--m-amber); background: transparent; }
+  .settings-profile-item-main strong, .settings-profile-presets strong, .settings-diagnostics-head strong { color: var(--m-text); }
+  .settings-profile-item-main small, .settings-diagnostic-row b, .settings-diagnostic-row p { color: var(--m-muted); }
+  .settings-profile-item-actions button { border-color: var(--m-line); color: var(--m-muted); }
+  .settings-diagnostic-row { grid-template-columns: 16px minmax(0, 1fr); }
+  .settings-diagnostic-row b { grid-column: 2; }
+  .settings-diagnostic-row p { grid-column: 2; }
   .settings-service-header, .settings-network-header { gap: 10px; }
   .settings-service-title strong, .settings-network-header strong { color: var(--m-text); }
   .settings-service-title small, .settings-network-header small { color: var(--m-muted); }

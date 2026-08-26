@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
-import { ApiSaverClient, getRuntimeUsageSummary } from "./models/api-saver.js";
+import { ApiSaverClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/api-saver.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, LruCache, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
@@ -1418,6 +1418,22 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
       });
       return { id: req.id, result: await client.getGatewayUsageSnapshot() };
     }
+    if (req.method === "settings.diagnose") {
+      const { apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const client = new ApiSaverClient({
+        apiKey: String(apiKey || ""),
+        apiKeys: stringList(apiKeys, 12),
+        baseURL: String(baseURL || ""),
+        defaultModel: String(model || ""),
+        apiMode: normalizeWireMode(apiMode),
+        reasoningMode: String(reasoningMode || "auto"),
+        contextWindowKB: Number(contextWindow) || undefined,
+        ...networkProxyConfig(req.params),
+      });
+      // A failing configuration is the normal outcome here, so the report is a
+      // successful result rather than an RPC error.
+      return { id: req.id, result: await client.diagnose(String(model || "")) };
+    }
     if (req.method === "models.list") {
       const { apiKey, apiKeys, baseURL, apiMode, reasoningMode, contextWindow, proxyEnabled, proxyURL, proxyBypassLocal } = req.params ?? {};
       if (!apiKey) {
@@ -1427,7 +1443,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         apiKey: String(apiKey),
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         proxyEnabled: Boolean(proxyEnabled),
@@ -1446,7 +1462,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1467,7 +1483,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1522,7 +1538,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1583,7 +1599,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-5.5"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1764,7 +1780,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       if (!apiKey || !Array.isArray(books) || books.length === 0) return { id: req.id, error: { code: -32602, message: "缺少榜单样本或模型配置" } };
       const client = new ApiSaverClient({
         apiKey: String(apiKey), apiKeys: stringList(apiKeys, 12), baseURL: String(baseURL || "https://api.apisaver.com/v1"),
-        defaultModel: String(model || "gpt-4o-mini"), apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        defaultModel: String(model || "gpt-4o-mini"), apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"), contextWindowKB: Number(contextWindow) || undefined, ...networkProxyConfig(req.params),
       });
       const samples = books.slice(0, 60).map((item, index) => {
@@ -1785,7 +1801,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1832,7 +1848,7 @@ ${source}
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1878,7 +1894,7 @@ ${sampleText}
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1907,7 +1923,7 @@ ${compactText(detailedOutline, 14_000)}`;
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1941,7 +1957,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -1976,7 +1992,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-5.5"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -2044,7 +2060,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         apiKeys: stringList(apiKeys, 12),
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"),
-        apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+        apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
         contextWindowKB: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
@@ -2300,7 +2316,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           apiKeys: stringList(apiKeys, 12),
           baseURL: String(baseURL || "https://api.apisaver.com/v1"),
           model: String(model || "gpt-4o-mini"),
-          apiMode: String(apiMode || "openai") as "openai" | "responses" | "anthropic",
+          apiMode: normalizeWireMode(apiMode),
           reasoningMode: String(reasoningMode || "auto"),
           contextWindowKB: Number(contextWindow) || undefined,
           ...networkProxyConfig(req.params),

@@ -1,7 +1,7 @@
 import { StateGraph, Annotation } from "@langchain/langgraph";
 import type { BaseMessage } from "@langchain/core/messages";
 import { StoryStore } from "../storage/story-store.js";
-import { ApiSaverClient, type ApiUsage } from "../models/api-saver.js";
+import { ApiSaverClient, type ApiUsage, type ApiWireMode } from "../models/api-saver.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, type ContextReport } from "../context/context-optimizer.js";
@@ -248,7 +248,7 @@ interface ChapterGraphConfig {
   apiKeys?: string[];
   baseURL?: string;
   model?: string;
-  apiMode?: "openai" | "responses" | "anthropic";
+  apiMode?: ApiWireMode | "responses";
   reasoningMode?: string;
   contextWindowKB?: number;
   proxyEnabled?: boolean;

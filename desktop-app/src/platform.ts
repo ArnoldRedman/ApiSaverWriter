@@ -59,16 +59,54 @@ const memoryList = (value: unknown, limit = 40): string[] => {
   }).filter(Boolean).slice(0, limit);
 };
 const isQuotaExceeded = (value: string) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/iu.test(value);
-const baseURL = (value: unknown) => {
+const anthropicVersion = '2023-06-01';
+const wireMode = (value: unknown): 'openai' | 'anthropic' => stringValue(value).trim().toLowerCase() === 'anthropic' ? 'anthropic' : 'openai';
+/** OpenAI-compatible addresses resolve to their `/v1` root; Anthropic ones to
+ * the host that serves `/v1/messages`. */
+const baseURL = (value: unknown, mode: 'openai' | 'anthropic' = 'openai') => {
   const raw = stringValue(value).trim().replace(/\/+$/u, '');
+  const fallback = mode === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.apisaver.com/v1';
   try {
-    const parsed = new URL(raw || 'https://api.apisaver.com/v1');
+    const parsed = new URL(raw || fallback);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('协议不受支持');
+    if (!raw) return fallback;
+    if (mode === 'anthropic') return raw.replace(/\/v1(?:\/messages)?$/iu, '') || raw;
     return /\/v1$/iu.test(raw) ? raw : `${raw}/v1`;
   } catch {
     throw new Error('API 地址无效，请填写完整的 http:// 或 https:// 地址');
   }
 };
+const chatEndpoint = (base: string, mode: 'openai' | 'anthropic') => mode === 'anthropic' ? `${base}/v1/messages` : `${base}/chat/completions`;
+const modelsEndpoint = (base: string, mode: 'openai' | 'anthropic') => mode === 'anthropic' ? `${base}/v1/models` : `${base}/models`;
+const authHeaders = (key: string, mode: 'openai' | 'anthropic'): Record<string, string> => mode === 'anthropic'
+  ? { 'x-api-key': key, 'anthropic-version': anthropicVersion }
+  : { Authorization: `Bearer ${key}` };
+const anthropicThinkingBudget: Record<string, number> = { low: 2048, medium: 6144, high: 12288, max: 24576 };
+const openAIReasoningEffort: Record<string, string> = { minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', max: 'high' };
+/** Anthropic keeps the system prompt outside the turn list and requires the
+ * conversation to open with a user turn. */
+const toAnthropicMessages = (messages: ChatMessage[]) => {
+  const system = messages.filter(message => message.role === 'system' && message.content.trim()).map(message => message.content).join('\n\n');
+  const turns: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+  for (const message of messages) {
+    if (message.role === 'system' || !message.content.trim()) continue;
+    const role = message.role === 'assistant' ? 'assistant' : 'user';
+    const previous = turns[turns.length - 1];
+    if (previous?.role === role) previous.content = `${previous.content}\n\n${message.content}`;
+    else turns.push({ role, content: message.content });
+  }
+  if (!turns.length) turns.push({ role: 'user', content: system || '继续' });
+  if (turns[0].role === 'assistant') turns.unshift({ role: 'user', content: '请继续。' });
+  return { system, turns };
+};
+/** `thinking` and `tool_use` blocks share the array and must not reach a chapter. */
+const anthropicText = (value: unknown) => Array.isArray(value)
+  ? value
+    .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === 'object'))
+    .filter(block => block.type === 'text')
+    .map(block => typeof block.text === 'string' ? block.text : '')
+    .join('')
+  : '';
 
 const usageKey = 'writer-mobile-usage';
 const baiduTokenKey = 'writer-baidu-access-token';
@@ -793,52 +831,121 @@ const mobileResponseText = (value: unknown, depth = 0): string => {
     || mobileResponseText(item.message, depth + 1);
 };
 
+/** Reads an Anthropic Messages reply, streaming or not. Anthropic reports input
+ * tokens in `message_start` and output tokens in `message_delta`, so streamed
+ * usage has to accumulate across events. */
+async function mobileAnthropicResult(response: Response, endpoint: string, onChunk?: (chunk: string) => void): Promise<{ content: string; usage?: unknown }> {
+  if (!onChunk || !response.body) {
+    const data = await response.json() as Record<string, unknown>;
+    const content = anthropicText(data.content);
+    if (!content) {
+      const stopReason = stringValue(data.stop_reason);
+      throw new Error(stopReason === 'max_tokens'
+        ? 'Anthropic 接口输出被截断，请提高输出上限或降低思考强度'
+        : `Anthropic 接口返回内容为空（${endpoint}，stop_reason：${stopReason || '无'}）`);
+    }
+    recordUsage(data.usage);
+    return { content, usage: data.usage };
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  const usage: Record<string, number> = {};
+  let done = false;
+  while (!done) {
+    const next = await reader.read();
+    buffer += decoder.decode(next.value || new Uint8Array(), { stream: !next.done });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('event:')) continue;
+      const raw = trimmed.replace(/^data:\s*/u, '');
+      if (!raw || raw === '[DONE]') continue;
+      try {
+        const event = JSON.parse(raw) as Record<string, unknown>;
+        const delta = event.delta as Record<string, unknown> | undefined;
+        // `thinking_delta` events share this type and must stay out of the text.
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string' && delta.text) {
+          content += delta.text;
+          onChunk(delta.text);
+        }
+        const message = event.type === 'message_start' && event.message && typeof event.message === 'object'
+          ? (event.message as Record<string, unknown>).usage
+          : event.usage;
+        if (message && typeof message === 'object') {
+          for (const [field, value] of Object.entries(message as Record<string, unknown>)) {
+            if (typeof value === 'number') usage[field] = value;
+          }
+        }
+        if (event.type === 'message_stop') done = true;
+      } catch { /* Ignore keep-alives and malformed proxy fragments. */ }
+    }
+    if (next.done) break;
+  }
+  recordUsage(usage);
+  return { content, usage };
+}
+
 async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk?: (chunk: string) => void, jsonMode = false): Promise<{ content: string; usage?: unknown }> {
   const fetcher = await httpFetch();
-  // Keep mobile on the same verified OpenAI-compatible wire as desktop.
-  const apiMode = 'openai';
+  const apiMode = wireMode(params.apiMode);
   const model = stringValue(params.model, 'gpt-4o-mini');
   // ApiSaver's Gemini-compatible routes can reject OpenAI's response_format
   // option upstream. The prompt still asks for JSON, so parsing remains safe.
   const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
-  const base = baseURL(params.baseURL);
+  const base = baseURL(params.baseURL, apiMode);
   const configuredKeys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
   const knownModelKeys = configuredKeys.filter(key => mobileModelsByApiKey.get(`${base}\n${key}`)?.has(model));
   const allKeysKnown = configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(`${base}\n${key}`));
   if (!knownModelKeys.length && allKeysKnown) throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请重新拉取模型并选择该模型对应的 API Key。`);
   const keys = knownModelKeys.length ? knownModelKeys : configuredKeys;
   if (!keys.length) throw new Error('请先在设置中填写 API Key。');
-  let endpoint = `${base}/chat/completions`;
-  let body: Record<string, unknown>;
-  const maxTokens = jsonMode ? 1300 : 6000;
+  const endpoint = chatEndpoint(base, apiMode);
+  const reasoningMode = stringValue(params.reasoningMode, 'auto');
+  const thinkingBudget = apiMode === 'anthropic' ? anthropicThinkingBudget[reasoningMode] : undefined;
   const temperature = jsonMode ? 0.2 : 0.7;
+  // Anthropic rejects a thinking budget that is not strictly below max_tokens.
+  const maxTokens = Math.max(jsonMode ? 1300 : 6000, thinkingBudget ? thinkingBudget + 1024 : 0);
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: onChunk ? 'text/event-stream' : 'application/json' };
-  body = { model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk), ...(onChunk ? { stream_options: { include_usage: true } } : {}), ...(jsonMode && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}) };
-  headers.Authorization = `Bearer ${keys[0]}`;
+  const body: Record<string, unknown> = apiMode === 'anthropic'
+    ? (() => {
+      const { system, turns } = toAnthropicMessages(messages);
+      return {
+        model,
+        max_tokens: maxTokens,
+        messages: turns,
+        stream: Boolean(onChunk),
+        ...(system ? { system } : {}),
+        // Extended thinking pins temperature at 1, so it must be omitted.
+        ...(thinkingBudget ? { thinking: { type: 'enabled', budget_tokens: thinkingBudget } } : { temperature }),
+      };
+    })()
+    : {
+      model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk),
+      ...(onChunk ? { stream_options: { include_usage: true } } : {}),
+      ...(jsonMode && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}),
+      ...(openAIReasoningEffort[reasoningMode] ? { reasoning_effort: openAIReasoningEffort[reasoningMode] } : {}),
+    };
   let response: Response | null = null;
   let lastError = '';
   for (const key of keys) {
-    const requestHeaders = { ...headers };
-    requestHeaders.Authorization = `Bearer ${key}`;
-    let candidate = await fetcher(endpoint, { method: 'POST', headers: requestHeaders, body: JSON.stringify(body) });
+    const candidate = await fetcher(endpoint, { method: 'POST', headers: { ...headers, ...authHeaders(key, apiMode) }, body: JSON.stringify(body) });
     if (candidate.ok) {
       response = candidate;
       break;
     }
     const detail = (await candidate.text()).replace(/\s+/gu, ' ').slice(0, 220);
-    lastError = `模型接口返回 ${candidate.status}：${detail}`;
+    lastError = isQuotaExceeded(detail)
+      ? 'API 中转服务额度已用尽。章节正文已保存，本章记忆将在额度恢复后再更新。'
+      : `模型接口返回 ${candidate.status}（${apiMode === 'anthropic' ? 'Anthropic Messages' : 'OpenAI 兼容'} · ${endpoint}）：${detail}`;
     // A key may be out of quota or lack this model while another configured
     // key remains usable. Continue through the configured key pool.
   }
   if (!response) throw new Error(lastError || '所有 API Key 请求均失败。');
-  if (!response.ok) {
-    const detail = (await response.text()).replace(/\s+/gu, ' ').slice(0, 220);
-    if (isQuotaExceeded(detail)) {
-      throw new Error('API 中转服务额度已用尽。章节正文已保存，本章记忆将在额度恢复后再更新。');
-    }
-    throw new Error(`模型接口返回 ${response.status}：${detail}`);
-  }
-  if (!onChunk || !response.body || apiMode !== 'openai') {
+  if (apiMode === 'anthropic') return mobileAnthropicResult(response, endpoint, onChunk);
+  if (!onChunk || !response.body) {
     const data = await response.json() as Record<string, unknown>;
     const choices = Array.isArray(data.choices) ? data.choices as Array<Record<string, unknown>> : [];
     const message = choices[0]?.message as Record<string, unknown> | undefined;
@@ -1445,17 +1552,65 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   if (method === 'models.list') {
     const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
     if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+    const mode = wireMode(params.apiMode);
+    const base = baseURL(params.baseURL, mode);
+    const endpoint = modelsEndpoint(base, mode);
     const responses = await Promise.allSettled(keys.map(async key => {
-      const response = await fetcher(`${baseURL(params.baseURL)}/models`, { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' } });
-      if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）`);
+      const response = await fetcher(endpoint, { headers: { ...authHeaders(key, mode), Accept: 'application/json' } });
+      if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）：${(await response.text()).replace(/\s+/gu, ' ').slice(0, 160)}`);
       const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
       const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
-    modelsByApiKey.set(`${base}\n${key}`, new Set(models));
+      mobileModelsByApiKey.set(`${base}\n${key}`, new Set(models));
       return models;
     }));
     const models = Array.from(new Set(responses.flatMap(result => result.status === 'fulfilled' ? result.value : [])));
-    if (!models.length) throw new Error('所有 API Key 拉取模型失败');
+    if (!models.length) {
+      const reasons = responses.flatMap(result => result.status === 'rejected' ? [String(result.reason)] : []);
+      throw new Error(reasons.length ? `所有 API Key 拉取模型失败：${reasons.join('；')}` : `${endpoint} 没有返回可用模型`);
+    }
     return { models } as T;
+  }
+  if (method === 'settings.diagnose') {
+    const mode = wireMode(params.apiMode);
+    const checks: Array<{ id: string; label: string; status: 'pass' | 'warn' | 'fail'; detail: string }> = [];
+    let base = '';
+    try {
+      base = baseURL(params.baseURL, mode);
+    } catch (error) {
+      return { mode, modelsEndpoint: '', chatEndpoint: '', checks: [{ id: 'address', label: '接口地址', status: 'fail', detail: error instanceof Error ? error.message : String(error) }] } as T;
+    }
+    const chat = chatEndpoint(base, mode);
+    const models = modelsEndpoint(base, mode);
+    const modeName = mode === 'anthropic' ? 'Anthropic Messages' : 'OpenAI 兼容';
+    checks.push({ id: 'address', label: '接口地址', status: 'pass', detail: `${modeName} · ${chat}` });
+    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
+    checks.push(keys.length
+      ? { id: 'keys', label: 'API 密钥', status: 'pass', detail: `已配置 ${keys.length} 个 Key，认证方式 ${mode === 'anthropic' ? 'x-api-key' : 'Authorization: Bearer'}` }
+      : { id: 'keys', label: 'API 密钥', status: 'fail', detail: '没有配置任何 API Key' });
+    if (!keys.length) return { mode, modelsEndpoint: models, chatEndpoint: chat, checks } as T;
+    let available: string[] = [];
+    try {
+      const listed = await mobileAgentRpc<{ models?: string[] }>('models.list', params);
+      available = Array.isArray(listed.models) ? listed.models : [];
+      checks.push({ id: 'models', label: '模型列表', status: 'pass', detail: `共 ${available.length} 个模型` });
+    } catch (error) {
+      checks.push({ id: 'models', label: '模型列表', status: 'fail', detail: error instanceof Error ? error.message : String(error) });
+    }
+    const target = stringValue(params.model).trim();
+    if (target) {
+      checks.push(!available.length
+        ? { id: 'model', label: '当前模型', status: 'warn', detail: `无法核对 ${target}：模型列表不可用` }
+        : available.includes(target)
+          ? { id: 'model', label: '当前模型', status: 'pass', detail: `${target} 在接口返回的模型列表中` }
+          : { id: 'model', label: '当前模型', status: 'fail', detail: `接口没有提供 ${target}。可用模型示例：${available.slice(0, 6).join('、')}${available.length > 6 ? ' 等' : ''}` });
+    }
+    try {
+      await mobileChat(params, [{ role: 'user', content: '请只回复 OK' }]);
+      checks.push({ id: 'chat', label: '实际调用', status: 'pass', detail: `${chat} 返回正常` });
+    } catch (error) {
+      checks.push({ id: 'chat', label: '实际调用', status: 'fail', detail: error instanceof Error ? error.message : String(error) });
+    }
+    return { mode, modelsEndpoint: models, chatEndpoint: chat, checks } as T;
   }
   if (method === 'models.test') {
     await mobileChat(params, [{ role: 'user', content: '请只回复 OK' }]);

@@ -540,8 +540,8 @@ interface AgentMemoryResult {
 }
 
 type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'plan' | 'draft' | 'review' | 'done' | 'error';
-type ApiMode = 'openai' | 'responses' | 'anthropic';
-type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max' | 'custom';
+type ApiMode = 'openai' | 'anthropic';
+type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max';
 type AgentProgressStatus = 'pending' | 'active' | 'complete' | 'error';
 
 const skillCategoryLabels: Record<string, string> = {
@@ -560,6 +560,9 @@ interface AgentConfig {
   // Keep the relationship so calls never default to an unrelated first key.
   modelKeyMap: Record<string, string[]>;
   model: string;
+  // Models kept switchable in the editor. Per profile, because a Claude relay
+  // and an OpenAI relay never offer the same model IDs.
+  enabledModels: string[];
   contextWindow: number;
   reasoningMode: ReasoningMode;
   proxyEnabled: boolean;
@@ -640,18 +643,51 @@ const isAgentWorkflowStep = (value: string | undefined): value is AgentWorkflowS
 const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(stage);
 
 const defaultBaseURL = 'https://api.apisaver.com/v1';
-const normalizeBaseURL = (value: string) => {
+const defaultAnthropicBaseURL = 'https://api.anthropic.com';
+const apiModes: Array<{ value: ApiMode; label: string; hint: string; placeholder: string; endpoint: string }> = [
+  { value: 'openai', label: 'OpenAI 兼容', hint: '走 /v1/chat/completions，请求头 Authorization: Bearer', placeholder: 'https://api.example.com/v1', endpoint: '/v1/chat/completions' },
+  { value: 'anthropic', label: 'Anthropic Messages', hint: '走 /v1/messages，请求头 x-api-key + anthropic-version', placeholder: 'https://api.anthropic.com', endpoint: '/v1/messages' },
+];
+const apiModeLabel = (mode: ApiMode) => apiModes.find(item => item.value === mode)?.label ?? 'OpenAI 兼容';
+const defaultBaseURLFor = (mode: ApiMode) => mode === 'anthropic' ? defaultAnthropicBaseURL : defaultBaseURL;
+/** OpenAI-compatible relays are addressed by their `/v1` root, Anthropic ones by
+ * the host that serves `/v1/messages`. Returns '' for an unusable address so
+ * callers can report it instead of silently falling back. */
+const normalizeBaseURL = (value: string, mode: ApiMode = 'openai') => {
   const trimmed = value.trim().replace(/\/+$/, '');
-  if (!trimmed) return defaultBaseURL;
+  if (!trimmed) return defaultBaseURLFor(mode);
   try {
     const parsed = new URL(trimmed);
     if (!['http:', 'https:'].includes(parsed.protocol)) return '';
   } catch {
     return '';
   }
+  if (mode === 'anthropic') return trimmed.replace(/\/v1(?:\/messages)?$/i, '') || trimmed;
   return /\/v1$/i.test(trimmed) ? trimmed : `${trimmed}/v1`;
 };
-const isDefaultApiService = (value: string) => normalizeBaseURL(value) === defaultBaseURL;
+/** Resolved URL the request will actually hit, shown next to the address field. */
+const resolvedEndpoint = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) => {
+  const base = normalizeBaseURL(config.baseURL, config.apiMode);
+  if (!base) return '';
+  return config.apiMode === 'anthropic' ? `${base}/v1/messages` : `${base}/chat/completions`;
+};
+// The gateway dashboard reads New API endpoints that only the managed ApiSaver
+// relay serves, so both the protocol and the host have to match.
+const isDefaultApiService = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) =>
+  config.apiMode === 'openai' && normalizeBaseURL(config.baseURL, 'openai') === defaultBaseURL;
+
+const contextWindowPresets = [64, 128, 200, 256, 512, 1024, 2048];
+const maxContextWindowKB = 2048;
+const formatContextWindow = (value: number) => value >= 1024 ? `${(value / 1024).toFixed(value % 1024 ? 1 : 0)}M` : `${value}K`;
+const clampContextWindow = (value: unknown) => Math.min(maxContextWindowKB, Math.max(16, Number(value) || 128));
+const reasoningModes: Array<{ value: ReasoningMode; hint: string }> = [
+  { value: 'auto', hint: '不发送思考参数，由模型自行决定' },
+  { value: 'off', hint: '明确关闭思考' },
+  { value: 'low', hint: 'Anthropic 思考预算 2K tokens' },
+  { value: 'medium', hint: 'Anthropic 思考预算 6K tokens' },
+  { value: 'high', hint: 'Anthropic 思考预算 12K tokens' },
+  { value: 'max', hint: 'Anthropic 思考预算 24K tokens；OpenAI 兼容接口没有 max，会按 high 发送' },
+];
 const memoryQuotaCooldownMs = 5 * 60 * 1000;
 let memoryQuotaRetryAt = 0;
 const isQuotaExceededError = (value: unknown) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|额度(?:已)?用尽|余额不足/iu.test(String(value));
@@ -665,6 +701,7 @@ const deviceBackedStateKeys = new Set([
   'writer-dismantle-books',
   'writer-writing-styles',
 ]);
+const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
 const normalizeAgentConfig = (value: unknown): AgentConfig => {
   const parsed = value && typeof value === 'object' ? value as Partial<AgentConfig> & Record<string, unknown> : {};
   const apiKeys = Array.from(new Set([
@@ -678,22 +715,95 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
       : [];
     return mappedKeys.length ? [[model, Array.from(new Set(mappedKeys))]] : [];
   }));
+  const apiMode: ApiMode = parsed.apiMode === 'anthropic' ? 'anthropic' : 'openai';
+  const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0];
+  const enabledModels = Array.from(new Set([
+    ...(Array.isArray(parsed.enabledModels) ? parsed.enabledModels : []).filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map(item => item.trim()),
+    model,
+  ]));
+  // Legacy releases stored a byte count here. The KB ceiling is 2048, so any
+  // larger number can only be the old unit.
+  const storedWindow = Number((parsed as Record<string, unknown>).contextWindowKB ?? parsed.contextWindow) || 0;
+  const storedReasoning = (parsed as Record<string, unknown>).reasoningMode;
   return {
     serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : 'ApiSaver（省API）',
     enabled: parsed.enabled !== false,
-    apiMode: 'openai',
-    baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURL) || defaultBaseURL,
+    apiMode,
+    baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURLFor(apiMode), apiMode) || defaultBaseURLFor(apiMode),
     apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
     apiKeys,
     modelKeyMap,
-    model: typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0],
-    contextWindow: Number((parsed as Record<string, unknown>).contextWindowKB ?? (Number(parsed.contextWindow) > 1024 ? Number(parsed.contextWindow) / 1024 : parsed.contextWindow)) || 128,
-    reasoningMode: parsed.reasoningMode === 'off' || parsed.reasoningMode === 'low' || parsed.reasoningMode === 'medium' || parsed.reasoningMode === 'high' || parsed.reasoningMode === 'max' || parsed.reasoningMode === 'custom' ? parsed.reasoningMode : 'auto',
+    model,
+    enabledModels,
+    contextWindow: clampContextWindow(storedWindow > maxContextWindowKB * 2 ? storedWindow / 1024 : storedWindow),
+    // `custom` disappeared with the English effort scale; it behaved as medium.
+    reasoningMode: storedReasoning === 'custom' ? 'medium'
+      : reasoningModes.some(item => item.value === storedReasoning) ? storedReasoning as ReasoningMode : 'auto',
     proxyEnabled: parsed.proxyEnabled === true,
     proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
     proxyBypassLocal: parsed.proxyBypassLocal === true,
   };
 };
+
+interface AgentProfile extends AgentConfig {
+  id: string;
+}
+const profilesStorageKey = 'agent-profiles';
+const activeProfileStorageKey = 'agent-active-profile';
+const newProfileId = () => `profile-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const normalizeAgentProfile = (value: unknown): AgentProfile => {
+  const parsed = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+  return {
+    ...normalizeAgentConfig(parsed),
+    id: typeof parsed.id === 'string' && parsed.id.trim() ? parsed.id.trim() : newProfileId(),
+  };
+};
+/** Reads the profile list, promoting a pre-upgrade single `agent-config` into
+ * profile #1 so an existing install keeps its keys and models. */
+const loadAgentProfiles = (): { profiles: AgentProfile[]; activeId: string } => {
+  let profiles: AgentProfile[] = [];
+  try {
+    const saved = JSON.parse(localStorage.getItem(profilesStorageKey) || '[]') as unknown;
+    profiles = Array.isArray(saved) ? saved.map(normalizeAgentProfile) : [];
+  } catch {
+    profiles = [];
+  }
+  if (!profiles.length) {
+    try {
+      const legacy = localStorage.getItem('agent-config');
+      const legacyModels = JSON.parse(localStorage.getItem('agent-models') || '[]') as unknown;
+      profiles = [normalizeAgentProfile({
+        ...(legacy ? JSON.parse(legacy) as Record<string, unknown> : {}),
+        ...(Array.isArray(legacyModels) && legacyModels.length ? { enabledModels: legacyModels } : {}),
+      })];
+    } catch {
+      profiles = [normalizeAgentProfile({})];
+    }
+  }
+  const storedActive = localStorage.getItem(activeProfileStorageKey) || '';
+  return { profiles, activeId: profiles.some(profile => profile.id === storedActive) ? storedActive : profiles[0].id };
+};
+const profilePresets: Array<{ id: string; label: string; hint: string; config: Partial<AgentConfig> }> = [
+  { id: 'apisaver', label: 'ApiSaver（省API）', hint: 'OpenAI 兼容 · 官方中转站', config: { serviceName: 'ApiSaver（省API）', apiMode: 'openai', baseURL: defaultBaseURL, model: fallbackModels[0] } },
+  { id: 'anthropic', label: 'Anthropic 官方', hint: 'Messages · api.anthropic.com', config: { serviceName: 'Anthropic 官方', apiMode: 'anthropic', baseURL: defaultAnthropicBaseURL, model: 'claude-opus-5', enabledModels: ['claude-opus-5'] } },
+  { id: 'openai-relay', label: '自定义中转（OpenAI 兼容）', hint: '任意支持 /v1/chat/completions 的地址', config: { serviceName: '自定义中转站', apiMode: 'openai', baseURL: defaultBaseURL } },
+  { id: 'anthropic-relay', label: '自定义中转（Anthropic）', hint: '任意支持 /v1/messages 的地址', config: { serviceName: '自定义 Claude 中转', apiMode: 'anthropic', baseURL: defaultAnthropicBaseURL } },
+];
+
+/** Mirror of the runtime's `settings.diagnose` result. */
+interface DiagnosticCheck {
+  id: string;
+  label: string;
+  status: 'pass' | 'warn' | 'fail';
+  detail: string;
+}
+interface DiagnosticReport {
+  mode: ApiMode;
+  modelsEndpoint: string;
+  chatEndpoint: string;
+  checks: DiagnosticCheck[];
+}
+const diagnosticStatusIcon: Record<DiagnosticCheck['status'], string> = { pass: '✓', warn: '!', fail: '×' };
 const agentNetworkParams = (config: AgentConfig) => ({
   proxyEnabled: config.proxyEnabled,
   proxyURL: config.proxyURL.trim(),
@@ -708,7 +818,6 @@ const applyModelKeyRouting = <T extends AgentConfig>(config: T, model: string): 
   const keys = orderApiKeysForModel(config, model);
   return { ...config, model, apiKey: keys[0] || '', apiKeys: keys };
 };
-const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
 const outlineKinds: OutlineKind[] = ['总纲', '章纲', '世界观与作品设定'];
 const memoryDocumentKinds: MemoryDocumentKind[] = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'];
 
@@ -1494,14 +1603,19 @@ function App() {
       || project.outlines.find(outline => outline.kind === '章纲' && outline.title === `章纲｜${chapter.title}`);
   };
   const [cardGenerating, setCardGenerating] = useState(false);
+  // One state object so a first-run install cannot generate two different
+  // profile IDs for the list and for the active pointer.
+  const [profileState, setProfileState] = useState(loadAgentProfiles);
+  const agentProfiles = profileState.profiles;
+  const activeProfileId = profileState.activeId;
   const [agentConfig, setAgentConfig] = useState<AgentConfig>(() => {
-    const saved = localStorage.getItem('agent-config');
-    try {
-      return normalizeAgentConfig(saved ? JSON.parse(saved) : {});
-    } catch {
-      return normalizeAgentConfig({});
-    }
+    const active = profileState.profiles.find(profile => profile.id === profileState.activeId);
+    return normalizeAgentConfig(active ?? {});
   });
+  useEffect(() => {
+    localStorage.setItem(profilesStorageKey, JSON.stringify(agentProfiles));
+    localStorage.setItem(activeProfileStorageKey, activeProfileId);
+  }, [agentProfiles, activeProfileId]);
 
   useEffect(() => {
     if (activeTab !== 'rankings' || rankingPlatform !== 'fanqie' || Object.values(fanqieCategories).some(items => items.length)) return;
@@ -1612,7 +1726,7 @@ function App() {
     return () => window.clearInterval(timer);
   }, []);
   const refreshGatewayUsage = async () => {
-    if (!isDefaultApiService(settingsDraft.baseURL)) {
+    if (!isDefaultApiService(settingsDraft)) {
       setGatewayUsage(null);
       setGatewayUsageError('自定义接口不支持 ApiSaver 中转站用量查询。');
       return;
@@ -1641,9 +1755,6 @@ function App() {
       setGatewayUsageLoading(false);
     }
   };
-  useEffect(() => {
-    if (showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft.baseURL) && !gatewayUsageLoading) void refreshGatewayUsage();
-  }, [showSettingsModal, settingsSection, settingsDraft.baseURL]);
   const [chapterSaving, setChapterSaving] = useState(false);
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [showSearchPanel, setShowSearchPanel] = useState(false);
@@ -1672,6 +1783,12 @@ function App() {
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
   const goalNoticeChapterRef = useRef<number | null>(null);
   const [settingsDraft, setSettingsDraft] = useState(agentConfig);
+  // Must stay below the `settingsDraft` declaration: the dependency array is
+  // evaluated during render, so reading it earlier hits the temporal dead zone
+  // and throws before React can mount anything.
+  useEffect(() => {
+    if (showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft) && !gatewayUsageLoading) void refreshGatewayUsage();
+  }, [showSettingsModal, settingsSection, settingsDraft.baseURL]);
   const [availableModels, setAvailableModels] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem('agent-models');
@@ -1696,6 +1813,9 @@ function App() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsTesting, setModelsTesting] = useState(false);
   const [modelListMessage, setModelListMessage] = useState('');
+  const [settingsDiagnostics, setSettingsDiagnostics] = useState<DiagnosticReport | null>(null);
+  const [diagnosticsRunning, setDiagnosticsRunning] = useState(false);
+  const [showProfilePresets, setShowProfilePresets] = useState(false);
   const [settingsServiceExpanded, setSettingsServiceExpanded] = useState(true);
   
   // 表单数据
@@ -4564,10 +4684,12 @@ function App() {
         apiConfigured: Boolean(agentConfig.apiKey.trim() || agentConfig.apiKeys.some(key => key.trim())),
       };
       const clientState = Object.fromEntries([
-        'agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
+        'agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
         'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
       ].map(key => [key, localStorage.getItem(key)]));
       clientState['agent-config'] = JSON.stringify(agentConfig);
+      clientState['agent-profiles'] = JSON.stringify(agentProfiles);
+      clientState['agent-active-profile'] = activeProfileId;
       clientState['agent-models'] = JSON.stringify(availableModels);
       clientState['writer-skills'] = JSON.stringify(skills);
       clientState.projects = JSON.stringify(snapshot);
@@ -4694,7 +4816,7 @@ function App() {
           localStorage.setItem(key, value);
         });
       }
-      const lightweightState = ['agent-config', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage', 'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path'];
+      const lightweightState = ['agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage', 'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path'];
       lightweightState.forEach(key => {
         const value = restoredState[key];
         if (typeof value !== 'string') return;
@@ -4715,6 +4837,20 @@ function App() {
           setAvailableModels(restoredModels);
           setSettingsModels(restoredModels);
         }
+      }
+      // Backups written after the multi-profile upgrade carry the whole list and
+      // take precedence over the single-config keys restored above.
+      const restoredProfilesValue = parseState('agent-profiles');
+      if (Array.isArray(restoredProfilesValue) && restoredProfilesValue.length) {
+        const profiles = restoredProfilesValue.map(normalizeAgentProfile);
+        const restoredActiveId = restoredState['agent-active-profile'];
+        const activeId = typeof restoredActiveId === 'string' && profiles.some(profile => profile.id === restoredActiveId) ? restoredActiveId : profiles[0].id;
+        const active = profiles.find(profile => profile.id === activeId) ?? profiles[0];
+        setProfileState({ profiles, activeId });
+        setAgentConfig(active);
+        setSettingsDraft(active);
+        setSettingsModels(active.enabledModels);
+        setAvailableModels(active.enabledModels);
       }
       if (Array.isArray(restoredSkillsValue)) {
         const restoredSkills = restoredSkillsValue.filter((skill): skill is Skill => Boolean(skill && typeof skill === 'object' && typeof (skill as Skill).name === 'string'));
@@ -4744,10 +4880,14 @@ function App() {
       setNotice({ title: '需要 API Key', content: '请先填写 API Key，再拉取模型列表。' });
       return;
     }
+    const requestBaseURL = normalizeBaseURL(settingsDraft.baseURL, settingsDraft.apiMode);
+    if (!requestBaseURL) {
+      setModelListMessage('API 地址无效：请填写完整的 http:// 或 https:// 地址');
+      return;
+    }
     setModelsLoading(true);
     try {
       await invoke<string>('start_agent_runtime');
-      const requestBaseURL = normalizeBaseURL(settingsDraft.baseURL) || defaultBaseURL;
       const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await invoke<{ models?: string[] }>('call_agent_rpc', {
         method: 'models.list',
         params: { baseURL: requestBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
@@ -4761,14 +4901,19 @@ function App() {
         return map;
       }, {});
       const models = Object.keys(modelKeyMap);
-      if (models.length === 0) throw new Error('接口没有返回可用模型');
+      if (models.length === 0) {
+        // Every key answered but none advertised a model: report the upstream
+        // reason rather than a bare "没有可用模型".
+        const reasons = responses.flatMap(response => response.status === 'rejected' ? [String(response.reason)] : []);
+        throw new Error(reasons.length ? reasons.join('；') : `${requestBaseURL} 没有返回可用模型`);
+      }
       setFetchedModels(models);
       localStorage.setItem('agent-fetched-models', JSON.stringify(models));
       setSettingsDraft(current => applyModelKeyRouting({ ...current, modelKeyMap: { ...current.modelKeyMap, ...modelKeyMap } }, current.model));
       const failed = responses.length - successful.length;
       setModelListMessage(`已从 ${successful.length}/${keys.length} 个 Key 获取 ${models.length} 个模型${failed ? `，${failed} 个 Key 请求失败` : ''}${settingsDraft.proxyEnabled ? `，请求已通过代理 ${settingsDraft.proxyURL}` : ''}，勾选模型即可启用。`);
     } catch (error) {
-      setModelListMessage(`拉取模型失败：${String(error)}`);
+      setModelListMessage(`拉取模型失败（${apiModeLabel(settingsDraft.apiMode)} · ${requestBaseURL}）：${String(error)}`);
     } finally {
       setModelsLoading(false);
     }
@@ -4777,6 +4922,11 @@ function App() {
   const testSelectedModel = async () => {
     if (!settingsDraft.apiKey.trim()) {
       setModelListMessage('请先填写 API 密钥，再测试模型。');
+      return;
+    }
+    const requestBaseURL = normalizeBaseURL(settingsDraft.baseURL, settingsDraft.apiMode);
+    if (!requestBaseURL) {
+      setModelListMessage('API 地址无效：请填写完整的 http:// 或 https:// 地址');
       return;
     }
     setModelsTesting(true);
@@ -4790,18 +4940,61 @@ function App() {
         params: {
           apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
           apiKeys: orderedKeys,
-          baseURL: normalizeBaseURL(settingsDraft.baseURL || defaultBaseURL),
+          baseURL: requestBaseURL,
           model: selectedModel,
+          apiMode: settingsDraft.apiMode,
           reasoningMode: settingsDraft.reasoningMode,
           contextWindow: settingsDraft.contextWindow,
           ...agentNetworkParams(settingsDraft),
         },
       });
-      setModelListMessage(`模型 ${settingsDraft.model || fallbackModels[0]} 测试成功${settingsDraft.proxyEnabled ? `，已通过代理 ${settingsDraft.proxyURL}` : ''}。`);
+      setModelListMessage(`模型 ${selectedModel} 测试成功（${apiModeLabel(settingsDraft.apiMode)}）${settingsDraft.proxyEnabled ? `，已通过代理 ${settingsDraft.proxyURL}` : ''}。`);
     } catch (error) {
-      setModelListMessage(`模型测试失败：${String(error)}`);
+      setModelListMessage(`模型测试失败（${apiModeLabel(settingsDraft.apiMode)} · ${resolvedEndpoint(settingsDraft)}）：${String(error)}`);
     } finally {
       setModelsTesting(false);
+    }
+  };
+
+  /** Runs the full preflight in the runtime and shows one line per check, so a
+   * wrong address, key, format or model is named before writing starts. */
+  const runDiagnostics = async () => {
+    const mode = settingsDraft.apiMode;
+    const requestBaseURL = normalizeBaseURL(settingsDraft.baseURL, mode);
+    if (!requestBaseURL) {
+      setSettingsDiagnostics({
+        mode, modelsEndpoint: '', chatEndpoint: '',
+        checks: [{ id: 'address', label: '接口地址', status: 'fail', detail: 'API 地址无效：请填写完整的 http:// 或 https:// 地址' }],
+      });
+      return;
+    }
+    setDiagnosticsRunning(true);
+    setSettingsDiagnostics(null);
+    setModelListMessage('');
+    try {
+      const selectedModel = settingsDraft.model.trim();
+      const orderedKeys = orderApiKeysForModel(settingsDraft, selectedModel);
+      await invoke<string>('start_agent_runtime');
+      setSettingsDiagnostics(await invoke<DiagnosticReport>('call_agent_rpc', {
+        method: 'settings.diagnose',
+        params: {
+          apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
+          apiKeys: orderedKeys,
+          baseURL: requestBaseURL,
+          model: selectedModel,
+          apiMode: mode,
+          reasoningMode: settingsDraft.reasoningMode,
+          contextWindow: settingsDraft.contextWindow,
+          ...agentNetworkParams(settingsDraft),
+        },
+      }));
+    } catch (error) {
+      setSettingsDiagnostics({
+        mode, modelsEndpoint: '', chatEndpoint: '',
+        checks: [{ id: 'runtime', label: '本地运行时', status: 'fail', detail: String(error) }],
+      });
+    } finally {
+      setDiagnosticsRunning(false);
     }
   };
 
@@ -4880,8 +5073,69 @@ function App() {
     });
   };
 
+  /** Loads a profile into the editor and into every downstream call site. */
+  const applyProfileToEditor = (profile: AgentProfile) => {
+    setAgentConfig(profile);
+    setSettingsDraft(profile);
+    setSettingsModels(profile.enabledModels);
+    setAvailableModels(profile.enabledModels);
+    localStorage.setItem('agent-models', JSON.stringify(profile.enabledModels));
+    // Fetched models belong to the previous address and would mislead here.
+    setFetchedModels([]);
+    localStorage.removeItem('agent-fetched-models');
+    setSettingsDiagnostics(null);
+    setAgentError('');
+    setAgentStage('idle');
+  };
+
+  const switchProfile = (id: string) => {
+    if (id === activeProfileId) return;
+    const profile = agentProfiles.find(item => item.id === id);
+    if (!profile) return;
+    setProfileState(current => ({ ...current, activeId: id }));
+    applyProfileToEditor(profile);
+    setModelListMessage(`已切换到「${profile.serviceName}」·${apiModeLabel(profile.apiMode)}·${profile.model || '未选择模型'}。`);
+  };
+
+  const addProfile = (presetId: string) => {
+    const preset = profilePresets.find(item => item.id === presetId) ?? profilePresets[0];
+    const taken = agentProfiles.filter(profile => profile.serviceName.startsWith(String(preset.config.serviceName ?? ''))).length;
+    const profile = normalizeAgentProfile({
+      ...preset.config,
+      serviceName: taken ? `${preset.config.serviceName} ${taken + 1}` : preset.config.serviceName,
+      id: newProfileId(),
+    });
+    setProfileState(current => ({ profiles: [...current.profiles, profile], activeId: profile.id }));
+    applyProfileToEditor(profile);
+    setShowProfilePresets(false);
+    setSettingsServiceExpanded(true);
+    setModelListMessage(`已新增「${profile.serviceName}」，请填写接口地址与 API Key 后保存。`);
+  };
+
+  const duplicateProfile = (id: string) => {
+    const source = agentProfiles.find(item => item.id === id);
+    if (!source) return;
+    const profile: AgentProfile = { ...source, id: newProfileId(), serviceName: `${source.serviceName} 副本` };
+    setProfileState(current => ({ profiles: [...current.profiles, profile], activeId: profile.id }));
+    applyProfileToEditor(profile);
+    setModelListMessage(`已复制为「${profile.serviceName}」。`);
+  };
+
+  const removeProfile = (id: string) => {
+    if (agentProfiles.length <= 1) {
+      setModelListMessage('至少需要保留一个 API 配置。');
+      return;
+    }
+    const removed = agentProfiles.find(item => item.id === id);
+    const remaining = agentProfiles.filter(profile => profile.id !== id);
+    const nextActive = remaining.find(profile => profile.id === activeProfileId) ?? remaining[0];
+    setProfileState({ profiles: remaining, activeId: nextActive.id });
+    if (id === activeProfileId) applyProfileToEditor(nextActive);
+    setModelListMessage(`已删除「${removed?.serviceName ?? '配置'}」，当前使用「${nextActive.serviceName}」。`);
+  };
+
   const saveSettings = () => {
-    const normalizedBaseURL = normalizeBaseURL(settingsDraft.baseURL);
+    const normalizedBaseURL = normalizeBaseURL(settingsDraft.baseURL, settingsDraft.apiMode);
     if (!normalizedBaseURL) {
       setModelListMessage('API 地址无效：请填写完整的 http:// 或 https:// 地址');
       return;
@@ -4898,22 +5152,37 @@ function App() {
     const enabledModels = Array.from(new Set((settingsModels.length ? settingsModels : [settingsDraft.model || fallbackModels[0]]).map(model => model.trim()).filter(Boolean)));
     const selectedModel = enabledModels.includes(settingsDraft.model) ? settingsDraft.model : enabledModels[0];
     const apiKeys = Array.from(new Set([settingsDraft.apiKey, ...(settingsDraft.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    setAvailableModels(enabledModels);
-    localStorage.setItem('agent-models', JSON.stringify(enabledModels));
-    setAgentConfig(applyModelKeyRouting({
+    const saved = applyModelKeyRouting({
       ...settingsDraft,
       serviceName: settingsDraft.serviceName.trim() || 'ApiSaver（省API）',
-      apiMode: 'openai',
       baseURL: normalizedBaseURL,
       apiKey: apiKeys[0] || '',
       apiKeys,
       model: selectedModel,
-      contextWindow: Math.max(16, Number(settingsDraft.contextWindow) || 128),
-    }, selectedModel));
+      enabledModels,
+      contextWindow: clampContextWindow(settingsDraft.contextWindow),
+    }, selectedModel);
+    setAvailableModels(enabledModels);
+    localStorage.setItem('agent-models', JSON.stringify(enabledModels));
+    setAgentConfig(saved);
+    setSettingsDraft(saved);
+    setProfileState(current => ({
+      ...current,
+      profiles: current.profiles.map(profile => profile.id === current.activeId ? { ...saved, id: profile.id } : profile),
+    }));
     setAgentError('');
     setAgentStage('idle');
+    if (!apiKeys.length) {
+      // Saving an address without a key is allowed, but every later call would
+      // fail with an authentication error, so say so now.
+      setModelListMessage('已保存，但没有填写任何 API Key —— 现在调用模型一定会失败，请补齐后再写作。');
+      return;
+    }
     setShowSettingsModal(false);
-    setNotice({ title: '设置已保存', content: 'API 地址、模型和 Key 已保存到本机。' });
+    setNotice({
+      title: '设置已保存',
+      content: `${saved.serviceName}·${apiModeLabel(saved.apiMode)}·${resolvedEndpoint(saved)}，模型 ${selectedModel}，上下文 ${formatContextWindow(saved.contextWindow)} 字符，思考强度 ${saved.reasoningMode}。`,
+    });
   };
 
   const chooseOutlineType = (kind: OutlineKind) => {
@@ -6125,6 +6394,37 @@ function App() {
               </nav>
             <div className="modal-body settings-content">
               {settingsSection === 'model' && <>
+              <section className="settings-profile-card">
+                <div className="settings-profile-header">
+                  <div><strong>API 配置</strong><small>点击卡片即切换当前使用的服务，配置各自独立保存</small></div>
+                  <button className="btn-secondary" onClick={() => setShowProfilePresets(current => !current)}>{showProfilePresets ? '取消' : '+ 新增配置'}</button>
+                </div>
+                {showProfilePresets && <div className="settings-profile-presets">
+                  {profilePresets.map(preset => <button key={preset.id} type="button" onClick={() => addProfile(preset.id)}>
+                    <strong>{preset.label}</strong><small>{preset.hint}</small>
+                  </button>)}
+                </div>}
+                <div className="settings-profile-list">
+                  {agentProfiles.map(profile => <div
+                    key={profile.id}
+                    className={`settings-profile-item ${profile.id === activeProfileId ? 'active' : ''}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => switchProfile(profile.id)}
+                    onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); switchProfile(profile.id); } }}
+                  >
+                    <div className="settings-profile-item-main">
+                      <strong>{profile.serviceName}{profile.id === activeProfileId && <em>使用中</em>}</strong>
+                      <small>{apiModeLabel(profile.apiMode)} · {profile.model || '未选择模型'} · {(profile.apiKeys || []).filter(Boolean).length} 个 Key</small>
+                      <code>{resolvedEndpoint(profile) || profile.baseURL}</code>
+                    </div>
+                    <div className="settings-profile-item-actions">
+                      <button type="button" title="复制此配置" onClick={event => { event.stopPropagation(); duplicateProfile(profile.id); }}>复制</button>
+                      <button type="button" title="删除此配置" disabled={agentProfiles.length <= 1} onClick={event => { event.stopPropagation(); removeProfile(profile.id); }}>删除</button>
+                    </div>
+                  </div>)}
+                </div>
+              </section>
               <section className="settings-service-card">
                 <div className="settings-service-header">
                   <button className="settings-collapse-button" aria-label={settingsServiceExpanded ? '收起服务配置' : '展开服务配置'} onClick={() => setSettingsServiceExpanded(current => !current)}>{settingsServiceExpanded ? '⌄' : '›'}</button>
@@ -6143,15 +6443,31 @@ function App() {
                     <input className="input" value={settingsDraft.serviceName} onChange={(event) => setSettingsDraft({ ...settingsDraft, serviceName: event.target.value })} placeholder="服务名称" />
                   </div>
                   <div className="form-group">
-                    <label>API 模式</label>
+                    <label>API 格式</label>
                     <div className="settings-segmented-control">
-                      <span className="settings-fixed-mode">OpenAI 兼容接口（所有模型统一使用）</span>
+                      {apiModes.map(mode => <button
+                        key={mode.value}
+                        type="button"
+                        className={settingsDraft.apiMode === mode.value ? 'active' : ''}
+                        onClick={() => setSettingsDraft(current => ({
+                          ...current,
+                          apiMode: mode.value,
+                          // Re-anchor the address on the new protocol's root so
+                          // switching format never leaves a `/v1` mismatch.
+                          baseURL: normalizeBaseURL(current.baseURL, mode.value) || defaultBaseURLFor(mode.value),
+                        }))}
+                      >{mode.label}</button>)}
                     </div>
+                    <small className="settings-network-note">{apiModes.find(mode => mode.value === settingsDraft.apiMode)?.hint}</small>
                   </div>
                   <div className="form-group">
-                    <label>接口地址 <small>OpenAI 兼容</small></label>
-                    <input className="input" value={settingsDraft.baseURL} placeholder="https://api.example.com/v1" onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
-                    <small className="settings-network-note">支持 /v1/models 和 /v1/chat/completions；未填写 /v1 时保存设置会自动补全</small>
+                    <label>接口地址 <small>{apiModeLabel(settingsDraft.apiMode)}</small></label>
+                    <input className="input" value={settingsDraft.baseURL} placeholder={apiModes.find(mode => mode.value === settingsDraft.apiMode)?.placeholder} onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
+                    <small className={`settings-network-note ${normalizeBaseURL(settingsDraft.baseURL, settingsDraft.apiMode) ? '' : 'error'}`}>
+                      {normalizeBaseURL(settingsDraft.baseURL, settingsDraft.apiMode)
+                        ? `实际请求地址：${resolvedEndpoint(settingsDraft)}`
+                        : '地址无效：请填写完整的 http:// 或 https:// 地址'}
+                    </small>
                   </div>
                   <div className="form-group">
                     <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>
@@ -6177,12 +6493,49 @@ function App() {
                     <div className="settings-model-actions">
                       <button className="btn-secondary" onClick={pullModels} disabled={modelsLoading}>{modelsLoading ? '拉取中...' : '拉取模型'}</button>
                       <button className="btn-secondary" onClick={testSelectedModel} disabled={modelsTesting || !settingsDraft.model.trim()}>{modelsTesting ? '测试中...' : '测试模型'}</button>
+                      <button className="btn-secondary" onClick={() => void runDiagnostics()} disabled={diagnosticsRunning}>{diagnosticsRunning ? '检测中...' : '检测配置'}</button>
                     </div>
-                    {modelListMessage && <p className={`model-list-message ${modelListMessage.includes('失败') || modelListMessage.includes('错误') ? 'error' : ''}`}>{modelListMessage}</p>}
+                    {modelListMessage && <p className={`model-list-message ${modelListMessage.includes('失败') || modelListMessage.includes('错误') || modelListMessage.includes('无效') ? 'error' : ''}`}>{modelListMessage}</p>}
+                    {settingsDiagnostics && <div className="settings-diagnostics">
+                      <div className="settings-diagnostics-head">
+                        <strong>配置检测结果</strong>
+                        <small>{apiModeLabel(settingsDiagnostics.mode)}{settingsDiagnostics.chatEndpoint ? ` · ${settingsDiagnostics.chatEndpoint}` : ''}</small>
+                        <button type="button" className="link-button" onClick={() => setSettingsDiagnostics(null)}>关闭</button>
+                      </div>
+                      {settingsDiagnostics.checks.map(check => <div key={check.id} className={`settings-diagnostic-row ${check.status}`}>
+                        <span aria-hidden="true">{diagnosticStatusIcon[check.status]}</span>
+                        <b>{check.label}</b>
+                        <p>{check.detail}</p>
+                      </div>)}
+                      {settingsDiagnostics.checks.every(check => check.status === 'pass') && <p className="settings-diagnostics-summary">全部检查通过，可以开始写作。</p>}
+                    </div>}
                   </div>
                   <div className="settings-grid-two">
-                    <div className="form-group"><label>上下文窗口 <strong>{Number(settingsDraft.contextWindow).toLocaleString()} KB</strong></label><input className="settings-range" type="range" min="16" max="512" step="16" value={settingsDraft.contextWindow} onChange={(event) => setSettingsDraft({ ...settingsDraft, contextWindow: Number(event.target.value) })} /></div>
-                    <div className="form-group"><label>推理模式</label><select className="select" value={settingsDraft.reasoningMode} onChange={(event) => setSettingsDraft({ ...settingsDraft, reasoningMode: event.target.value as ReasoningMode })}><option value="auto">自动</option><option value="off">关闭</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="max">最大</option><option value="custom">自定义</option></select></div>
+                    <div className="form-group">
+                      <label>上下文窗口 <strong>{formatContextWindow(settingsDraft.contextWindow)}</strong> <small>字符预算，超出部分会在发送前截断</small></label>
+                      <div className="settings-chip-row">
+                        {contextWindowPresets.map(preset => <button
+                          key={preset}
+                          type="button"
+                          className={settingsDraft.contextWindow === preset ? 'active' : ''}
+                          onClick={() => setSettingsDraft({ ...settingsDraft, contextWindow: preset })}
+                        >{formatContextWindow(preset)}</button>)}
+                      </div>
+                      <input className="settings-range" type="range" min="16" max={maxContextWindowKB} step="16" value={settingsDraft.contextWindow} onChange={(event) => setSettingsDraft({ ...settingsDraft, contextWindow: clampContextWindow(event.target.value) })} />
+                    </div>
+                    <div className="form-group">
+                      <label>思考强度 <small>reasoning effort</small></label>
+                      <div className="settings-chip-row">
+                        {reasoningModes.map(mode => <button
+                          key={mode.value}
+                          type="button"
+                          className={settingsDraft.reasoningMode === mode.value ? 'active' : ''}
+                          title={mode.hint}
+                          onClick={() => setSettingsDraft({ ...settingsDraft, reasoningMode: mode.value })}
+                        >{mode.value}</button>)}
+                      </div>
+                      <small className="settings-network-note">{reasoningModes.find(mode => mode.value === settingsDraft.reasoningMode)?.hint}</small>
+                    </div>
                   </div>
                 </div>}
               </section>
@@ -6193,7 +6546,7 @@ function App() {
                 <label className="settings-network-check"><input type="checkbox" checked={settingsDraft.proxyBypassLocal} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyBypassLocal: event.target.checked })} /> 本地地址不走代理（推荐）</label>
                 <small className="settings-network-note">支持 HTTP/HTTPS 代理，例如 Clash、Surge、V2Ray 的本地 HTTP 端口。</small>
               </section>}
-              {settingsSection === 'usage' && isDefaultApiService(settingsDraft.baseURL) && <section className="usage-dashboard">
+              {settingsSection === 'usage' && isDefaultApiService(settingsDraft) && <section className="usage-dashboard">
                 <div className="usage-filter-bar"><div className="usage-range-checks">{[['all', '全部时间'], ['today', '今天'], ['1', '近 1 天'], ['7', '近 7 天'], ['14', '近 14 天'], ['30', '近 30 天']].map(([value, label]) => <button type="button" key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''} onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }}>{label}</button>)}</div><div className="usage-date-controls"><label>开始<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>重置</button></div></div>
                 <div className="gateway-usage-heading"><div><strong>ApiSaver 中转站用量</strong><small>余额、模型广场定价与日志均直接来自中转站；仅使用当前配置的 API Key 查询。</small></div><button className="btn-secondary" disabled={gatewayUsageLoading} onClick={() => void refreshGatewayUsage()}>{gatewayUsageLoading ? '刷新中...' : '刷新中转站数据'}</button></div>
                 {gatewayUsageError && <p className="model-list-message error">{gatewayUsageError}</p>}
@@ -6221,7 +6574,7 @@ function App() {
                 </>}
                 <details className="local-usage-details"><summary>本机应用统计（离线回退）</summary><div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间本机处理 Tokens' : '筛选时间本机处理 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div><div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div><div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div></details>
               </section>}
-              {settingsSection === 'usage' && !isDefaultApiService(settingsDraft.baseURL) && <section className="usage-dashboard"><p className="empty-hint">自定义接口可使用本机 Token 统计，但不提供 ApiSaver 中转站余额、价格和日志查询。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
+              {settingsSection === 'usage' && !isDefaultApiService(settingsDraft) && <section className="usage-dashboard"><p className="empty-hint">自定义接口可使用本机 Token 统计，但不提供 ApiSaver 中转站余额、价格和日志查询。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
               {settingsSection === 'sync' && <section className="settings-sync-card">
                 <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
                 <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
