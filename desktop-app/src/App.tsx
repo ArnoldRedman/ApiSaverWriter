@@ -640,6 +640,18 @@ const isAgentWorkflowStep = (value: string | undefined): value is AgentWorkflowS
 const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(stage);
 
 const defaultBaseURL = 'https://api.apisaver.com/v1';
+const normalizeBaseURL = (value: string) => {
+  const trimmed = value.trim().replace(/\/+$/, '');
+  if (!trimmed) return defaultBaseURL;
+  try {
+    const parsed = new URL(trimmed);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+  } catch {
+    return '';
+  }
+  return /\/v1$/i.test(trimmed) ? trimmed : `${trimmed}/v1`;
+};
+const isDefaultApiService = (value: string) => normalizeBaseURL(value) === defaultBaseURL;
 const memoryQuotaCooldownMs = 5 * 60 * 1000;
 let memoryQuotaRetryAt = 0;
 const isQuotaExceededError = (value: unknown) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|额度(?:已)?用尽|余额不足/iu.test(String(value));
@@ -669,12 +681,8 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
   return {
     serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : 'ApiSaver（省API）',
     enabled: parsed.enabled !== false,
-    // ApiSaverWriter is a managed OpenAI-compatible gateway. Model selection
-    // chooses its matching key; it must not also switch the wire protocol.
     apiMode: 'openai',
-    // ApiSaverWriter uses one managed gateway. Keep legacy/custom values from
-    // leaking into requests or making the settings UI appear configurable.
-    baseURL: defaultBaseURL,
+    baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURL) || defaultBaseURL,
     apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
     apiKeys,
     modelKeyMap,
@@ -1604,6 +1612,11 @@ function App() {
     return () => window.clearInterval(timer);
   }, []);
   const refreshGatewayUsage = async () => {
+    if (!isDefaultApiService(settingsDraft.baseURL)) {
+      setGatewayUsage(null);
+      setGatewayUsageError('自定义接口不支持 ApiSaver 中转站用量查询。');
+      return;
+    }
     const key = settingsDraft.apiKey.trim() || agentConfig.apiKey.trim();
     if (!key) {
       setGatewayUsageError('请先在 AI 模型配置中填写并保存 API Key。');
@@ -1629,8 +1642,8 @@ function App() {
     }
   };
   useEffect(() => {
-    if (showSettingsModal && settingsSection === 'usage' && !gatewayUsageLoading) void refreshGatewayUsage();
-  }, [showSettingsModal, settingsSection]);
+    if (showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft.baseURL) && !gatewayUsageLoading) void refreshGatewayUsage();
+  }, [showSettingsModal, settingsSection, settingsDraft.baseURL]);
   const [chapterSaving, setChapterSaving] = useState(false);
   const [autoSaveStatus, setAutoSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [showSearchPanel, setShowSearchPanel] = useState(false);
@@ -4734,9 +4747,10 @@ function App() {
     setModelsLoading(true);
     try {
       await invoke<string>('start_agent_runtime');
+      const requestBaseURL = normalizeBaseURL(settingsDraft.baseURL) || defaultBaseURL;
       const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await invoke<{ models?: string[] }>('call_agent_rpc', {
         method: 'models.list',
-        params: { baseURL: defaultBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
+        params: { baseURL: requestBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
       }) })));
       const successful = responses.filter((response): response is PromiseFulfilledResult<{ apiKey: string; result: { models?: string[] } }> => response.status === 'fulfilled');
       const modelKeyMap = successful.reduce<Record<string, string[]>>((map, response) => {
@@ -4776,8 +4790,7 @@ function App() {
         params: {
           apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
           apiKeys: orderedKeys,
-          baseURL: defaultBaseURL,
-          apiMode: settingsDraft.apiMode,
+          baseURL: normalizeBaseURL(settingsDraft.baseURL || defaultBaseURL),
           model: selectedModel,
           reasoningMode: settingsDraft.reasoningMode,
           contextWindow: settingsDraft.contextWindow,
@@ -4868,6 +4881,11 @@ function App() {
   };
 
   const saveSettings = () => {
+    const normalizedBaseURL = normalizeBaseURL(settingsDraft.baseURL);
+    if (!normalizedBaseURL) {
+      setModelListMessage('API 地址无效：请填写完整的 http:// 或 https:// 地址');
+      return;
+    }
     if (settingsDraft.proxyEnabled) {
       try {
         const proxyURL = new URL(settingsDraft.proxyURL.trim());
@@ -4886,7 +4904,7 @@ function App() {
       ...settingsDraft,
       serviceName: settingsDraft.serviceName.trim() || 'ApiSaver（省API）',
       apiMode: 'openai',
-      baseURL: defaultBaseURL,
+      baseURL: normalizedBaseURL,
       apiKey: apiKeys[0] || '',
       apiKeys,
       model: selectedModel,
@@ -6131,8 +6149,9 @@ function App() {
                     </div>
                   </div>
                   <div className="form-group">
-                    <label>接口地址 <small>固定官方服务</small></label>
-                    <input className="input settings-fixed-address" value={defaultBaseURL} readOnly aria-readonly="true" />
+                    <label>接口地址 <small>OpenAI 兼容</small></label>
+                    <input className="input" value={settingsDraft.baseURL} placeholder="https://api.example.com/v1" onChange={(event) => setSettingsDraft({ ...settingsDraft, baseURL: event.target.value })} />
+                    <small className="settings-network-note">支持 /v1/models 和 /v1/chat/completions；未填写 /v1 时保存设置会自动补全</small>
                   </div>
                   <div className="form-group">
                     <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>
@@ -6174,7 +6193,7 @@ function App() {
                 <label className="settings-network-check"><input type="checkbox" checked={settingsDraft.proxyBypassLocal} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyBypassLocal: event.target.checked })} /> 本地地址不走代理（推荐）</label>
                 <small className="settings-network-note">支持 HTTP/HTTPS 代理，例如 Clash、Surge、V2Ray 的本地 HTTP 端口。</small>
               </section>}
-              {settingsSection === 'usage' && <section className="usage-dashboard">
+              {settingsSection === 'usage' && isDefaultApiService(settingsDraft.baseURL) && <section className="usage-dashboard">
                 <div className="usage-filter-bar"><div className="usage-range-checks">{[['all', '全部时间'], ['today', '今天'], ['1', '近 1 天'], ['7', '近 7 天'], ['14', '近 14 天'], ['30', '近 30 天']].map(([value, label]) => <button type="button" key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''} onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }}>{label}</button>)}</div><div className="usage-date-controls"><label>开始<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>重置</button></div></div>
                 <div className="gateway-usage-heading"><div><strong>ApiSaver 中转站用量</strong><small>余额、模型广场定价与日志均直接来自中转站；仅使用当前配置的 API Key 查询。</small></div><button className="btn-secondary" disabled={gatewayUsageLoading} onClick={() => void refreshGatewayUsage()}>{gatewayUsageLoading ? '刷新中...' : '刷新中转站数据'}</button></div>
                 {gatewayUsageError && <p className="model-list-message error">{gatewayUsageError}</p>}
@@ -6202,6 +6221,7 @@ function App() {
                 </>}
                 <details className="local-usage-details"><summary>本机应用统计（离线回退）</summary><div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间本机处理 Tokens' : '筛选时间本机处理 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div><div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div><div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div></details>
               </section>}
+              {settingsSection === 'usage' && !isDefaultApiService(settingsDraft.baseURL) && <section className="usage-dashboard"><p className="empty-hint">自定义接口可使用本机 Token 统计，但不提供 ApiSaver 中转站余额、价格和日志查询。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
               {settingsSection === 'sync' && <section className="settings-sync-card">
                 <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
                 <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>

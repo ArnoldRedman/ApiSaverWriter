@@ -60,9 +60,14 @@ const memoryList = (value: unknown, limit = 40): string[] => {
 };
 const isQuotaExceeded = (value: string) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/iu.test(value);
 const baseURL = (value: unknown) => {
-  // Mobile clients use the managed ApiSaver gateway only. Ignore legacy
-  // custom values restored from older app versions.
-  return 'https://api.apisaver.com/v1';
+  const raw = stringValue(value).trim().replace(/\/+$/u, '');
+  try {
+    const parsed = new URL(raw || 'https://api.apisaver.com/v1');
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('协议不受支持');
+    return /\/v1$/iu.test(raw) ? raw : `${raw}/v1`;
+  } catch {
+    throw new Error('API 地址无效，请填写完整的 http:// 或 https:// 地址');
+  }
 };
 
 const usageKey = 'writer-mobile-usage';
@@ -796,13 +801,13 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   // ApiSaver's Gemini-compatible routes can reject OpenAI's response_format
   // option upstream. The prompt still asks for JSON, so parsing remains safe.
   const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
+  const base = baseURL(params.baseURL);
   const configuredKeys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-  const knownModelKeys = configuredKeys.filter(key => mobileModelsByApiKey.get(key)?.has(model));
-  const allKeysKnown = configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(key));
+  const knownModelKeys = configuredKeys.filter(key => mobileModelsByApiKey.get(`${base}\n${key}`)?.has(model));
+  const allKeysKnown = configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(`${base}\n${key}`));
   if (!knownModelKeys.length && allKeysKnown) throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请重新拉取模型并选择该模型对应的 API Key。`);
   const keys = knownModelKeys.length ? knownModelKeys : configuredKeys;
   if (!keys.length) throw new Error('请先在设置中填写 API Key。');
-  const base = baseURL(params.baseURL);
   let endpoint = `${base}/chat/completions`;
   let body: Record<string, unknown>;
   const maxTokens = jsonMode ? 1300 : 6000;
@@ -1445,7 +1450,7 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
       if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）`);
       const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
       const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
-      mobileModelsByApiKey.set(key, new Set(models));
+    modelsByApiKey.set(`${base}\n${key}`, new Set(models));
       return models;
     }));
     const models = Array.from(new Set(responses.flatMap(result => result.status === 'fulfilled' ? result.value : [])));

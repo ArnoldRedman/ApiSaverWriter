@@ -56,8 +56,8 @@ describe("API Saver model configuration", () => {
 
   it("rotates through configured supplier keys on retries", async () => {
     vi.useFakeTimers();
-    seedModelKeyRoutingCache("primary-key", ["gpt-test"]);
-    seedModelKeyRoutingCache("backup-key", ["gpt-test"]);
+    seedModelKeyRoutingCache("primary-key", ["gpt-test"], "https://example.test/v1");
+    seedModelKeyRoutingCache("backup-key", ["gpt-test"], "https://example.test/v1");
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response("bad gateway", { status: 502 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
@@ -82,10 +82,21 @@ describe("API Saver model configuration", () => {
 
     expect(models).toEqual(["gpt-a", "gpt-shared", "gpt-b"]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/models");
-    expect(fetchMock.mock.calls[1][0]).toBe("https://api.apisaver.com/v1/models");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://invalid.example/v1/models");
+    expect(fetchMock.mock.calls[1][0]).toBe("https://invalid.example/v1/models");
   });
 
+  it("uses a custom OpenAI-compatible base URL for models and chat", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "local-model" }] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ model: "local-model", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
+    const client = new ApiSaverClient({ apiKey: "local-key", baseURL: "http://127.0.0.1:8000", defaultModel: "local-model" });
+
+    await expect(client.listModels()).resolves.toEqual(["local-model"]);
+    await expect(client.chat([{ role: "user", content: "测试" }])).resolves.toMatchObject({ content: "OK" });
+    expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/v1/models");
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:8000/v1/chat/completions");
+  });
   it("uses the API key that advertised the selected model", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "claude-fable-5" }] }), { status: 200 }))
@@ -124,14 +135,14 @@ describe("API Saver model configuration", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/chat/completions");
   });
 
-  it("uses the managed gateway even when a legacy custom address is supplied", async () => {
+  it("uses the configured custom address for chat requests", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
 
     await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://legacy.example/v1", defaultModel: "gpt-test" })
       .chat([{ role: "user", content: "测试" }]))
       .resolves.toEqual({ content: "OK", model: "gpt-test" });
-    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/chat/completions");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://legacy.example/v1/chat/completions");
   });
 
   it("omits OpenAI-only JSON and reasoning options for Gemini-compatible models", async () => {

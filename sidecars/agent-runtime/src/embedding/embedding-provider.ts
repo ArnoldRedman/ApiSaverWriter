@@ -14,19 +14,27 @@ export interface EmbeddingProvider {
   getDimensions(): number;
 }
 
+function normalizeEmbeddingBaseURL(value: string): string {
+  const raw = value.trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(raw)) return "https://api.apisaver.com/v1";
+  return /\/v1$/i.test(raw) ? raw : `${raw}/v1`;
+}
+
 /**
- * API Saver Embedding Provider
- * 通过 API Saver 调用远程 embedding 模型
+ * OpenAI 兼容的 Embedding Provider
+ * 通过传入的 Base URL 调用远程 embedding 模型
  */
 export class ApiSaverEmbeddingProvider implements EmbeddingProvider {
   private dimensions: number;
+  private baseURL: string;
 
   constructor(
     private apiKey: string,
-    private baseURL: string = "https://api.apisaver.com/v1",
+    baseURL: string = "https://api.apisaver.com/v1",
     private model: string = "text-embedding-3-small",
     dimensions?: number
   ) {
+    this.baseURL = normalizeEmbeddingBaseURL(baseURL);
     // text-embedding-3-small 默认 1536 维
     // bge-small-zh-v1.5 默认 512 维
     this.dimensions = dimensions || 1536;

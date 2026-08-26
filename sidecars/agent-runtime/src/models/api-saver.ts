@@ -24,13 +24,25 @@ export interface ApiSaverModelConfig {
   maxTokens?: number;
 }
 
-function trimTrailingSlash(value: string): string {
-  return value.replace(/\/+$/, "");
+const DEFAULT_API_BASE_URL = "https://api.apisaver.com/v1";
+const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, "");
+
+function normalizeOpenAIBaseURL(value?: string): string {
+  const raw = trimTrailingSlash(value?.trim() || DEFAULT_API_BASE_URL);
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("API 地址无效，请填写完整的 http:// 或 https:// 地址");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("API 地址仅支持 http:// 或 https:// 协议");
+  }
+  return /\/v1$/i.test(raw) ? raw : `${raw}/v1`;
 }
 
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
-const API_SAVER_BASE_URL = "https://api.apisaver.com/v1";
 
 function supportsOpenAIJsonMode(model: string): boolean {
   // Gemini's OpenAI-compatible adapters commonly reject response_format at
@@ -61,10 +73,10 @@ function apiErrorMessage(status: number, detail: string, statusText: string, att
 }
 
 export function buildModelConfig(input: ApiSaverModelInput): ApiSaverModelConfig {
-  const raw = trimTrailingSlash(input.baseUrl?.trim() || "https://api.apisaver.com");
+  const anthropicBaseURL = trimTrailingSlash(input.baseUrl?.trim() || "https://api.apisaver.com");
   const baseUrl = input.provider === "openai"
-    ? raw.endsWith("/v1") ? raw : `${raw}/v1`
-    : raw.endsWith("/messages") ? raw : `${raw}/v1/messages`;
+    ? normalizeOpenAIBaseURL(input.baseUrl)
+    : anthropicBaseURL.endsWith("/messages") ? anthropicBaseURL : `${anthropicBaseURL}/v1/messages`;
   return {
     provider: input.provider,
     apiKey: input.apiKey,
@@ -234,8 +246,8 @@ export function resetModelKeyRoutingCache(): void {
   modelLookupInFlight.clear();
 }
 
-export function seedModelKeyRoutingCache(key: string, models: string[]): void {
-  modelsByApiKey.set(key, new Set(models));
+export function seedModelKeyRoutingCache(key: string, models: string[], baseURL = DEFAULT_API_BASE_URL): void {
+  modelsByApiKey.set(`${normalizeOpenAIBaseURL(baseURL)}/models\n${key}`, new Set(models));
 }
 
 const isPrivateOrLocalHost = (hostname: string) => {
@@ -310,11 +322,12 @@ export class ApiSaverClient {
   }
 
   private async modelsForKey(key: string): Promise<Set<string> | undefined> {
-    const cached = modelsByApiKey.get(key);
+    const endpoint = `${normalizeOpenAIBaseURL(this.config.baseURL)}/models`;
+    const cacheKey = `${endpoint}\n${key}`;
+    const cached = modelsByApiKey.get(cacheKey);
     if (cached) return cached;
-    const inflight = modelLookupInFlight.get(key);
+    const inflight = modelLookupInFlight.get(cacheKey);
     if (inflight) return inflight;
-    const endpoint = `${API_SAVER_BASE_URL}/models`;
     const lookup = (async () => {
       try {
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
@@ -327,17 +340,17 @@ export class ApiSaverClient {
         const models = new Set((payload.data ?? payload.models ?? [])
           .map(item => typeof item === "string" ? item : item.id)
           .filter((model): model is string => Boolean(model)));
-        modelsByApiKey.set(key, models);
+        modelsByApiKey.set(cacheKey, models);
         return models;
       } catch {
         // Do not turn a temporary models endpoint failure into a hard writing
         // failure. The real completion request still has its normal retries.
         return undefined;
       } finally {
-        modelLookupInFlight.delete(key);
+        modelLookupInFlight.delete(cacheKey);
       }
     })();
-    modelLookupInFlight.set(key, lookup);
+    modelLookupInFlight.set(cacheKey, lookup);
     return lookup;
   }
 
@@ -360,7 +373,7 @@ export class ApiSaverClient {
   }
 
   async listModels(): Promise<string[]> {
-    const endpoint = `${API_SAVER_BASE_URL}/models`;
+    const endpoint = `${normalizeOpenAIBaseURL(this.config.baseURL)}/models`;
     const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
     if (!keys.length) throw new Error("缺少 API Key");
     const results = await Promise.allSettled(keys.map(async key => {
@@ -447,11 +460,7 @@ export class ApiSaverClient {
     options: ChatOptions = {}
   ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
-    const baseURL = API_SAVER_BASE_URL;
-    // All managed ApiSaver models use the verified OpenAI-compatible wire.
-    // A stale settings value must not route a normal write request to a
-    // different endpoint with a different response schema.
-    const apiMode = "openai";
+    const baseURL = normalizeOpenAIBaseURL(this.config.baseURL);
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
     const apiKeys = await this.keysForModel(configuredKeys, model);
@@ -509,7 +518,7 @@ export class ApiSaverClient {
         if (retryable && attempt < maxAttempts) {
           // Some upstream OpenAI-compatible adapters turn unsupported optional
           // fields into a 503. Retry the same task once with only core fields.
-          if (response.status === 503 && apiMode === "openai" && attempt === 1) {
+          if (response.status === 503 && attempt === 1) {
             try {
               const compatibilityBody = JSON.parse(body) as Record<string, unknown>;
               delete compatibilityBody.response_format;
@@ -539,7 +548,7 @@ export class ApiSaverClient {
     // Never let a stale protocol selection silently degrade writing to a
     // non-streaming request.
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
-    const baseURL = API_SAVER_BASE_URL;
+    const baseURL = normalizeOpenAIBaseURL(this.config.baseURL);
     const endpoint = `${baseURL}/chat/completions`;
     const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
