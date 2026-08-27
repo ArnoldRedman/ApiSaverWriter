@@ -4,7 +4,7 @@
 
 > ApiSaverWriter 是一款面向长篇网文创作的 AI 写作软件、AI 写小说软件和本地优先写作工作台。
 
-[![Version](https://img.shields.io/badge/version-0.1.4-1677ff)](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
+[![Version](https://img.shields.io/badge/version-0.1.5-1677ff)](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-20a162)](#下载安装)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-8a2be2)](LICENSE)
 

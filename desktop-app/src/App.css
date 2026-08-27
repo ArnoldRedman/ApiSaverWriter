@@ -1243,6 +1243,15 @@ main {
 .settings-sync-path small { color: #64748B; font-size: 11px; font-weight: 400; }
 .settings-sync-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .settings-sync-actions button { min-height: 36px; }
+.settings-github-card { margin-top: 14px; border-color: #3F4551; }
+.settings-sync-badge.github { border-color: #6B7280; background: #171A20; color: #E5E7EB; }
+.settings-sync-message { margin-top: 10px; }
+.github-restore-modal { width: min(540px, calc(100vw - 32px)); }
+.github-restore-body { display: grid; gap: 12px; }
+.github-restore-body > p { margin: 0; color: #CBD5E1; line-height: 1.6; }
+.github-restore-body > div { display: grid; gap: 4px; padding: 12px; border: 1px solid #334155; border-radius: 7px; background: #0F172A; }
+.github-restore-body strong { color: #E0F2FE; font-size: 13px; }
+.github-restore-body small { color: #7E91AA; font-size: 11px; line-height: 1.5; }
 .settings-tutorial-card { display: grid; gap: 16px; padding: 18px; border: 1px solid #334155; border-radius: 10px; background: #0B1220; }
 .settings-tutorial-heading { display: grid; gap: 4px; }
 .settings-tutorial-heading strong { color: #F8FAFC; font-size: 15px; }

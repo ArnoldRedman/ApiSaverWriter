@@ -136,6 +136,20 @@ interface CloudBackupFile {
   source: 'bundle';
 }
 
+interface GitHubProjectResult {
+  repositoryUrl: string;
+  branch: string;
+  commit: string;
+  project: unknown;
+}
+
+interface GitHubRestoreConflict {
+  project: Project;
+  localProject: Project;
+  repositoryUrl: string;
+  commit: string;
+}
+
 interface KnowledgeGraphNode {
   id: string;
   label: string;
@@ -260,6 +274,7 @@ interface Project {
   styleProfileId?: string;
   sourceDismantleBookId?: string;
   authorPreferences?: string[];
+  githubRepositoryUrl?: string;
 }
 
 type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten';
@@ -1428,6 +1443,46 @@ const channelTagCatalog: Record<Channel, Record<TagTab, GenreTag[]>> = {
   女频: femaleTagCatalog,
 };
 
+const normalizeStoredProject = (value: unknown): Project => {
+  const project = value && typeof value === 'object' ? value as Partial<Project> : {};
+  const now = new Date().toISOString();
+  const chapters = Array.isArray(project.chapters) ? project.chapters.map((chapter, index) => ({
+    ...chapter,
+    id: Number(chapter.id) || Date.now() + index,
+    title: typeof chapter.title === 'string' ? chapter.title : '未命名章节',
+    content: typeof chapter.content === 'string' ? chapter.content : '',
+    wordCount: countNovelCharacters(typeof chapter.content === 'string' ? chapter.content : ''),
+    createdAt: typeof chapter.createdAt === 'string' ? chapter.createdAt : now,
+    updatedAt: typeof chapter.updatedAt === 'string' ? chapter.updatedAt : now,
+  })) : [];
+  const memories = Array.isArray(project.memories) ? project.memories.map(memory => normalizeChapterMemory(memory)) : [];
+  return {
+    ...project,
+    id: Number(project.id) || Date.now(),
+    title: typeof project.title === 'string' && project.title.trim() ? project.title.trim() : '未命名小说',
+    genre: typeof project.genre === 'string' ? project.genre : '玄幻',
+    subgenre: typeof project.subgenre === 'string' ? project.subgenre : project.genre || '东方玄幻',
+    tags: project.tags && typeof project.tags === 'object' ? project.tags : {},
+    protagonist1: typeof project.protagonist1 === 'string' ? project.protagonist1 : '',
+    protagonist2: typeof project.protagonist2 === 'string' ? project.protagonist2 : '',
+    synopsis: typeof project.synopsis === 'string' ? project.synopsis : '',
+    status: project.status === 'completed' ? 'completed' : 'writing',
+    chapters,
+    outline: Array.isArray(project.outline) ? project.outline : [],
+    outlines: Array.isArray(project.outlines) ? project.outlines : [],
+    cards: Array.isArray(project.cards) ? project.cards : [],
+    memories,
+    memoryDocuments: hydrateMemoryDocuments(project.memoryDocuments, memories),
+    graphNodes: Array.isArray(project.graphNodes) ? project.graphNodes : [],
+    graphEdges: normalizeKnowledgeGraphEdges(project.graphEdges),
+    createdAt: typeof project.createdAt === 'string' ? project.createdAt : now,
+    updatedAt: typeof project.updatedAt === 'string' ? project.updatedAt : now,
+    wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
+    chapterTargetWords: Number(project.chapterTargetWords) > 0 ? Number(project.chapterTargetWords) : 3000,
+    githubRepositoryUrl: typeof project.githubRepositoryUrl === 'string' ? project.githubRepositoryUrl : undefined,
+  };
+};
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabType>('projects');
   const [projects, setProjects] = useState<Project[]>(() => {
@@ -1673,6 +1728,9 @@ function App() {
   const [showCloudBackupPicker, setShowCloudBackupPicker] = useState(false);
   const [baiduAuthURL, setBaiduAuthURL] = useState('');
   const [baiduAuthCode, setBaiduAuthCode] = useState('');
+  const [githubProjectId, setGithubProjectId] = useState<number | null>(null);
+  const [githubRepositoryUrl, setGithubRepositoryUrl] = useState('');
+  const [githubRestoreConflict, setGithubRestoreConflict] = useState<GitHubRestoreConflict | null>(null);
   const [usageDateFilter, setUsageDateFilter] = useState('all');
   const [usageStartDate, setUsageStartDate] = useState('');
   const [usageEndDate, setUsageEndDate] = useState('');
@@ -4552,6 +4610,11 @@ function App() {
     setCustomApiKey('');
     setModelListMessage('');
     setSettingsServiceExpanded(true);
+    const selectedProject = editingProject || projects.find(project => project.id === githubProjectId) || projects[0];
+    if (selectedProject) {
+      setGithubProjectId(selectedProject.id);
+      setGithubRepositoryUrl(selectedProject.githubRepositoryUrl || '');
+    }
     setShowSettingsModal(true);
     setSettingsSection('model');
   };
@@ -4609,6 +4672,117 @@ function App() {
       setBaiduAuthCode('');
       setBaiduAuthURL('');
       setCloudSyncMessage('百度网盘登录成功，可以开始备份与恢复。');
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const selectGithubProject = (projectId: number) => {
+    const project = projects.find(item => item.id === projectId);
+    setGithubProjectId(project?.id ?? null);
+    setGithubRepositoryUrl(project?.githubRepositoryUrl || '');
+  };
+
+  const backupProjectToGithub = async () => {
+    const repositoryUrl = githubRepositoryUrl.trim();
+    const selected = projects.find(project => project.id === githubProjectId);
+    if (!selected) { setCloudSyncMessage('请先选择要备份的小说。'); return; }
+    if (!repositoryUrl) { setCloudSyncMessage('请先指定 GitHub 仓库链接。'); return; }
+    if (isMobileRuntime()) { setCloudSyncMessage('GitHub Git 同步目前仅支持安装了 Git 的桌面端。'); return; }
+    setCloudSyncRunning(true);
+    setCloudSyncMessage(`正在保存《${selected.title}》并准备 Git 提交...`);
+    try {
+      const snapshot = editingProject?.id === selected.id ? editingProject : selected;
+      const currentProjects = projects.map(project => project.id === snapshot.id ? snapshot : project);
+      await invoke<string>('save_projects', { projects: currentProjects });
+      const result = await invoke<{ repositoryUrl: string; branch: string; commit: string; changed: boolean }>('backup_project_to_github', {
+        repositoryUrl,
+        project: snapshot,
+      });
+      const linkedProject = { ...snapshot, githubRepositoryUrl: result.repositoryUrl };
+      const linkedProjects = currentProjects.map(project => project.id === linkedProject.id ? linkedProject : project);
+      await invoke<string>('save_projects', { projects: linkedProjects });
+      setProjects(linkedProjects);
+      if (editingProject?.id === linkedProject.id) setEditingProject(linkedProject);
+      setGithubRepositoryUrl(result.repositoryUrl);
+      setCloudSyncMessage(result.changed
+        ? `GitHub 备份完成：${result.branch}@${result.commit}`
+        : `GitHub 已是最新版本：${result.branch}@${result.commit}`);
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const restoreProjectFromGithub = async () => {
+    const repositoryUrl = githubRepositoryUrl.trim();
+    if (!repositoryUrl) { setCloudSyncMessage('请先指定要恢复的 GitHub 仓库链接。'); return; }
+    if (isMobileRuntime()) { setCloudSyncMessage('GitHub Git 同步目前仅支持安装了 Git 的桌面端。'); return; }
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在从 GitHub 拉取并校验小说仓库...');
+    try {
+      const result = await invoke<GitHubProjectResult>('load_project_from_github', { repositoryUrl });
+      const restored = normalizeStoredProject(result.project);
+      restored.githubRepositoryUrl = result.repositoryUrl;
+      const localProject = projects.find(project => project.id === restored.id)
+        || projects.find(project => project.title.trim() === restored.title.trim());
+      if (localProject) {
+        setGithubRestoreConflict({ project: restored, localProject, repositoryUrl: result.repositoryUrl, commit: result.commit });
+        setCloudSyncMessage(`GitHub 中的《${restored.title}》与本地小说重复，请选择恢复方式。`);
+        return;
+      }
+      const nextProjects = [...projects, restored];
+      await invoke<string>('save_projects', { projects: nextProjects });
+      setProjects(nextProjects);
+      setGithubProjectId(restored.id);
+      setGithubRepositoryUrl(result.repositoryUrl);
+      setCloudSyncMessage(`已从 GitHub 新增《${restored.title}》（${result.branch}@${result.commit}）。`);
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const completeGithubRestore = async (mode: 'update' | 'copy') => {
+    const conflict = githubRestoreConflict;
+    if (!conflict) return;
+    setCloudSyncRunning(true);
+    try {
+      let restored: Project;
+      let nextProjects: Project[];
+      if (mode === 'update') {
+        restored = {
+          ...conflict.project,
+          id: conflict.localProject.id,
+          createdAt: conflict.localProject.createdAt,
+          githubRepositoryUrl: conflict.repositoryUrl,
+        };
+        nextProjects = projects.map(project => project.id === conflict.localProject.id ? restored : project);
+      } else {
+        const nextId = Math.max(Date.now(), ...projects.map(project => project.id + 1));
+        const baseTitle = `${conflict.project.title}（GitHub 恢复）`;
+        let title = baseTitle;
+        let suffix = 2;
+        while (projects.some(project => project.title === title)) title = `${baseTitle} ${suffix++}`;
+        restored = { ...conflict.project, id: nextId, title, githubRepositoryUrl: undefined, createdAt: new Date().toISOString() };
+        nextProjects = [...projects, restored];
+      }
+      await invoke<string>('save_projects', { projects: nextProjects });
+      setProjects(nextProjects);
+      if (mode === 'update' && editingProject?.id === conflict.localProject.id) {
+        setEditingProject(restored);
+        setActiveChapter(restored.chapters[0] || null);
+      }
+      setGithubProjectId(restored.id);
+      setGithubRepositoryUrl(restored.githubRepositoryUrl || '');
+      setGithubRestoreConflict(null);
+      setCloudSyncMessage(mode === 'update'
+        ? `已用 GitHub ${conflict.commit} 更新本地《${restored.title}》。`
+        : `已从 GitHub 新建本地副本《${restored.title}》。`);
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -6349,7 +6523,7 @@ function App() {
                 <button className={settingsSection === 'model' ? 'active' : ''} onClick={() => setSettingsSection('model')}><strong>AI 模型配置</strong><small>服务、接口、密钥与模型参数</small></button>
                 <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
                 <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>余额、模型价格与个人日志</small></button>
-                <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘云端备份与恢复</small></button>
+                <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘与 GitHub 仓库</small></button>
                 <button className={settingsSection === 'tutorial' ? 'active' : ''} onClick={() => setSettingsSection('tutorial')}><strong>使用教程</strong><small>快速了解核心工作流</small></button>
               </nav>
             <div className="modal-body settings-content">
@@ -6535,14 +6709,23 @@ function App() {
                 <details className="local-usage-details"><summary>本机应用统计（离线回退）</summary><div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间本机处理 Tokens' : '筛选时间本机处理 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div><div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div><div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div></details>
               </section>}
               {settingsSection === 'usage' && !isDefaultApiService(settingsDraft) && <section className="usage-dashboard"><p className="empty-hint">自定义接口可使用本机 Token 统计，但不提供 ApiSaver 中转站余额、价格和日志查询。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
-              {settingsSection === 'sync' && <section className="settings-sync-card">
-                <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
-                <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
-                <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void loadCloudBackups()}>选择备份恢复</button></div>
-                {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>{isDirectBaiduRuntime() ? '复制以下链接到浏览器完成授权，再粘贴浏览器地址栏中的完整授权结果或 access_token。' : '复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。'}</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder={isDirectBaiduRuntime() ? '粘贴完整授权结果或 access_token' : '粘贴 32 位授权码'} autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
-                {cloudSyncMessage && <p className={`model-list-message ${/失败|错误|未找到|未登录/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
-                <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
-              </section>}
+              {settingsSection === 'sync' && <>
+                <section className="settings-sync-card">
+                  <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
+                  <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
+                  <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void loadCloudBackups()}>选择备份恢复</button></div>
+                  {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>{isDirectBaiduRuntime() ? '复制以下链接到浏览器完成授权，再粘贴浏览器地址栏中的完整授权结果或 access_token。' : '复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。'}</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder={isDirectBaiduRuntime() ? '粘贴完整授权结果或 access_token' : '粘贴 32 位授权码'} autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
+                  <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
+                </section>
+                <section className="settings-sync-card settings-github-card">
+                  <div className="settings-network-header"><div><strong>GitHub 小说备份与恢复</strong><small>一个仓库对应一本小说，提交章节、大纲、卡片、记忆和知识图谱</small></div><span className="settings-sync-badge github">Git</span></div>
+                  <label className="form-group settings-sync-path"><span>本地小说</span><select className="input" value={githubProjectId ?? ''} onChange={event => selectGithubProject(Number(event.target.value))}><option value="">{projects.length ? '选择一本小说' : '本地还没有小说'}</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label>
+                  <label className="form-group settings-sync-path"><span>GitHub 仓库链接</span><input className="input" value={githubRepositoryUrl} onChange={event => setGithubRepositoryUrl(event.target.value)} placeholder="https://github.com/owner/novel.git" spellCheck={false} /><small>支持 HTTPS 或 SSH；使用本机 Git 登录状态，不在应用中保存 Token。</small></label>
+                  <div className="settings-sync-actions"><button className="btn-primary" disabled={cloudSyncRunning || !githubProjectId || isMobileRuntime()} onClick={() => void backupProjectToGithub()}>备份到 GitHub</button><button className="btn-secondary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void restoreProjectFromGithub()}>从 GitHub 恢复</button></div>
+                  <p className="settings-network-note">目标仓库必须为空，或已经是 ApiSaverWriter 规范小说仓库；不会提交 API Key 和应用账号配置。桌面端需安装 Git 并提前完成 GitHub 登录。</p>
+                </section>
+                {cloudSyncMessage && <p className={`model-list-message settings-sync-message ${/失败|错误|未找到|未登录|拒绝|无效|不是规范/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
+              </>}
               {settingsSection === 'tutorial' && <section className="settings-tutorial-card">
                 <div className="settings-tutorial-heading"><strong>使用教程</strong><small>飞书文档会持续更新最新功能说明与操作步骤。</small></div>
                 <div className="settings-tutorial-link"><div><span>ApiSaverWriter 使用教程</span><strong>飞书文档</strong><small>点击后在浏览器打开完整教程。</small></div><button className="btn-primary" onClick={() => void openTutorial()}>打开教程</button></div>
@@ -6592,6 +6775,16 @@ function App() {
               <button className="btn-primary" disabled={!selectedCloudBackup || cloudSyncRunning} onClick={() => selectedCloudBackup && void restoreFromCloud(selectedCloudBackup)}>恢复所选备份</button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {githubRestoreConflict && (
+        <div className="modal-overlay" onClick={() => setGithubRestoreConflict(null)}>
+          <div className="modal github-restore-modal" role="dialog" aria-modal="true" aria-labelledby="github-restore-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header"><h3 id="github-restore-title">本地已存在这本小说</h3><button className="modal-close" aria-label="关闭" onClick={() => setGithubRestoreConflict(null)}>×</button></div>
+            <div className="modal-body github-restore-body"><p>GitHub 仓库中的《{githubRestoreConflict.project.title}》与本地《{githubRestoreConflict.localProject.title}》匹配。</p><div><strong>更新本地小说</strong><small>以 GitHub 版本替换本地小说内容，并保留本地小说 ID。</small></div><div><strong>新建一本小说</strong><small>保留当前本地小说，创建一个不绑定原仓库的恢复副本。</small></div></div>
+            <div className="modal-footer"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void completeGithubRestore('copy')}>新建一本小说</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void completeGithubRestore('update')}>更新本地小说</button></div>
           </div>
         </div>
       )}

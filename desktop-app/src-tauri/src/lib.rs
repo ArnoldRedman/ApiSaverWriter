@@ -503,6 +503,249 @@ fn replace_cloud_data(app_data: &Path, export_root: &Path) -> Result<(), String>
     Ok(())
 }
 
+const GITHUB_PROJECT_MARKER: &str = ".apisaverwriter-project.json";
+const GITHUB_PROJECT_DATA: &str = "project.json";
+const GITHUB_MANAGED_PATHS: [&str; 8] = [
+    GITHUB_PROJECT_MARKER,
+    GITHUB_PROJECT_DATA,
+    "metadata.json",
+    "章节",
+    "大纲",
+    "卡片",
+    "记忆",
+    "图谱",
+];
+
+fn validate_github_repository_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err("请先填写 GitHub 仓库链接".to_string());
+    }
+    if trimmed.contains('?') || trimmed.contains('#') || trimmed.contains(char::is_whitespace) {
+        return Err("GitHub 仓库链接格式无效".to_string());
+    }
+    let path = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("git@github.com:"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .ok_or_else(|| "仅支持 GitHub HTTPS 或 SSH 仓库链接".to_string())?;
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts = path.split('/').collect::<Vec<_>>();
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains("..")
+            && part.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.'))
+    };
+    if parts.len() != 2 || !parts.iter().all(|part| valid_part(part)) {
+        return Err("GitHub 仓库链接必须是 owner/repository 格式".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+fn run_git(args: &[&str], working_directory: Option<&Path>) -> Result<String, String> {
+    let mut command = Command::new("git");
+    if let Some(directory) = working_directory {
+        command.current_dir(directory);
+    }
+    let output = command
+        .env("GIT_LFS_SKIP_SMUDGE", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(args)
+        .output()
+        .map_err(|error| format!("无法启动 Git，请先安装 Git 并完成 GitHub 登录: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        let detail = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { format!("退出码 {}", output.status) };
+        return Err(format!("Git 操作失败（git {}）：{detail}", args.first().copied().unwrap_or_default()));
+    }
+    Ok(if !stdout.is_empty() { stdout } else { stderr })
+}
+
+fn clone_github_repository(app_data: &Path, repository_url: &str, cache_name: &str) -> Result<PathBuf, String> {
+    run_git(&["--version"], None)?;
+    let root = app_data.join(cache_name);
+    if root.exists() {
+        fs::remove_dir_all(&root).map_err(|error| format!("清理 Git 临时目录失败: {error}"))?;
+    }
+    fs::create_dir_all(&root).map_err(|error| format!("创建 Git 临时目录失败: {error}"))?;
+    let checkout = root.join("repository");
+    let checkout_text = checkout.to_string_lossy().into_owned();
+    run_git(&["clone", "--depth", "1", repository_url, &checkout_text], None)?;
+    Ok(checkout)
+}
+
+fn read_github_project(checkout: &Path) -> Result<Value, String> {
+    let marker_path = checkout.join(GITHUB_PROJECT_MARKER);
+    let project_path = checkout.join(GITHUB_PROJECT_DATA);
+    let regular_file = |path: &Path| fs::symlink_metadata(path)
+        .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if !regular_file(&marker_path) || !regular_file(&project_path) {
+        return Err("该仓库不是规范的 ApiSaverWriter 小说备份仓库".to_string());
+    }
+    let marker: Value = serde_json::from_str(&fs::read_to_string(marker_path)
+        .map_err(|error| format!("读取 GitHub 备份标记失败: {error}"))?)
+        .map_err(|error| format!("GitHub 备份标记格式错误: {error}"))?;
+    if marker.get("kind").and_then(Value::as_str) != Some("apisaverwriter-project")
+        || marker.get("schemaVersion").and_then(Value::as_u64).unwrap_or(0) != 1
+    {
+        return Err("该仓库的 ApiSaverWriter 备份格式不受支持".to_string());
+    }
+    let project: Value = serde_json::from_str(&fs::read_to_string(project_path)
+        .map_err(|error| format!("读取 GitHub 小说数据失败: {error}"))?)
+        .map_err(|error| format!("GitHub 小说数据格式错误: {error}"))?;
+    let project_id = project.get("id").and_then(Value::as_i64).unwrap_or(0);
+    let project_title = project.get("title").and_then(Value::as_str).unwrap_or_default().trim();
+    let chapters = project.get("chapters").and_then(Value::as_array);
+    if project_id <= 0
+        || project_title.is_empty()
+        || chapters.is_none()
+        || chapters.is_some_and(|items| items.iter().any(|item| !item.is_object()))
+    {
+        return Err("GitHub 仓库中的小说数据不完整".to_string());
+    }
+    if marker.get("projectId").and_then(Value::as_i64) != Some(project_id)
+        || marker.get("title").and_then(Value::as_str) != Some(project_title)
+    {
+        return Err("GitHub 备份标记与小说数据不一致".to_string());
+    }
+    Ok(project)
+}
+
+fn validate_github_backup_destination(checkout: &Path, project_id: i64, project_title: &str) -> Result<(), String> {
+    if checkout.join(GITHUB_PROJECT_MARKER).exists() {
+        let existing = read_github_project(checkout)?;
+        let same_id = existing.get("id").and_then(Value::as_i64) == Some(project_id);
+        let same_title = existing.get("title").and_then(Value::as_str) == Some(project_title);
+        if !same_id && !same_title {
+            return Err("该仓库已绑定另一部小说，为避免覆盖已拒绝备份".to_string());
+        }
+        return Ok(());
+    }
+    let allowed = ["readme.md", "license", "license.md", ".gitignore", ".gitattributes"];
+    let has_other_files = fs::read_dir(checkout)
+        .map_err(|error| format!("读取 GitHub 仓库失败: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase())
+        .any(|name| name != ".git" && !allowed.contains(&name.as_str()));
+    if has_other_files {
+        return Err("仓库已有其他内容且不是 ApiSaverWriter 规范仓库，为避免覆盖已拒绝备份".to_string());
+    }
+    Ok(())
+}
+
+fn ensure_git_identity(checkout: &Path) -> Result<(), String> {
+    if run_git(&["config", "user.name"], Some(checkout)).unwrap_or_default().trim().is_empty() {
+        run_git(&["config", "user.name", "ApiSaverWriter"], Some(checkout))?;
+    }
+    if run_git(&["config", "user.email"], Some(checkout)).unwrap_or_default().trim().is_empty() {
+        run_git(&["config", "user.email", "apisaverwriter@local.invalid"], Some(checkout))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn backup_project_to_github(app: tauri::AppHandle, repository_url: String, project: Value) -> Result<Value, String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || backup_project_to_github_blocking(handle, repository_url, project))
+        .await
+        .map_err(|error| format!("GitHub 备份任务中断: {error}"))?
+}
+
+fn backup_project_to_github_blocking(app: tauri::AppHandle, repository_url: String, project: Value) -> Result<Value, String> {
+    let repository_url = validate_github_repository_url(&repository_url)?;
+    let project_id = project.get("id").and_then(Value::as_i64).filter(|id| *id > 0).ok_or_else(|| "小说缺少有效 ID".to_string())?;
+    let project_title = project.get("title").and_then(Value::as_str).unwrap_or_default().trim().to_string();
+    if project_title.is_empty() {
+        return Err("小说名称不能为空".to_string());
+    }
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "github-backup", "stage": "clone", "message": "正在拉取 GitHub 仓库..." }));
+    let app_data = app_data_directory(&app)?;
+    let checkout = clone_github_repository(&app_data, &repository_url, ".github-backup")?;
+    validate_github_backup_destination(&checkout, project_id, &project_title)?;
+    let source = find_project_directory(&app, project_id)?;
+    for managed in GITHUB_MANAGED_PATHS {
+        let path = checkout.join(managed);
+        if let Ok(metadata) = fs::symlink_metadata(&path) {
+            if metadata.file_type().is_symlink() || metadata.is_file() {
+                fs::remove_file(&path).map_err(|error| format!("清理仓库旧小说文件失败: {error}"))?;
+            } else if metadata.is_dir() {
+                fs::remove_dir_all(&path).map_err(|error| format!("清理仓库旧小说目录失败: {error}"))?;
+            }
+        }
+    }
+    copy_cloud_backup_contents(&source, &checkout)?;
+    // GitHub 仓库只保存创作资料，剔除旧版发布配置中的潜在账号信息
+    let mut project_snapshot = project;
+    if let Some(object) = project_snapshot.as_object_mut() {
+        object.remove("publishConfig");
+        object.remove("publishRecords");
+    }
+    let metadata_path = checkout.join("metadata.json");
+    if let Ok(content) = fs::read_to_string(&metadata_path) {
+        if let Ok(mut metadata) = serde_json::from_str::<Value>(&content) {
+            if let Some(object) = metadata.as_object_mut() {
+                object.remove("publishConfig");
+                object.remove("publishRecords");
+            }
+            fs::write(&metadata_path, serde_json::to_vec_pretty(&metadata).map_err(|error| format!("序列化 GitHub 小说索引失败: {error}"))?)
+                .map_err(|error| format!("写入 GitHub 小说索引失败: {error}"))?;
+        }
+    }
+    fs::write(
+        checkout.join(GITHUB_PROJECT_DATA),
+        serde_json::to_vec_pretty(&project_snapshot).map_err(|error| format!("序列化 GitHub 小说备份失败: {error}"))?,
+    ).map_err(|error| format!("写入 GitHub 小说备份失败: {error}"))?;
+    let marker = serde_json::json!({
+        "kind": "apisaverwriter-project",
+        "schemaVersion": 1,
+        "projectId": project_id,
+        "title": &project_title,
+    });
+    fs::write(
+        checkout.join(GITHUB_PROJECT_MARKER),
+        serde_json::to_vec_pretty(&marker).map_err(|error| format!("序列化 GitHub 备份标记失败: {error}"))?,
+    ).map_err(|error| format!("写入 GitHub 备份标记失败: {error}"))?;
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "github-backup", "stage": "commit", "message": "正在提交小说变更..." }));
+    run_git(&["add", "--all"], Some(&checkout))?;
+    let changed = !run_git(&["status", "--porcelain"], Some(&checkout))?.trim().is_empty();
+    if changed {
+        ensure_git_identity(&checkout)?;
+        let message = format!("备份小说《{}》", project_title.replace(['\r', '\n'], " "));
+        run_git(&["commit", "-m", &message], Some(&checkout))?;
+    }
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "github-backup", "stage": "push", "message": "正在推送到 GitHub..." }));
+    run_git(&["push", "--set-upstream", "origin", "HEAD"], Some(&checkout))?;
+    let branch = run_git(&["branch", "--show-current"], Some(&checkout))?;
+    let commit = run_git(&["rev-parse", "--short", "HEAD"], Some(&checkout))?;
+    fs::remove_dir_all(app_data.join(".github-backup")).ok();
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "github-backup", "stage": "done", "message": "小说已推送到 GitHub。" }));
+    Ok(serde_json::json!({ "repositoryUrl": repository_url, "title": project_title, "branch": branch, "commit": commit, "changed": changed }))
+}
+
+#[tauri::command]
+async fn load_project_from_github(app: tauri::AppHandle, repository_url: String) -> Result<Value, String> {
+    let handle = app.clone();
+    tauri::async_runtime::spawn_blocking(move || load_project_from_github_blocking(handle, repository_url))
+        .await
+        .map_err(|error| format!("GitHub 恢复任务中断: {error}"))?
+}
+
+fn load_project_from_github_blocking(app: tauri::AppHandle, repository_url: String) -> Result<Value, String> {
+    let repository_url = validate_github_repository_url(&repository_url)?;
+    let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "github-restore", "stage": "clone", "message": "正在从 GitHub 拉取小说..." }));
+    let app_data = app_data_directory(&app)?;
+    let checkout = clone_github_repository(&app_data, &repository_url, ".github-restore")?;
+    let project = read_github_project(&checkout)?;
+    let branch = run_git(&["branch", "--show-current"], Some(&checkout))?;
+    let commit = run_git(&["rev-parse", "--short", "HEAD"], Some(&checkout))?;
+    fs::remove_dir_all(app_data.join(".github-restore")).ok();
+    Ok(serde_json::json!({ "repositoryUrl": repository_url, "branch": branch, "commit": commit, "project": project }))
+}
+
 #[tauri::command]
 fn cloud_sync_status() -> Result<Value, String> {
     let output = run_bdpan(&["whoami", "--json"])?;
@@ -1753,6 +1996,53 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn github_repository_url_only_accepts_owner_and_repository() {
+        assert_eq!(
+            validate_github_repository_url("https://github.com/example/novel.git").unwrap(),
+            "https://github.com/example/novel.git"
+        );
+        assert_eq!(
+            validate_github_repository_url("git@github.com:example/novel.git").unwrap(),
+            "git@github.com:example/novel.git"
+        );
+        assert!(validate_github_repository_url("https://gitlab.com/example/novel.git").is_err());
+        assert!(validate_github_repository_url("https://github.com/example").is_err());
+        assert!(validate_github_repository_url("https://github.com/example/../secret.git").is_err());
+        assert!(validate_github_repository_url("https://token@github.com/example/novel.git").is_err());
+    }
+
+    #[test]
+    fn github_project_repository_round_trip_uses_real_git() {
+        let root = std::env::temp_dir().join(format!(
+            "apisaverwriter-git-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let bare = root.join("remote.git");
+        fs::create_dir_all(&root).unwrap();
+        let bare_text = bare.to_string_lossy().into_owned();
+        run_git(&["init", "--bare", &bare_text], None).unwrap();
+
+        let checkout = clone_github_repository(&root, &bare_text, "write-cache").unwrap();
+        validate_github_backup_destination(&checkout, 42, "测试小说").unwrap();
+        let project = json!({ "id": 42, "title": "测试小说", "chapters": [{ "id": 1, "title": "第一章", "content": "正文" }] });
+        fs::write(checkout.join(GITHUB_PROJECT_MARKER), serde_json::to_vec_pretty(&json!({
+            "kind": "apisaverwriter-project", "schemaVersion": 1, "projectId": 42, "title": "测试小说"
+        })).unwrap()).unwrap();
+        fs::write(checkout.join(GITHUB_PROJECT_DATA), serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+        ensure_git_identity(&checkout).unwrap();
+        run_git(&["add", "--all"], Some(&checkout)).unwrap();
+        run_git(&["commit", "-m", "测试备份"], Some(&checkout)).unwrap();
+        run_git(&["push", "--set-upstream", "origin", "HEAD"], Some(&checkout)).unwrap();
+
+        let restored_checkout = clone_github_repository(&root, &bare_text, "read-cache").unwrap();
+        assert_eq!(read_github_project(&restored_checkout).unwrap(), project);
+        validate_github_backup_destination(&restored_checkout, 42, "测试小说").unwrap();
+        assert!(validate_github_backup_destination(&restored_checkout, 99, "另一本小说").is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn selected_cloud_backup_must_stay_in_configured_directory() {
         assert_eq!(
             validate_cloud_backup_path(
@@ -1865,6 +2155,8 @@ pub fn run() {
             backup_projects_to_baidu,
             list_baidu_backups,
             restore_projects_from_baidu,
+            backup_project_to_github,
+            load_project_from_github,
             load_projects,
             save_projects,
             load_dismantle_books,

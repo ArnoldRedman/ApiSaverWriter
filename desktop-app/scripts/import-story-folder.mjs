@@ -5,7 +5,7 @@
 //
 // 目标目录中的 projects/ 为空时，应用会回退读取 projects.json，并在下一次
 // 自动保存时把它拆分成正式的目录结构，所以这里只需要写单个 JSON 索引。
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 
 const args = process.argv.slice(2);
@@ -15,6 +15,8 @@ const flag = (name) => {
 };
 const sourceRoot = resolve(args.find(item => !item.startsWith('--')) ?? '.');
 const dryRun = args.includes('--dry-run');
+const githubRoot = flag('--github-repo') ? resolve(flag('--github-repo')) : undefined;
+const repositoryUrl = flag('--repository-url')?.trim();
 const appDataRoot = resolve(flag('--app-data')
   ?? join(process.env.APPDATA ?? join(process.env.HOME ?? '.', '.config'), 'com.apisaverwriter.app'));
 
@@ -159,16 +161,21 @@ const currentStateFor = (characterId) => {
   ].filter(Boolean).join('　');
 };
 
+const characterCardIds = new Map();
 const cards = [
-  ...characters.map(item => ({
-    id: id(),
-    type: '角色卡',
-    title: item.data.name ?? item.file.replace(/\.json$/, ''),
-    content: toMarkdown(item.data),
-    currentState: currentStateFor(item.data.id ?? ''),
-    createdAt: now,
-    updatedAt: now,
-  })),
+  ...characters.map(item => {
+    const card = {
+      id: id(),
+      type: '角色卡',
+      title: item.data.name ?? item.file.replace(/\.json$/, ''),
+      content: toMarkdown(item.data),
+      currentState: currentStateFor(item.data.id ?? ''),
+      createdAt: now,
+      updatedAt: now,
+    };
+    if (item.data.id) characterCardIds.set(item.data.id, card.id);
+    return card;
+  }),
   ...(readJSON('story_data/bible/world/locations.json')?.locations ?? []).map(location => ({
     id: id(),
     type: '地点卡',
@@ -180,8 +187,48 @@ const cards = [
   })),
 ];
 
+const graphFolder = (type) => type === '角色卡' ? '重要角色' : type === '地点卡' ? '地点与场景' : '物品与设定';
+const graphNodes = cards.map(card => ({
+  id: `card:${card.id}`,
+  label: card.title,
+  type: 'card',
+  category: card.type,
+  content: card.content,
+  sourcePath: `图谱/${graphFolder(card.type)}/${card.title}.md`,
+  status: card.currentState || '已导入',
+  updatedAt: now,
+}));
+const graphEdges = Object.entries(state?.relationship_stages ?? {}).flatMap(([pair, detail], index) => {
+  const [left, right] = pair.split('@');
+  const sourceId = characterCardIds.get(left);
+  const targetId = characterCardIds.get(right);
+  return sourceId && targetId ? [{
+    id: `relationship:${index + 1}`,
+    source: `card:${sourceId}`,
+    target: `card:${targetId}`,
+    label: detail.stage ?? '人物关系',
+    weight: 0.9,
+    updatedAt: now,
+  }] : [];
+});
+const stateMarkdown = state ? `# 动态设定事实账本\n\n${toMarkdown(state)}\n` : '';
+const memoryDocuments = stateMarkdown ? [{
+  id: 'memory-document:设定事实',
+  kind: '设定事实',
+  title: '设定事实',
+  content: stateMarkdown,
+  updatedAt: now,
+  manuallyEdited: true,
+}] : [];
+
+const existingGithubMarker = githubRoot && existsSync(join(githubRoot, '.apisaverwriter-project.json'))
+  ? readFileSync(join(githubRoot, '.apisaverwriter-project.json'), 'utf8')
+  : '';
+let existingProjectId = 0;
+try { existingProjectId = Number(JSON.parse(existingGithubMarker).projectId) || 0; } catch { /* First export has no marker yet. */ }
+
 const project = {
-  id: Date.now(),
+  id: existingProjectId || Date.now(),
   title: bookTitle,
   genre: '男频',
   subgenre: '都市日常',
@@ -195,13 +242,14 @@ const project = {
   outlines,
   cards,
   memories: [],
-  memoryDocuments: [],
-  graphNodes: [],
-  graphEdges: [],
+  memoryDocuments,
+  graphNodes,
+  graphEdges,
   createdAt: now,
   updatedAt: now,
   wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
   chapterTargetWords: 2500,
+  ...(repositoryUrl ? { githubRepositoryUrl: repositoryUrl } : {}),
 };
 
 const styleContent = [read('NOVEL_STYLE_AND_CRAFT_GUIDE.md'), read('.agents/rules/novel-craft-standard.md')]
@@ -223,10 +271,66 @@ console.log(`主角：${protagonist1 || '(未识别)'}${protagonist2 ? ` / ${pro
 console.log(`章节：${chapters.length} 章，共 ${project.wordCount.toLocaleString()} 字`);
 console.log(`大纲：${outlines.length} 篇 —— ${outlines.map(item => `${item.kind}·${item.title}`).join('、')}`);
 console.log(`卡片：${cards.filter(card => card.type === '角色卡').length} 张角色卡、${cards.filter(card => card.type === '地点卡').length} 张地点卡`);
+console.log(`记忆：${memoryDocuments.length} 篇；图谱：${graphNodes.length} 个节点、${graphEdges.length} 条关系`);
 console.log(`文风：${styles.length ? styles[0].name : '无'}`);
 
 if (dryRun) {
   console.log('\n--dry-run：未写入任何文件。');
+  process.exit(0);
+}
+
+if (githubRoot) {
+  const safeName = (value, fallback) => String(value || '').trim()
+    .replace(/[\\/:*?"<>|]/gu, '_')
+    .replace(/^[. ]+|[. ]+$/gu, '') || fallback;
+  const managedDirectories = ['章节', '大纲', '卡片', '记忆', '图谱'];
+  mkdirSync(githubRoot, { recursive: true });
+  for (const directory of managedDirectories) {
+    rmSync(join(githubRoot, directory), { recursive: true, force: true });
+    mkdirSync(join(githubRoot, directory), { recursive: true });
+  }
+
+  const metadata = structuredClone(project);
+  metadata.chapters.forEach(chapter => {
+    writeFileSync(join(githubRoot, '章节', `${safeName(chapter.title, `章节-${chapter.id}`)}.md`), chapter.content, 'utf8');
+    chapter.content = '';
+  });
+  metadata.outlines.forEach(outline => {
+    writeFileSync(join(githubRoot, '大纲', `${safeName(outline.title, `大纲-${outline.id}`)}.md`), outline.content, 'utf8');
+    outline.content = '';
+  });
+  metadata.cards.forEach(card => {
+    const directory = join(githubRoot, '卡片', safeName(card.type, '知识卡'));
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      join(directory, `${safeName(card.title, `卡片-${card.id}`)}.md`),
+      `${card.content}\n\n## 当前状态\n${card.currentState || '暂无'}\n`,
+      'utf8',
+    );
+    card.content = '';
+  });
+  metadata.memoryDocuments.forEach(document => {
+    writeFileSync(join(githubRoot, '记忆', `${safeName(document.title, document.kind)}.md`), document.content, 'utf8');
+  });
+  metadata.graphNodes.forEach(node => {
+    const segments = String(node.sourcePath || `图谱/${node.label}.md`).replace(/\\/gu, '/').split('/');
+    const path = join(githubRoot, ...segments.map((segment, index) => safeName(segment, index === segments.length - 1 ? `节点-${node.id}.md` : '其他实体')));
+    mkdirSync(resolve(path, '..'), { recursive: true });
+    writeFileSync(path, node.content || '', 'utf8');
+    node.content = '';
+  });
+
+  writeFileSync(join(githubRoot, 'project.json'), JSON.stringify(project, null, 2), 'utf8');
+  writeFileSync(join(githubRoot, 'metadata.json'), JSON.stringify(metadata, null, 2), 'utf8');
+  writeFileSync(join(githubRoot, '.apisaverwriter-project.json'), JSON.stringify({
+    kind: 'apisaverwriter-project',
+    schemaVersion: 1,
+    projectId: project.id,
+    title: project.title,
+  }, null, 2), 'utf8');
+  console.log(`\n已导出 GitHub 规范小说仓库：${githubRoot}`);
+  console.log(`规范标记：${join(githubRoot, '.apisaverwriter-project.json')}`);
+  console.log(`完整快照：${join(githubRoot, 'project.json')}`);
   process.exit(0);
 }
 
