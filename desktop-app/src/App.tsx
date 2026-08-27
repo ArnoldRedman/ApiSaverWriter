@@ -536,6 +536,149 @@ interface GatewayPricingEntry extends Record<string, unknown> {
 }
 interface AgentChatMessage { role: 'user' | 'assistant'; content: string; createdAt: string }
 
+type ProjectAgentMode = 'discuss' | 'execute';
+type ProjectAgentChangeStatus = 'pending' | 'applied' | 'dismissed';
+type ProjectAgentRawChange =
+  | { type: 'project.update'; summary: string; patch: Partial<Pick<Project, 'title' | 'synopsis' | 'genre' | 'subgenre' | 'protagonist1' | 'protagonist2' | 'status' | 'authorPreferences'>> }
+  | { type: 'outline.upsert'; summary: string; targetId?: number; kind: OutlineKind; title: string; content: string; chapterId?: number }
+  | { type: 'card.upsert'; summary: string; targetId?: number; cardType: CardType; title: string; content: string; currentState?: string }
+  | { type: 'memory.document.upsert'; summary: string; kind: MemoryDocumentKind; title: string; content: string }
+  | { type: 'graph.node.upsert'; summary: string; targetId: string; label: string; nodeType: KnowledgeGraphNode['type']; category?: string; content?: string; nodeStatus?: string }
+  | { type: 'graph.edge.upsert'; summary: string; targetId: string; source: string; target: string; label: string; weight?: number }
+  | { type: 'chapter.create'; summary: string; title: string; content: string; chapterPlan?: string; chapterSummary?: string };
+type ProjectAgentChange = ProjectAgentRawChange & { id: string; status: ProjectAgentChangeStatus; baseUpdatedAt?: string; baseFields?: Record<string, unknown> };
+interface ProjectAgentToolEvent { tool: string; status: 'complete' | 'error'; message: string }
+interface ProjectAgentMessage extends AgentChatMessage { id: string; toolEvents?: ProjectAgentToolEvent[]; changeIds?: string[]; error?: boolean }
+interface ProjectAgentSession {
+  version: 1;
+  projectId: number;
+  sessionId: string;
+  mode: ProjectAgentMode;
+  messages: ProjectAgentMessage[];
+  changes: ProjectAgentChange[];
+  updatedAt: string;
+}
+interface ProjectAgentResponse { message: string; changes?: unknown[]; toolEvents?: ProjectAgentToolEvent[] }
+
+const projectAgentSessionId = () => `project-agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+const projectAgentRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
+const projectAgentString = (value: unknown, max: number) => typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : '';
+const projectAgentNumber = (value: unknown) => Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : undefined;
+
+const createProjectAgentSession = (projectId: number, sessionId = projectAgentSessionId()): ProjectAgentSession => ({
+  version: 1,
+  projectId,
+  sessionId,
+  mode: 'discuss',
+  messages: [],
+  changes: [],
+  updatedAt: new Date().toISOString(),
+});
+
+const normalizeProjectAgentChange = (value: unknown, project: Project, index = 0): ProjectAgentChange | null => {
+  if (!projectAgentRecord(value)) return null;
+  const type = projectAgentString(value.type, 80);
+  const summary = projectAgentString(value.summary, 200);
+  if (!summary) return null;
+  const id = projectAgentString(value.id, 160) || `change-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 7)}`;
+  const status: ProjectAgentChangeStatus = ['applied', 'dismissed'].includes(String(value.status)) ? value.status as ProjectAgentChangeStatus : 'pending';
+  const storedBase = typeof value.baseUpdatedAt === 'string' ? value.baseUpdatedAt : undefined;
+  if (type === 'project.update' && projectAgentRecord(value.patch)) {
+    const patch: Record<string, unknown> = {};
+    for (const key of ['title', 'synopsis', 'genre', 'subgenre', 'protagonist1', 'protagonist2'] as const) {
+      if (typeof value.patch[key] === 'string') patch[key] = value.patch[key];
+    }
+    if (value.patch.status === 'writing' || value.patch.status === 'completed') patch.status = value.patch.status;
+    if (Array.isArray(value.patch.authorPreferences)) patch.authorPreferences = value.patch.authorPreferences.filter(item => typeof item === 'string' && item.trim()).slice(0, 20);
+    if (!Object.keys(patch).length) return null;
+    // 只快照本次要改的字段：project.updatedAt 会被任意一次章节保存刷新，不能当作冲突依据
+    const source = project as unknown as Record<string, unknown>;
+    const baseFields = projectAgentRecord(value.baseFields) ? value.baseFields : Object.fromEntries(Object.keys(patch).map(key => [key, source[key]]));
+    return { type, id, status, summary, patch, baseFields } as ProjectAgentChange;
+  }
+  if (type === 'outline.upsert') {
+    const targetId = projectAgentNumber(value.targetId);
+    const target = targetId ? project.outlines.find(item => item.id === targetId) : undefined;
+    const kind = ['总纲', '章纲', '世界观与作品设定'].includes(String(value.kind)) ? value.kind as OutlineKind : null;
+    const title = projectAgentString(value.title, 160);
+    const content = projectAgentString(value.content, 60_000);
+    if (!kind || !title || !content || (targetId && !target)) return null;
+    return { type, id, status, summary, targetId, kind, title, content, chapterId: projectAgentNumber(value.chapterId), baseUpdatedAt: storedBase || target?.updatedAt };
+  }
+  if (type === 'card.upsert') {
+    const targetId = projectAgentNumber(value.targetId);
+    const target = targetId ? project.cards.find(item => item.id === targetId) : undefined;
+    const cardType = ['角色卡', '物品卡', '地点卡', '势力卡', '金手指卡'].includes(String(value.cardType)) ? value.cardType as CardType : null;
+    const title = projectAgentString(value.title, 120);
+    const content = projectAgentString(value.content, 40_000);
+    if (!cardType || !title || !content || (targetId && !target)) return null;
+    return { type, id, status, summary, targetId, cardType, title, content, currentState: typeof value.currentState === 'string' ? value.currentState.slice(0, 6000) : undefined, baseUpdatedAt: storedBase || target?.updatedAt };
+  }
+  if (type === 'memory.document.upsert') {
+    const kind = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'].includes(String(value.kind)) ? value.kind as MemoryDocumentKind : null;
+    const title = projectAgentString(value.title, 120);
+    const content = projectAgentString(value.content, 60_000);
+    const target = kind ? project.memoryDocuments.find(item => item.kind === kind) : undefined;
+    if (!kind || !title || !content) return null;
+    return { type, id, status, summary, kind, title, content, baseUpdatedAt: storedBase || target?.updatedAt };
+  }
+  if (type === 'graph.node.upsert') {
+    const targetId = projectAgentString(value.targetId, 160);
+    const label = projectAgentString(value.label, 120);
+    const nodeType = ['chapter', 'card', 'outline', 'entity'].includes(String(value.nodeType)) ? value.nodeType as KnowledgeGraphNode['type'] : null;
+    const target = project.graphNodes.find(item => item.id === targetId);
+    if (!targetId || !label || !nodeType) return null;
+    return { type, id, status, summary, targetId, label, nodeType, category: projectAgentString(value.category, 80) || undefined, content: typeof value.content === 'string' ? value.content.slice(0, 30_000) : undefined, nodeStatus: projectAgentString(value.nodeStatus, 1000) || undefined, baseUpdatedAt: storedBase || target?.updatedAt };
+  }
+  if (type === 'graph.edge.upsert') {
+    const targetId = projectAgentString(value.targetId, 240);
+    const source = projectAgentString(value.source, 160);
+    const target = projectAgentString(value.target, 160);
+    const label = projectAgentString(value.label, 80);
+    const existing = project.graphEdges.find(item => item.id === targetId);
+    const weight = typeof value.weight === 'number' && value.weight >= 0.1 && value.weight <= 1 ? value.weight : undefined;
+    if (!targetId || !source || !target || source === target || !label) return null;
+    return { type, id, status, summary, targetId, source, target, label, weight, baseUpdatedAt: storedBase || existing?.updatedAt };
+  }
+  if (type === 'chapter.create') {
+    const title = projectAgentString(value.title, 160);
+    const content = projectAgentString(value.content, 120_000);
+    if (!title || !content) return null;
+    return { type, id, status, summary, title, content, chapterPlan: typeof value.chapterPlan === 'string' ? value.chapterPlan.slice(0, 30_000) : undefined, chapterSummary: typeof value.chapterSummary === 'string' ? value.chapterSummary.slice(0, 3000) : undefined };
+  }
+  return null;
+};
+
+const normalizeProjectAgentSession = (value: unknown, project: Project, sessionId: string): ProjectAgentSession => {
+  if (!projectAgentRecord(value)) return createProjectAgentSession(project.id, sessionId);
+  const messages = Array.isArray(value.messages) ? value.messages.slice(-200).flatMap((item, index): ProjectAgentMessage[] => {
+    if (!projectAgentRecord(item) || (item.role !== 'user' && item.role !== 'assistant') || typeof item.content !== 'string') return [];
+    return [{
+      id: projectAgentString(item.id, 160) || `message-${index}`,
+      role: item.role,
+      content: item.content.slice(0, 30_000),
+      createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
+      toolEvents: Array.isArray(item.toolEvents) ? item.toolEvents.filter(projectAgentRecord).flatMap((event): ProjectAgentToolEvent[] => {
+        const tool = projectAgentString(event.tool, 120); const message = projectAgentString(event.message, 1000);
+        const status = event.status;
+        return tool && message && (status === 'complete' || status === 'error') ? [{ tool, message, status }] : [];
+      }).slice(0, 30) : undefined,
+      changeIds: Array.isArray(item.changeIds) ? item.changeIds.filter(id => typeof id === 'string').slice(0, 20) : undefined,
+      error: item.error === true,
+    }];
+  }) : [];
+  const changes = Array.isArray(value.changes) ? value.changes.slice(-80).map((item, index) => normalizeProjectAgentChange(item, project, index)).filter((item): item is ProjectAgentChange => Boolean(item)) : [];
+  return {
+    version: 1,
+    projectId: project.id,
+    sessionId,
+    mode: value.mode === 'execute' ? 'execute' : 'discuss',
+    messages,
+    changes,
+    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
+  };
+};
+
 interface AgentMemoryResult {
   summary?: string;
   keywords?: string[];
@@ -1483,6 +1626,226 @@ const normalizeStoredProject = (value: unknown): Project => {
   };
 };
 
+const projectAgentChangeTargetKey = (change: ProjectAgentChange) => {
+  if (change.type === 'project.update') return 'project';
+  if (change.type === 'outline.upsert') return `outline:${change.targetId ?? `new:${change.kind}:${change.title}`}`;
+  if (change.type === 'card.upsert') return `card:${change.targetId ?? `new:${change.cardType}:${change.title}`}`;
+  if (change.type === 'memory.document.upsert') return `memory:${change.kind}`;
+  if (change.type === 'graph.node.upsert') return `graph-node:${change.targetId}`;
+  if (change.type === 'graph.edge.upsert') return `graph-edge:${change.targetId}`;
+  return `chapter:new:${change.title}`;
+};
+
+const projectAgentRebase = (change: ProjectAgentChange, project: Project): ProjectAgentChange => {
+  if (change.type === 'project.update') {
+    const source = project as unknown as Record<string, unknown>;
+    return { ...change, baseFields: Object.fromEntries(Object.keys(change.patch).map(key => [key, source[key]])) };
+  }
+  if (change.type === 'outline.upsert') return { ...change, baseUpdatedAt: project.outlines.find(item => item.id === change.targetId)?.updatedAt };
+  if (change.type === 'card.upsert') return { ...change, baseUpdatedAt: project.cards.find(item => item.id === change.targetId)?.updatedAt };
+  if (change.type === 'memory.document.upsert') return { ...change, baseUpdatedAt: project.memoryDocuments.find(item => item.kind === change.kind)?.updatedAt };
+  if (change.type === 'graph.node.upsert') return { ...change, baseUpdatedAt: project.graphNodes.find(item => item.id === change.targetId)?.updatedAt };
+  if (change.type === 'graph.edge.upsert') return { ...change, baseUpdatedAt: project.graphEdges.find(item => item.id === change.targetId)?.updatedAt };
+  return change;
+};
+
+const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentChange[]): { project: Project; createdChapterId?: number } => {
+  const order: Record<ProjectAgentRawChange['type'], number> = {
+    'project.update': 0,
+    'outline.upsert': 1,
+    'card.upsert': 2,
+    'memory.document.upsert': 3,
+    'graph.node.upsert': 4,
+    'graph.edge.upsert': 5,
+    'chapter.create': 6,
+  };
+  const pending = changes.filter(change => change.status === 'pending').sort((left, right) => order[left.type] - order[right.type]);
+  if (!pending.length) throw new Error('没有待应用的变更');
+  const now = new Date().toISOString();
+  const stale = (expected: string | undefined, actual: string | undefined, label: string) => {
+    if (expected && expected !== actual) throw new Error(`${label}已在提案生成后发生修改，请重新让项目 Agent 处理`);
+  };
+  for (const change of pending) {
+    if (change.type === 'project.update' && change.baseFields) {
+      const source = project as unknown as Record<string, unknown>;
+      const conflicts = Object.keys(change.baseFields).filter(key => JSON.stringify(source[key]) !== JSON.stringify(change.baseFields?.[key]));
+      if (conflicts.length) throw new Error(`小说资料的 ${conflicts.join('、')} 已在提案生成后被修改，请重新让项目 Agent 处理`);
+    }
+    if (change.type === 'outline.upsert') {
+      const target = change.targetId ? project.outlines.find(item => item.id === change.targetId) : undefined;
+      if (change.targetId && !target) throw new Error(`找不到待更新大纲 ID ${change.targetId}`);
+      if (target) stale(change.baseUpdatedAt, target.updatedAt, `大纲《${target.title}》`);
+    }
+    if (change.type === 'card.upsert') {
+      const target = change.targetId ? project.cards.find(item => item.id === change.targetId) : undefined;
+      if (change.targetId && !target) throw new Error(`找不到待更新卡片 ID ${change.targetId}`);
+      if (target) stale(change.baseUpdatedAt, target.updatedAt, `卡片《${target.title}》`);
+    }
+    if (change.type === 'memory.document.upsert') {
+      const target = project.memoryDocuments.find(item => item.kind === change.kind);
+      if (target) stale(change.baseUpdatedAt, target.updatedAt, `记忆文档《${change.title}》`);
+    }
+    if (change.type === 'graph.node.upsert') {
+      const target = project.graphNodes.find(item => item.id === change.targetId);
+      if (target) stale(change.baseUpdatedAt, target.updatedAt, `图谱节点《${change.label}》`);
+    }
+    if (change.type === 'graph.edge.upsert') {
+      const target = project.graphEdges.find(item => item.id === change.targetId);
+      if (target) stale(change.baseUpdatedAt, target.updatedAt, `图谱关系《${change.label}》`);
+    }
+    if (change.type === 'chapter.create') {
+      if (project.chapters.some(item => item.title.trim() === change.title.trim())) throw new Error(`章节《${change.title}》已经存在`);
+    }
+  }
+
+  let next: Project = { ...project };
+  let serial = Date.now();
+  let createdChapterId: number | undefined;
+  for (const change of pending) {
+    if (change.type === 'project.update') {
+      next = { ...next, ...change.patch };
+      continue;
+    }
+    if (change.type === 'outline.upsert') {
+      const outline: OutlineDocument = {
+        id: change.targetId ?? ++serial,
+        kind: change.kind,
+        chapterId: change.chapterId,
+        title: change.title,
+        content: change.content,
+        createdAt: change.targetId ? next.outlines.find(item => item.id === change.targetId)?.createdAt || now : now,
+        updatedAt: now,
+      };
+      next = {
+        ...next,
+        outlines: change.targetId ? next.outlines.map(item => item.id === change.targetId ? outline : item) : [...next.outlines, outline],
+        graphNodes: next.graphNodes.some(node => node.id === `outline:${outline.id}`)
+          ? next.graphNodes.map(node => node.id === `outline:${outline.id}` ? { ...node, label: outline.title, category: outline.kind, updatedAt: now } : node)
+          : [...next.graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: outline.kind, content: createGraphNodeProfile('outline', outline.kind), updatedAt: now }],
+      };
+      continue;
+    }
+    if (change.type === 'card.upsert') {
+      const previous = change.targetId ? next.cards.find(item => item.id === change.targetId) : undefined;
+      const card: KnowledgeCard = {
+        id: change.targetId ?? ++serial,
+        type: change.cardType,
+        title: change.title,
+        content: change.content,
+        currentState: change.currentState ?? previous?.currentState,
+        stateHistory: previous?.stateHistory,
+        createdAt: previous?.createdAt || now,
+        updatedAt: now,
+      };
+      next = {
+        ...next,
+        cards: change.targetId ? next.cards.map(item => item.id === change.targetId ? card : item) : [...next.cards, card],
+        graphNodes: next.graphNodes.some(node => node.id === `card:${card.id}`)
+          ? next.graphNodes.map(node => node.id === `card:${card.id}` ? { ...node, label: card.title, category: card.type, updatedAt: now } : node)
+          : [...next.graphNodes, { id: `card:${card.id}`, label: card.title, type: 'card', category: card.type, content: createGraphNodeProfile('card', card.type), updatedAt: now }],
+      };
+      continue;
+    }
+    if (change.type === 'memory.document.upsert') {
+      const existing = next.memoryDocuments.find(item => item.kind === change.kind);
+      const document: MemoryDocument = {
+        id: existing?.id || memoryDocumentId(change.kind),
+        kind: change.kind,
+        title: change.title,
+        content: change.content,
+        updatedAt: now,
+        manuallyEdited: true,
+      };
+      next = { ...next, memoryDocuments: existing ? next.memoryDocuments.map(item => item.id === existing.id ? document : item) : [...next.memoryDocuments, document] };
+      continue;
+    }
+    if (change.type === 'graph.node.upsert') {
+      const existing = next.graphNodes.find(item => item.id === change.targetId);
+      const node: KnowledgeGraphNode = {
+        ...existing,
+        id: change.targetId,
+        label: change.label,
+        type: change.nodeType,
+        category: change.category ?? existing?.category,
+        content: change.content ?? existing?.content ?? createGraphNodeProfile(change.nodeType, change.category),
+        status: change.nodeStatus ?? existing?.status,
+        updatedAt: now,
+      };
+      next = { ...next, graphNodes: existing ? next.graphNodes.map(item => item.id === node.id ? node : item) : [...next.graphNodes, node] };
+      continue;
+    }
+    if (change.type === 'graph.edge.upsert') {
+      const availableNodeIds = new Set(next.graphNodes.map(node => node.id));
+      if (!availableNodeIds.has(change.source) || !availableNodeIds.has(change.target)) {
+        throw new Error(`图谱关系《${change.label}》引用了不存在的节点`);
+      }
+      const existing = next.graphEdges.find(item => item.id === change.targetId);
+      const edge: KnowledgeGraphEdge = {
+        ...existing,
+        id: change.targetId,
+        source: change.source,
+        target: change.target,
+        label: change.label,
+        weight: normalizeKnowledgeGraphWeight(change.weight, change.label),
+        updatedAt: now,
+      };
+      next = { ...next, graphEdges: existing ? next.graphEdges.map(item => item.id === edge.id ? edge : item) : [...next.graphEdges, edge] };
+      continue;
+    }
+    if (change.type === 'chapter.create') {
+      const chapter: Chapter = {
+        id: ++serial,
+        title: change.title,
+        content: change.content,
+        wordCount: countNovelCharacters(change.content),
+        createdAt: now,
+        updatedAt: now,
+      };
+      createdChapterId = chapter.id;
+      const memories = change.chapterSummary ? [...next.memories, normalizeChapterMemory({
+        id: ++serial,
+        chapterId: chapter.id,
+        chapterTitle: chapter.title,
+        summary: change.chapterSummary,
+        keywords: [],
+        characterStateChanges: [],
+        knowledgeChanges: [],
+        foreshadowingChanges: [],
+        timelineEvents: [],
+        canonFacts: [],
+        conflicts: [],
+        endingHook: '',
+        sourceChapterNumber: next.chapters.length + 1,
+        createdAt: now,
+        updatedAt: now,
+      }, chapter)] : next.memories;
+      let outlines = next.outlines;
+      let graphNodes = [...next.graphNodes, { id: `chapter:${chapter.id}`, label: chapter.title, type: 'chapter' as const, content: createGraphNodeProfile('chapter'), updatedAt: now }];
+      if (change.chapterPlan?.trim()) {
+        const outline: OutlineDocument = { id: ++serial, kind: '章纲', chapterId: chapter.id, title: `章纲｜${chapter.title}`, content: change.chapterPlan, createdAt: now, updatedAt: now };
+        outlines = [...outlines, outline];
+        graphNodes = [...graphNodes, { id: `outline:${outline.id}`, label: outline.title, type: 'outline', category: '章纲', content: createGraphNodeProfile('outline', '章纲'), updatedAt: now }];
+      }
+      next = {
+        ...next,
+        chapters: [...next.chapters, chapter],
+        outlines,
+        memories,
+        memoryDocuments: change.chapterSummary ? buildMemoryDocuments(memories, next.memoryDocuments) : next.memoryDocuments,
+        graphNodes,
+      };
+    }
+  }
+  return {
+    project: {
+      ...next,
+      wordCount: next.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0),
+      updatedAt: now,
+    },
+    createdChapterId,
+  };
+};
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabType>('projects');
   const [projects, setProjects] = useState<Project[]>(() => {
@@ -1625,6 +1988,10 @@ function App() {
   
   // 编辑器状态
   const [editingProject, setEditingProject] = useState<Project | null>(null);
+  const editingProjectRef = useRef<Project | null>(null);
+  const projectsRef = useRef<Project[]>(projects);
+  useEffect(() => { editingProjectRef.current = editingProject; }, [editingProject]);
+  useEffect(() => { projectsRef.current = projects; }, [projects]);
   const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
@@ -1693,6 +2060,15 @@ function App() {
   const [agentDisplayContent, setAgentDisplayContent] = useState('');
   const [outlineChatMessages, setOutlineChatMessages] = useState<AgentChatMessage[]>([]);
   const [cardChatMessages, setCardChatMessages] = useState<AgentChatMessage[]>([]);
+  const [showProjectAgent, setShowProjectAgent] = useState(false);
+  const [projectAgentSession, setProjectAgentSession] = useState<ProjectAgentSession | null>(null);
+  const projectAgentSessionRef = useRef<ProjectAgentSession | null>(null);
+  useEffect(() => { projectAgentSessionRef.current = projectAgentSession; }, [projectAgentSession]);
+  const [projectAgentInput, setProjectAgentInput] = useState('');
+  const [projectAgentRunning, setProjectAgentRunning] = useState(false);
+  const [projectAgentProgress, setProjectAgentProgress] = useState(0);
+  const [projectAgentActivity, setProjectAgentActivity] = useState<Array<{ id: string; message: string; status: 'active' | 'complete' | 'error' }>>([]);
+  const projectAgentRunRef = useRef('');
   const [chapterSessionId, setChapterSessionId] = useState(() => `chapter-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const [outlineSessionId, setOutlineSessionId] = useState(() => `outline-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const [cardSessionId, setCardSessionId] = useState(() => `card-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -1894,6 +2270,27 @@ function App() {
       const payload = event.payload;
       if (!payload) return;
       const data = payload.data ?? {};
+      if (payload.runId === projectAgentRunRef.current) {
+        if (payload.type === 'chunk') return;
+        const message = String(data.message || data.context?.action || data.error || '项目 Agent 正在处理');
+        if (payload.type === 'error') {
+          setProjectAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, message, status: 'error' as const }].slice(-20));
+          return;
+        }
+        if (payload.type === 'complete') {
+          setProjectAgentProgress(100);
+          setProjectAgentActivity(current => current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item));
+          return;
+        }
+        const progress = Math.max(1, Math.min(99, Number(data.progress) || 1));
+        setProjectAgentProgress(current => Math.max(current, progress));
+        setProjectAgentActivity(current => {
+          const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
+          const id = `${String(data.step || data.context?.source || 'step')}:${message}`;
+          return [...previous.filter(item => item.id !== id), { id, message, status: 'active' as const }].slice(-20);
+        });
+        return;
+      }
       if (payload.runId === outlineRunRef.current) {
         if (payload.type === 'chunk' && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
         if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
@@ -1999,6 +2396,26 @@ function App() {
       const payload = (event as CustomEvent<AgentProgressEvent>).detail;
       if (!payload) return;
       const data = payload.data ?? {};
+      if (payload.runId === projectAgentRunRef.current) {
+        if (payload.type === 'chunk') return;
+        const message = String(data.message || data.context?.action || data.error || '项目 Agent 正在处理');
+        if (payload.type === 'error') {
+          setProjectAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, message, status: 'error' as const }].slice(-20));
+          return;
+        }
+        if (payload.type === 'complete') {
+          setProjectAgentProgress(100);
+          setProjectAgentActivity(current => current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item));
+          return;
+        }
+        setProjectAgentProgress(current => Math.max(current, Math.max(1, Math.min(99, Number(data.progress) || 1))));
+        setProjectAgentActivity(current => {
+          const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
+          const id = `${String(data.step || data.context?.source || 'step')}:${message}`;
+          return [...previous.filter(item => item.id !== id), { id, message, status: 'active' as const }].slice(-20);
+        });
+        return;
+      }
       if (payload.runId === outlineRunRef.current) {
         if (payload.type === 'chunk' && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
         if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
@@ -2161,6 +2578,46 @@ function App() {
     }, 300);
     return () => window.clearTimeout(timer);
   }, [projects, deviceStorageReady]);
+
+  useEffect(() => {
+    const project = editingProjectRef.current;
+    if (!project) {
+      setProjectAgentSession(null);
+      setShowProjectAgent(false);
+      return;
+    }
+    let disposed = false;
+    const storageKey = `project-agent-current-session:${project.id}`;
+    const storedId = localStorage.getItem(storageKey) || '';
+    const sessionId = /^project-agent-[a-z0-9_-]+$/iu.test(storedId) ? storedId : projectAgentSessionId();
+    localStorage.setItem(storageKey, sessionId);
+    setProjectAgentSession(null);
+    const load = '__TAURI_INTERNALS__' in window
+      ? invoke<ProjectAgentSession | null>('load_agent_chat', { projectId: String(project.id), sessionId })
+      : Promise.resolve((() => { try { return JSON.parse(localStorage.getItem(`project-agent-chat:${project.id}:${sessionId}`) || 'null') as ProjectAgentSession | null; } catch { return null; } })());
+    void load.then(value => {
+      if (!disposed) setProjectAgentSession(normalizeProjectAgentSession(value, editingProjectRef.current?.id === project.id ? editingProjectRef.current : project, sessionId));
+    }).catch(error => {
+      console.warn('读取项目 Agent 会话失败', error);
+      if (!disposed) setProjectAgentSession(createProjectAgentSession(project.id, sessionId));
+    });
+    return () => { disposed = true; };
+  }, [editingProject?.id]);
+
+  useEffect(() => {
+    if (!projectAgentSession) return;
+    const timer = window.setTimeout(() => {
+      const session = { ...projectAgentSession, updatedAt: new Date().toISOString() };
+      if ('__TAURI_INTERNALS__' in window) {
+        void invoke<string>('save_agent_chat', { projectId: String(session.projectId), sessionId: session.sessionId, session })
+          .catch(error => console.warn('保存项目 Agent 会话失败', error));
+      } else {
+        try { localStorage.setItem(`project-agent-chat:${session.projectId}:${session.sessionId}`, JSON.stringify(session)); }
+        catch (error) { console.warn('保存项目 Agent 会话失败', error); }
+      }
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [projectAgentSession]);
 
   useEffect(() => {
     if (!resourceStorageReady) return;
@@ -4072,6 +4529,138 @@ function App() {
     setProjects(current => current.map(project => project.id === updated.id ? updated : project));
   };
 
+  const startNewProjectAgentSession = () => {
+    const project = editingProjectRef.current;
+    if (!project || projectAgentRunning) return;
+    const sessionId = projectAgentSessionId();
+    localStorage.setItem(`project-agent-current-session:${project.id}`, sessionId);
+    setProjectAgentSession(createProjectAgentSession(project.id, sessionId));
+    setProjectAgentInput('');
+    setProjectAgentActivity([]);
+    setProjectAgentProgress(0);
+  };
+
+  const runProjectAgentChat = async () => {
+    const project = editingProjectRef.current;
+    const session = projectAgentSessionRef.current;
+    const instruction = projectAgentInput.trim();
+    if (!project || !session || !instruction || projectAgentRunning) return;
+    if (!agentConfig.enabled || !agentConfig.apiKey.trim()) {
+      setNotice({ title: '需要 API Key', content: '请先在设置中填写模型 API Key，再运行项目 Agent。' });
+      return;
+    }
+    const userMessage: ProjectAgentMessage = { id: `message-${Date.now()}-user`, role: 'user', content: instruction, createdAt: new Date().toISOString() };
+    const runId = `project-agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    projectAgentRunRef.current = runId;
+    setProjectAgentInput('');
+    setProjectAgentRunning(true);
+    setProjectAgentProgress(1);
+    setProjectAgentActivity([{ id: 'starting', message: '正在启动项目 Agent', status: 'active' }]);
+    setProjectAgentSession(current => current ? { ...current, messages: [...current.messages, userMessage], updatedAt: new Date().toISOString() } : current);
+    try {
+      await invoke<string>('start_agent_runtime');
+      const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
+      const result = await invoke<ProjectAgentResponse>('call_agent_rpc', {
+        method: 'project.agent.chat',
+        params: {
+          runId,
+          sessionId: session.sessionId,
+          mode: session.mode,
+          instruction,
+          project,
+          activeChapterId: activeChapter?.id,
+          history: session.messages.slice(-12).map(message => ({ role: message.role, content: message.content })),
+          writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
+          skills: skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          apiKey: agentConfig.apiKey.trim(),
+          apiKeys: agentConfig.apiKeys,
+          baseURL: agentConfig.baseURL.trim(),
+          model: agentConfig.model.trim() || fallbackModels[0],
+          apiMode: agentConfig.apiMode,
+          reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow,
+          ...agentNetworkParams(agentConfig),
+        },
+      });
+      const latestProject = editingProjectRef.current;
+      if (!latestProject || latestProject.id !== project.id) throw new Error('当前小说已切换，已丢弃旧项目 Agent 回复');
+      const proposed = Array.isArray(result.changes)
+        ? result.changes.map((change, index) => normalizeProjectAgentChange(change, latestProject, index)).filter((change): change is ProjectAgentChange => Boolean(change))
+        : [];
+      const assistantMessage: ProjectAgentMessage = {
+        id: `message-${Date.now()}-assistant`,
+        role: 'assistant',
+        content: typeof result.message === 'string' && result.message.trim() ? result.message.trim() : (proposed.length ? `已生成 ${proposed.length} 项待确认变更。` : '任务已完成。'),
+        createdAt: new Date().toISOString(),
+        toolEvents: Array.isArray(result.toolEvents) ? result.toolEvents.filter(event => event && typeof event.tool === 'string' && typeof event.message === 'string').slice(0, 30) : [],
+        changeIds: proposed.map(change => change.id),
+      };
+      setProjectAgentSession(current => current ? {
+        ...current,
+        messages: [...current.messages, assistantMessage].slice(-200),
+        changes: [...current.changes, ...proposed].slice(-80),
+        updatedAt: new Date().toISOString(),
+      } : current);
+      setProjectAgentProgress(100);
+    } catch (error) {
+      const message = String(error);
+      setProjectAgentSession(current => current ? {
+        ...current,
+        messages: [...current.messages, { id: `message-${Date.now()}-error`, role: 'assistant' as const, content: message, createdAt: new Date().toISOString(), error: true }].slice(-200),
+        updatedAt: new Date().toISOString(),
+      } : current);
+      setProjectAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, message, status: 'error' as const }].slice(-20));
+    } finally {
+      setProjectAgentRunning(false);
+    }
+  };
+
+  const applyPendingProjectAgentChanges = async (ids?: string[]) => {
+    const currentProject = editingProjectRef.current;
+    const session = projectAgentSessionRef.current;
+    if (!currentProject || !session || projectAgentRunning) return;
+    const selected = ids ? new Set(ids) : null;
+    const pending = session.changes.filter(change => change.status === 'pending' && (!selected || selected.has(change.id)));
+    try {
+      const result = applyProjectAgentChangeBatch(currentProject, pending);
+      const nextProjects = projectsRef.current.map(project => project.id === result.project.id ? result.project : project);
+      if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
+      else localStorage.setItem('projects', JSON.stringify(nextProjects));
+      setProjects(nextProjects);
+      setEditingProject(result.project);
+      if (result.createdChapterId) {
+        const chapter = result.project.chapters.find(item => item.id === result.createdChapterId) || null;
+        setActiveChapter(chapter);
+        setEditorSidebarTab('chapters');
+      } else if (activeChapter) {
+        setActiveChapter(result.project.chapters.find(item => item.id === activeChapter.id) || result.project.chapters[0] || null);
+      }
+      const appliedIds = new Set(pending.map(change => change.id));
+      const appliedTargets = new Set(pending.map(projectAgentChangeTargetKey));
+      setProjectAgentSession(current => current ? {
+        ...current,
+        changes: current.changes.map(change => {
+          if (appliedIds.has(change.id)) return { ...change, status: 'applied' };
+          if (change.status !== 'pending' || appliedTargets.has(projectAgentChangeTargetKey(change))) return change;
+          return projectAgentRebase(change, result.project);
+        }),
+        updatedAt: new Date().toISOString(),
+      } : current);
+      setNotice({ title: '项目 Agent 变更已应用', content: `已写入 ${pending.length} 项变更。` });
+    } catch (error) {
+      setNotice({ title: '无法应用项目 Agent 变更', content: String(error) });
+    }
+  };
+
+  const dismissProjectAgentChanges = (ids?: string[]) => {
+    const selected = ids ? new Set(ids) : null;
+    setProjectAgentSession(current => current ? {
+      ...current,
+      changes: current.changes.map(change => change.status === 'pending' && (!selected || selected.has(change.id)) ? { ...change, status: 'dismissed' } : change),
+      updatedAt: new Date().toISOString(),
+    } : current);
+  };
+
   const parseChineseChapterNumber = (value: string): number | undefined => {
     const normalized = value.replace(/\s+/gu, '');
     if (/^\d+$/u.test(normalized)) return Number(normalized);
@@ -4821,6 +5410,7 @@ function App() {
       const clientState = Object.fromEntries([
         'agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
         'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
+        ...snapshot.map(project => `project-agent-current-session:${project.id}`),
       ].map(key => [key, localStorage.getItem(key)]));
       clientState['agent-config'] = JSON.stringify(agentConfig);
       clientState['agent-profiles'] = JSON.stringify(agentProfiles);
@@ -4834,6 +5424,12 @@ function App() {
       clientState['writer-writing-styles'] = JSON.stringify(writingStyles);
       clientState['cloud-remote-path'] = remotePath;
       clientState['backup-manifest'] = JSON.stringify(backupManifest);
+      // 项目 Agent 会话存在 app-data 目录里，备份包只认 clientState，需要单独导出
+      try {
+        clientState['agent-chats'] = JSON.stringify(await invoke<Record<string, unknown>>('export_agent_chats'));
+      } catch (error) {
+        console.warn('导出项目 Agent 会话失败，本次备份不含聊天记录', error);
+      }
       await invoke<{ message?: string; remotePath?: string }>('backup_projects_to_baidu', { remotePath, clientState });
       localStorage.setItem('cloud-remote-path', remotePath);
       setCloudSyncMessage(`完整备份完成：小说 ${snapshot.length}、书籍 ${libraryBooks.length}、拆书 ${dismantleBooks.length}、榜单 ${rankingBooks.length}、文风 ${writingStyles.length}。`);
@@ -4883,6 +5479,14 @@ function App() {
         backupFsId: selectedBackup.fsId,
       });
       const restoredState = result.clientState || {};
+      if (typeof restoredState['agent-chats'] === 'string') {
+        // 聊天记录恢复失败不应该阻断小说数据恢复
+        try {
+          await invoke<number>('import_agent_chats', { sessions: JSON.parse(restoredState['agent-chats']) });
+        } catch (error) {
+          console.warn('恢复项目 Agent 会话失败', error);
+        }
+      }
       const parseState = (key: string): unknown => {
         try {
           const value = restoredState[key];
@@ -4951,7 +5555,7 @@ function App() {
           localStorage.setItem(key, value);
         });
       }
-      const lightweightState = ['agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage', 'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path'];
+      const lightweightState = ['agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage', 'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path', ...Object.keys(restoredState).filter(key => key.startsWith('project-agent-current-session:'))];
       lightweightState.forEach(key => {
         const value = restoredState[key];
         if (typeof value !== 'string') return;
@@ -5577,6 +6181,33 @@ function App() {
       degree: edges.filter(edge => edge.source === position.id || edge.target === position.id).length,
     }));
   })();
+  const projectAgentPendingChanges = projectAgentSession?.changes.filter(change => change.status === 'pending') || [];
+  const projectAgentChangeLabel = (change: ProjectAgentChange) => {
+    switch (change.type) {
+      case 'project.update': return '更新小说资料';
+      case 'outline.upsert': return change.targetId ? '更新大纲' : '新建大纲';
+      case 'card.upsert': return change.targetId ? '更新卡片' : '新建卡片';
+      case 'memory.document.upsert': return '整理记忆文档';
+      case 'graph.node.upsert': return '更新图谱节点';
+      case 'graph.edge.upsert': return '更新图谱关系';
+      case 'chapter.create': return '新建章节草稿';
+    }
+  };
+  const projectAgentChangeDetail = (change: ProjectAgentChange) => {
+    if (change.type === 'project.update') return Object.keys(change.patch).join('、');
+    if (change.type === 'outline.upsert') return `${change.kind} · ${change.title}`;
+    if (change.type === 'card.upsert') return `${change.cardType} · ${change.title}`;
+    if (change.type === 'memory.document.upsert') return `${change.kind} · ${change.title}`;
+    if (change.type === 'graph.node.upsert') return `${change.nodeType} · ${change.label}`;
+    if (change.type === 'graph.edge.upsert') return `${change.source} -[${change.label}]-> ${change.target}`;
+    return `${change.title} · ${countNovelCharacters(change.content).toLocaleString()} 字`;
+  };
+  const projectAgentChangePreview = (change: ProjectAgentChange) => {
+    if (change.type === 'project.update') return JSON.stringify(change.patch, null, 2);
+    if (change.type === 'outline.upsert' || change.type === 'card.upsert' || change.type === 'memory.document.upsert' || change.type === 'chapter.create') return change.content;
+    if (change.type === 'graph.node.upsert') return change.content || change.nodeStatus || projectAgentChangeDetail(change);
+    return projectAgentChangeDetail(change);
+  };
   const visibleSkills = skills.filter(skill => {
     const matchesCategory = !skillCategoryFilter || skill.category === skillCategoryFilter;
     const query = skillSearch.trim().toLowerCase();
@@ -5671,6 +6302,7 @@ function App() {
           <header className="editor-header">
             <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
             <h2>{editingProject.title}</h2>
+            <button className={`editor-tool-button project-agent-toggle ${showProjectAgent ? 'active' : ''}`} title="打开项目 Agent 对话" onClick={() => setShowProjectAgent(current => !current)}><span aria-hidden="true">✦</span> 项目 Agent{projectAgentPendingChanges.length ? ` ${projectAgentPendingChanges.length}` : ''}</button>
             {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && <>
               <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
@@ -5685,6 +6317,20 @@ function App() {
             {cardMode && <span className="editor-mode-label">卡片编辑</span>}
             {styleMode && <span className="editor-mode-label">作品文风</span>}
           </header>
+
+          {showProjectAgent && <aside className="project-agent-drawer" aria-label="项目 Agent 对话">
+            <header className="project-agent-header">
+              <div><strong>项目 Agent</strong><small>仅操作《{editingProject.title}》</small></div>
+              <div className="project-agent-header-actions"><button className="icon-button" title="新建会话" disabled={projectAgentRunning} onClick={startNewProjectAgentSession}>＋</button><button className="icon-button" title="关闭" onClick={() => setShowProjectAgent(false)}>×</button></div>
+            </header>
+            <div className="project-agent-mode" role="tablist" aria-label="项目 Agent 模式"><button className={projectAgentSession?.mode === 'discuss' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'discuss' } : current)}>讨论</button><button className={projectAgentSession?.mode === 'execute' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current)}>执行</button></div>
+            <div className="project-agent-messages">
+              {!projectAgentSession ? <div className="project-agent-empty"><strong>正在读取会话</strong></div> : projectAgentSession.messages.length === 0 ? <div className="project-agent-empty"><strong>讨论全书，或让 Agent 整理项目</strong><span>执行模式下，所有写入都会先生成待确认变更。</span></div> : projectAgentSession.messages.map(message => <article key={message.id} className={`project-agent-message ${message.role} ${message.error ? 'error' : ''}`}><small>{message.role === 'user' ? '你' : '项目 Agent'}</small><p>{message.content}</p>{message.toolEvents?.length ? <div className="project-agent-tools">{message.toolEvents.map((event, index) => <span className={event.status} key={`${message.id}-${event.tool}-${index}`}><b>{event.tool}</b>{event.message}</span>)}</div> : null}</article>)}
+              {projectAgentRunning && <section className="project-agent-running" aria-live="polite"><div><strong>正在处理项目</strong><span>{projectAgentProgress}%</span></div><i><b style={{ width: `${projectAgentProgress}%` }} /></i>{projectAgentActivity.map(item => <span className={item.status} key={item.id}>{item.message}</span>)}</section>}
+              {projectAgentPendingChanges.length > 0 && <section className="project-agent-changes"><header><div><strong>待确认变更</strong><small>{projectAgentPendingChanges.length} 项，应用前不会写入</small></div><button className="link-button" disabled={projectAgentRunning} onClick={() => dismissProjectAgentChanges()}>全部放弃</button></header>{projectAgentPendingChanges.map(change => <article key={change.id}><div><strong>{projectAgentChangeLabel(change)}</strong><small>{change.summary}</small><span>{projectAgentChangeDetail(change)}</span><details><summary>预览内容</summary><pre>{projectAgentChangePreview(change)}</pre></details><div className="project-agent-change-actions"><button className="btn-secondary" disabled={projectAgentRunning} onClick={() => dismissProjectAgentChanges([change.id])}>放弃</button><button className="btn-primary" disabled={projectAgentRunning} onClick={() => void applyPendingProjectAgentChanges([change.id])}>应用</button></div></div></article>)}<button className="btn-primary" disabled={projectAgentRunning} onClick={() => void applyPendingProjectAgentChanges()}>应用全部变更</button></section>}
+            </div>
+            <footer className="project-agent-composer"><textarea value={projectAgentInput} disabled={!projectAgentSession || projectAgentRunning} onChange={event => setProjectAgentInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); void runProjectAgentChat(); } }} placeholder={projectAgentSession?.mode === 'execute' ? '例如：整理所有角色卡，并补充知识图谱关系' : '询问全书设定、剧情、人物或伏笔'} /><div><small>Ctrl / ⌘ + Enter 发送</small><button className="btn-primary" disabled={!projectAgentInput.trim() || !projectAgentSession || projectAgentRunning} onClick={() => void runProjectAgentChat()}>{projectAgentRunning ? '处理中...' : '发送'}</button></div></footer>
+          </aside>}
 
           {notice && (
             <div className="editor-notice" role="status" aria-live="polite">

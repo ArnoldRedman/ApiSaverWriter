@@ -5,6 +5,7 @@ import { ApiSaverClient, getRuntimeUsageSummary, normalizeWireMode } from "./mod
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, LruCache, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
+import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { ProxyAgent } from "undici";
 import { load as loadHtml } from "cheerio";
 import iconv from "iconv-lite";
@@ -1981,6 +1982,176 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         result = (ending > numericLimit * 0.55 ? limited.slice(0, ending + 1) : limited).trim();
       }
       return { id: req.id, result: { content: result } };
+    }
+    if (req.method === "project.agent.chat") {
+      const { mode, instruction, project, history, activeChapterId, sessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      if (!apiKey || !instruction || !project || typeof project !== "object") {
+        return { id: req.id, error: { code: -32602, message: "缺少项目 Agent 所需的小说、指令或模型配置" } };
+      }
+      const projectRecord = project as Record<string, unknown>;
+      const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
+      const emitProjectEvent = (event: Record<string, unknown>) => {
+        if (runId) process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event: { ...event, timestamp: Date.now() } }) + "\n");
+      };
+      emitProjectEvent({ type: "progress", data: { step: "project-search", progress: 8, message: "正在检索全书章节、大纲、卡片、记忆和知识图谱" } });
+      const client = new ApiSaverClient({
+        apiKey: String(apiKey),
+        apiKeys: stringList(apiKeys, 12),
+        baseURL: String(baseURL || "https://api.apisaver.com/v1"),
+        defaultModel: String(model || "gpt-4o-mini"),
+        apiMode: normalizeWireMode(apiMode),
+        reasoningMode: String(reasoningMode || "auto"),
+        contextWindowKB: Number(contextWindow) || undefined,
+        ...networkProxyConfig(req.params),
+      });
+      // 三个委托都直接复用应用里已有的专用智能体 RPC，Agent 自己不写内容。
+      // `...req.params` 会把 apiKey、skills、writingStyle 等一并带过去，和界面上点按钮走同一条路。
+      const projectList = (key: string) => Array.isArray(projectRecord[key])
+        ? (projectRecord[key] as unknown[]).filter(item => item && typeof item === "object") as Array<Record<string, unknown>>
+        : [];
+      const projectKnowledgeGraph = {
+        nodes: Array.isArray(projectRecord.graphNodes) ? projectRecord.graphNodes : [],
+        edges: Array.isArray(projectRecord.graphEdges) ? projectRecord.graphEdges : [],
+      };
+      const delegateBase = (suffix: string) => ({
+        ...req.params,
+        runId: runId ? `${runId}:${suffix}` : "",
+        sessionId: `${String(sessionId || "project-agent")}:${suffix}`,
+        previousSessionId: "",
+        projectId: String(projectRecord.id || "project"),
+        projectTitle: String(projectRecord.title || "未命名小说"),
+        synopsis: projectRecord.synopsis,
+      });
+      const delegateResult = async (suffix: string, method: string, params: Record<string, unknown>) => {
+        const delegated = await handleRequest({ id: `${String(req.id)}:${suffix}`, method, params });
+        if (delegated.error) throw new Error(delegated.error.message);
+        return delegated.result && typeof delegated.result === "object" ? delegated.result as Record<string, unknown> : {};
+      };
+
+      const delegateOutline = async (request: ProjectAgentOutlineRequest) => {
+        emitProjectEvent({ type: "progress", data: { step: "outline-delegate", progress: 40, message: `已委托大纲智能体处理《${request.title}》` } });
+        const outlines = projectList("outlines");
+        const target = request.targetId ? outlines.find(item => Number(item.id) === request.targetId) : undefined;
+        const result = await delegateResult("outline", "outline.write", {
+          ...delegateBase("outline"),
+          outlineId: request.targetId,
+          kind: request.kind,
+          existingContent: String(target?.content || ""),
+          instruction: request.instruction,
+          cards: projectList("cards"),
+          knowledgeGraph: projectKnowledgeGraph,
+          worldSetting: outlines.filter(item => String(item.kind || "") === "世界观与作品设定")
+            .map(item => ({ id: item.id, title: item.title, content: item.content })),
+          authorPreferences: Array.isArray(projectRecord.authorPreferences) ? projectRecord.authorPreferences : [],
+        });
+        const content = String(result.content || "").trim();
+        if (!content) throw new Error("大纲智能体没有返回内容");
+        return { type: "outline.upsert" as const, summary: request.summary, targetId: request.targetId, kind: request.kind, title: request.title, content };
+      };
+
+      const delegateCard = async (request: ProjectAgentCardRequest) => {
+        emitProjectEvent({ type: "progress", data: { step: "card-delegate", progress: 44, message: `已委托卡片智能体处理《${request.title}》` } });
+        const cards = projectList("cards");
+        const target = request.targetId ? cards.find(item => Number(item.id) === request.targetId) : undefined;
+        const activeChapter = projectList("chapters").find(item => String(item.id) === String(activeChapterId));
+        const result = await delegateResult("card", "card.write", {
+          ...delegateBase("card"),
+          cardType: request.cardType,
+          cardTitle: request.title,
+          existingContent: String(target?.content || ""),
+          instruction: request.instruction,
+          chapterTitle: activeChapter?.title,
+          chapterContent: String(activeChapter?.content || "").slice(-6000),
+          outlines: projectList("outlines").slice(-4).map(item => ({ kind: item.kind, content: item.content })),
+          cards: cards.filter(item => Number(item.id) !== request.targetId).slice(-8),
+        });
+        const content = String(result.content || "").trim();
+        if (!content) throw new Error("卡片智能体没有返回内容");
+        return {
+          type: "card.upsert" as const,
+          summary: request.summary,
+          targetId: request.targetId,
+          cardType: request.cardType,
+          title: String(result.title || request.title).trim() || request.title,
+          content,
+          currentState: typeof target?.currentState === "string" ? target.currentState : undefined,
+        };
+      };
+
+      const delegateChapter = async (request: ProjectAgentChapterRequest) => {
+        emitProjectEvent({ type: "progress", data: { step: "chapter-delegate", progress: 32, message: "已委托章节智能体规划并起草下一章" } });
+        const chapters = Array.isArray(projectRecord.chapters)
+          ? projectRecord.chapters.filter(item => item && typeof item === "object") as Array<Record<string, unknown>>
+          : [];
+        const outlines = Array.isArray(projectRecord.outlines)
+          ? projectRecord.outlines.filter(item => item && typeof item === "object") as Array<Record<string, unknown>>
+          : [];
+        const memories = Array.isArray(projectRecord.memories)
+          ? projectRecord.memories.filter(item => item && typeof item === "object") as Array<Record<string, unknown>>
+          : [];
+        const nextNumber = chapters.length + 1;
+        const title = request.title?.trim() || `第 ${nextNumber} 章`;
+        const targetOutline = request.outlineId
+          ? outlines.find(item => Number(item.id) === request.outlineId)
+          : outlines.find(item => String(item.kind || "") === "章纲" && !chapters.some(chapter => String(chapter.id) === String(item.chapterId)))
+            || [...outlines].reverse().find(item => String(item.kind || "") === "章纲");
+        const previousChapter = chapters.at(-1);
+        const previousMemory = previousChapter
+          ? memories.find(item => String(item.chapterId) === String(previousChapter.id))
+          : undefined;
+        const delegated = await handleRequest({
+          id: `${String(req.id)}:chapter`,
+          method: "chapter.write",
+          params: {
+            ...req.params,
+            runId: runId ? `${runId}:chapter` : "",
+            sessionId: `${String(sessionId || "project-agent")}:chapter`,
+            previousSessionId: "",
+            projectId: String(projectRecord.id || "project"),
+            projectTitle: String(projectRecord.title || "未命名小说"),
+            chapterId: `project-agent-next-${Date.now()}`,
+            instruction: request.instruction,
+            outline: String(targetOutline?.content || ""),
+            outlines,
+            activeOutlineId: targetOutline?.id,
+            cards: Array.isArray(projectRecord.cards) ? projectRecord.cards : [],
+            previousChapters: previousChapter ? [previousChapter] : [],
+            memories: previousMemory ? [previousMemory] : [],
+            memoryDocuments: Array.isArray(projectRecord.memoryDocuments) ? projectRecord.memoryDocuments : [],
+            knowledgeGraph: {
+              nodes: Array.isArray(projectRecord.graphNodes) ? projectRecord.graphNodes : [],
+              edges: Array.isArray(projectRecord.graphEdges) ? projectRecord.graphEdges : [],
+            },
+            authorPreferences: Array.isArray(projectRecord.authorPreferences) ? projectRecord.authorPreferences : [],
+          },
+        });
+        if (delegated.error) throw new Error(delegated.error.message);
+        const result = delegated.result && typeof delegated.result === "object" ? delegated.result as Record<string, unknown> : {};
+        const content = String(result.draftContent || "").trim();
+        if (!content) throw new Error("章节智能体没有返回可用正文");
+        return {
+          type: "chapter.create" as const,
+          summary: request.summary,
+          title,
+          content,
+          chapterPlan: typeof result.chapterPlan === "string" ? result.chapterPlan : undefined,
+          chapterSummary: typeof result.summary === "string" ? result.summary : undefined,
+        };
+      };
+      emitProjectEvent({ type: "progress", data: { step: "project-plan", progress: 20, message: "正在分析请求并制定受控操作计划" } });
+      const result = await runProjectAgent({
+        mode: mode === "execute" ? "execute" : "discuss",
+        instruction: String(instruction),
+        project: projectRecord,
+        history: Array.isArray(history) ? history as Array<{ role?: unknown; content?: unknown }> : [],
+        activeChapterId,
+        contextWindowKB: contextWindow,
+        maxSteps: req.params?.maxSteps,
+        // 每次工具调用都推一条进度，让抽屉里能看到它在检索什么
+        onStep: step => emitProjectEvent({ type: "progress", data: { step: `project-${step.kind}`, progress: 24, message: step.message } }),
+      }, client, { chapter: delegateChapter, outline: delegateOutline, card: delegateCard });
+      emitProjectEvent({ type: "complete", data: { message: result.changes.length ? `已生成 ${result.changes.length} 项待确认变更` : "项目 Agent 已完成回复" } });
+      return { id: req.id, result };
     }
     if (req.method === "card.write") {
       const { projectTitle, synopsis, cardType, cardTitle, existingContent, instruction, chapterTitle, chapterContent, outlines, cards, sessionId, previousSessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};

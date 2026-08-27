@@ -267,8 +267,9 @@ const mobileBackupBundle = async (clientState: Record<string, string | null>) =>
     ['agent-config.json', 'agent-config'],
     ['writer-skills.json', 'writer-skills'],
     ['backup-manifest.json', 'backup-manifest'],
+    ['agent-chats.json', 'agent-chats'],
   ];
-  const entries = [['client-state.json', state], ...snapshotFiles.map(([file, key]) => [file, encoder.encode(stringValue(clientState[key], key === 'agent-config' || key === 'backup-manifest' ? '{}' : '[]'))] as [string, Uint8Array])] as Array<[string, Uint8Array]>;
+  const entries = [['client-state.json', state], ...snapshotFiles.map(([file, key]) => [file, encoder.encode(stringValue(clientState[key], key === 'agent-config' || key === 'backup-manifest' || key === 'agent-chats' ? '{}' : '[]'))] as [string, Uint8Array])] as Array<[string, Uint8Array]>;
   const parts: Uint8Array[] = [backupMagic, u64(entries.length)];
   entries.forEach(([path, content]) => {
     const pathBytes = encoder.encode(path);
@@ -312,6 +313,7 @@ const readMobileBackupBundle = async (bytes: Uint8Array) => {
     ['agent-config.json', 'agent-config'],
     ['writer-skills.json', 'writer-skills'],
     ['backup-manifest.json', 'backup-manifest'],
+    ['agent-chats.json', 'agent-chats'],
   ];
   snapshotFiles.forEach(([file, key]) => {
     if (typeof state[key] !== 'string' && typeof files[file] === 'string') state[key] = files[file];
@@ -566,7 +568,7 @@ const mobileBaiduBackup = async (remotePath: string, clientState: Record<string,
   await mobileBaiduEnsureDirectory(path);
   const remoteFile = await mobileBaiduUpload(path, bundle);
   emitCloudProgress('完整备份已上传到百度网盘。');
-  return { remotePath: path, remoteFile, size: bundle.byteLength, scope: 'projects, books, dismantles, rankings, styles, client-state' };
+  return { remotePath: path, remoteFile, size: bundle.byteLength, scope: 'projects, books, dismantles, rankings, styles, agent-chats, client-state' };
 };
 
 const mobileBaiduRestore = async (remotePath: string, backupPath: string, backupFsId?: string) => {
@@ -907,7 +909,8 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const thinkingBudget = apiMode === 'anthropic' ? anthropicThinkingBudget[reasoningMode] : undefined;
   const temperature = jsonMode ? 0.2 : 0.7;
   // Anthropic rejects a thinking budget that is not strictly below max_tokens.
-  const maxTokens = Math.max(jsonMode ? 1300 : 6000, thinkingBudget ? thinkingBudget + 1024 : 0);
+  const requestedMaxTokens = Math.max(0, Math.min(8000, Number(params.maxOutputTokens) || 0));
+  const maxTokens = Math.max(jsonMode ? 1300 : 6000, requestedMaxTokens, thinkingBudget ? thinkingBudget + 1024 : 0);
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: onChunk ? 'text/event-stream' : 'application/json' };
   const body: Record<string, unknown> = apiMode === 'anthropic'
     ? (() => {
@@ -1479,8 +1482,111 @@ const mobileSearchAllQianyue = async (query: string) => {
   return { books, searchedSourceCount: sources.length, responsiveSourceCount, failedSourceCount };
 };
 
+const mobileProjectAgentContext = (params: MobileParams) => {
+  const project = params.project && typeof params.project === 'object' ? params.project as Record<string, unknown> : {};
+  const instruction = stringValue(params.instruction);
+  const needsContinuity = /下一章|续写|继续写|章节草稿|创作下一章/u.test(instruction);
+  const terms = Array.from(new Set(instruction.toLocaleLowerCase().split(/[\s，。！？、；：,.!?;:()（）【】\u005B\u005D]+/u).filter(term => term.length >= 2))).slice(0, 16);
+  const records = (value: unknown) => Array.isArray(value) ? value.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>> : [];
+  const excerpt = (content: string, tail = false) => {
+    const lower = content.toLocaleLowerCase();
+    const term = terms.find(item => lower.includes(item));
+    if (term) {
+      const position = lower.indexOf(term);
+      return mobileCompactPromptText(content.slice(Math.max(0, position - 150), Math.min(content.length, position + term.length + 320)), 1600);
+    }
+    return mobileCompactPromptText(tail ? content.slice(-3500) : content, tail ? 1800 : 700);
+  };
+  const choose = (value: unknown, fields: string[], limit: number, kind: 'chapter' | 'document' = 'document') => records(value).map((item, index, all) => {
+    const content = fields.map(field => stringValue(item[field])).join('\n');
+    const score = terms.reduce((total, term) => total + (content.toLocaleLowerCase().includes(term) ? 2 : 0), 0) + index / 1000;
+    const compact = Object.fromEntries(['id', ...fields].flatMap(key => {
+      const field = item[key];
+      if (field === undefined) return [];
+      return [[key, typeof field === 'string' && field.length > 900 ? excerpt(field, kind === 'chapter' && needsContinuity && index === all.length - 1) : field]];
+    }));
+    return { item: compact, score };
+  }).sort((left, right) => right.score - left.score).slice(0, limit).map(entry => entry.item);
+  return {
+    id: project.id,
+    title: project.title,
+    synopsis: project.synopsis,
+    genre: project.genre,
+    subgenre: project.subgenre,
+    protagonist1: project.protagonist1,
+    protagonist2: project.protagonist2,
+    status: project.status,
+    chapters: choose(project.chapters, ['title', 'content'], 6, 'chapter'),
+    outlines: choose(project.outlines, ['kind', 'title', 'content'], 6),
+    cards: choose(project.cards, ['type', 'title', 'content', 'currentState'], 10),
+    memories: choose(project.memories, ['chapterTitle', 'summary', 'endingHook'], 5),
+    memoryDocuments: choose(project.memoryDocuments, ['kind', 'title', 'content'], 4),
+    graphNodes: choose(project.graphNodes, ['label', 'category', 'content', 'status'], 16),
+    graphEdges: records(project.graphEdges).slice(-40),
+  };
+};
+
+const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
+  const mode = params.mode === 'execute' ? 'execute' : 'discuss';
+  const runId = stringValue(params.runId);
+  emitProgress(runId, { type: 'progress', data: { step: 'project-search', progress: 8, message: '正在检索当前小说资料' } });
+  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next';
+  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
+  emitProgress(runId, { type: 'progress', data: { step: 'project-plan', progress: 22, message: '正在分析请求并制定操作计划' } });
+  const response = await mobileChat({ ...params, maxOutputTokens: 6500 }, [
+    { role: 'system', content: '保持小说资料一致，只返回约定 JSON；所有修改都只是待确认提案。' },
+    { role: 'user', content: prompt },
+  ], undefined, true);
+  const parsed = parseJSON<Record<string, unknown>>(response.content) || {};
+  const planned = mode === 'execute' && Array.isArray(parsed.changes) ? parsed.changes.slice(0, 12) : [];
+  const changes: unknown[] = [];
+  const toolEvents: Array<{ tool: string; status: 'complete' | 'error'; message: string }> = [{ tool: 'project.search', status: 'complete', message: '已检索当前小说资料' }];
+  const project = params.project && typeof params.project === 'object' ? params.project as Record<string, unknown> : {};
+  const chapters = Array.isArray(project.chapters) ? project.chapters : [];
+  const outlines = Array.isArray(project.outlines) ? project.outlines : [];
+  for (const item of planned) {
+    if (!item || typeof item !== 'object' || (item as Record<string, unknown>).type !== 'chapter.draft_next') {
+      changes.push(item);
+      continue;
+    }
+    const request = item as Record<string, unknown>;
+    try {
+      emitProgress(runId, { type: 'progress', data: { step: 'chapter-delegate', progress: 36, message: '正在委托章节智能体起草下一章' } });
+      const outlineId = Number(request.outlineId);
+      const outline = outlines.find(entry => entry && typeof entry === 'object' && Number((entry as Record<string, unknown>).id) === outlineId) as Record<string, unknown> | undefined;
+      const { project: _project, history: _history, instruction: _projectInstruction, mode: _projectMode, ...modelParams } = params;
+      const drafted = await mobileAgentRpc<Record<string, unknown>>('chapter.write', {
+        ...modelParams,
+        // 独立 runId：避免章节智能体的 complete 事件把项目 Agent 的进度提前推到 100%
+        runId: runId ? `${runId}:chapter` : '',
+        maxOutputTokens: 8000,
+        projectId: project.id,
+        projectTitle: project.title,
+        chapterId: `project-agent-next-${Date.now()}`,
+        instruction: stringValue(request.instruction),
+        outline: stringValue(outline?.content),
+        outlines,
+        cards: Array.isArray(project.cards) ? project.cards : [],
+        previousChapters: chapters.length ? [chapters[chapters.length - 1]] : [],
+        memories: Array.isArray(project.memories) ? project.memories.slice(-2) : [],
+        memoryDocuments: Array.isArray(project.memoryDocuments) ? project.memoryDocuments : [],
+        knowledgeGraph: { nodes: project.graphNodes || [], edges: project.graphEdges || [] },
+      });
+      const content = stringValue(drafted.draftContent || drafted.content).trim();
+      if (!content) throw new Error('章节智能体没有返回可用正文');
+      changes.push({ type: 'chapter.create', summary: stringValue(request.summary, '起草下一章'), title: stringValue(request.title, `第 ${chapters.length + 1} 章`), content, chapterPlan: stringValue(drafted.chapterPlan), chapterSummary: stringValue(drafted.summary) });
+      toolEvents.push({ tool: 'chapter.draft_next', status: 'complete', message: '章节草稿已生成' });
+    } catch (error) {
+      toolEvents.push({ tool: 'chapter.draft_next', status: 'error', message: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  emitProgress(runId, { type: 'complete', data: { message: changes.length ? `已生成 ${changes.length} 项待确认变更` : '项目 Agent 已完成回复' } });
+  return { message: stringValue(parsed.message, changes.length ? `已生成 ${changes.length} 项待确认变更。` : '任务已完成。'), changes, toolEvents } as T;
+};
+
 const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<T> => {
   if (method === 'usage.summary') return readUsage() as T;
+  if (method === 'project.agent.chat') return mobileProjectAgentChat<T>(params);
   if (method === 'ranking.categories') return mobileNovelCatchCategories() as T;
   if (method === 'ranking.fetch') return mobileRankingFetch(params) as T;
   if (method === 'book.search.all' || method === 'book.search') {

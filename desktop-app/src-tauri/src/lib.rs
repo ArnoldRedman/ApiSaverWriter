@@ -341,7 +341,7 @@ fn copy_cloud_backup_contents(source: &Path, target: &Path) -> Result<(), String
     Ok(())
 }
 
-const CLOUD_BACKUP_DIRECTORIES: [&str; 5] = ["projects", "books", "dismantles", "rankings", "styles"];
+const CLOUD_BACKUP_DIRECTORIES: [&str; 6] = ["projects", "books", "dismantles", "rankings", "styles", "agent-chats"];
 const CLOUD_BACKUP_BUNDLE_NAME: &str = "ApiSaverWriter-backup.aswbackup";
 const CLOUD_BACKUP_MAGIC: &[u8] = b"ASWBACKUP\x01";
 
@@ -891,6 +891,103 @@ fn restore_projects_from_baidu_blocking(app: tauri::AppHandle, remote_path: Stri
     fs::remove_dir_all(&restore_root).ok();
     let _ = app.emit("cloud-sync-progress", serde_json::json!({ "action": "restore", "stage": "done", "message": "完整应用数据已恢复，正在重新载入。" }));
     Ok(serde_json::json!({ "remotePath": remote_path, "backupPath": remote_bundle, "message": output, "reloaded": true, "clientState": client_state }))
+}
+
+fn validate_agent_chat_id(value: &str, label: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 120
+        || !trimmed.chars().all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!("{label}格式无效"));
+    }
+    Ok(trimmed.to_string())
+}
+
+#[tauri::command]
+fn load_agent_chat(app: tauri::AppHandle, project_id: String, session_id: String) -> Result<Option<Value>, String> {
+    let project_id = validate_agent_chat_id(&project_id, "小说 ID")?;
+    let session_id = validate_agent_chat_id(&session_id, "会话 ID")?;
+    let path = app_data_directory(&app)?.join("agent-chats").join(project_id).join(format!("{session_id}.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path).map_err(|error| format!("读取项目 Agent 会话失败: {error}"))?;
+    serde_json::from_str(&content).map(Some).map_err(|error| format!("项目 Agent 会话格式错误: {error}"))
+}
+
+#[tauri::command]
+fn save_agent_chat(app: tauri::AppHandle, project_id: String, session_id: String, session: Value) -> Result<String, String> {
+    let project_id = validate_agent_chat_id(&project_id, "小说 ID")?;
+    let session_id = validate_agent_chat_id(&session_id, "会话 ID")?;
+    if !session.is_object() {
+        return Err("项目 Agent 会话必须是对象".to_string());
+    }
+    let directory = app_data_directory(&app)?.join("agent-chats").join(project_id);
+    fs::create_dir_all(&directory).map_err(|error| format!("创建项目 Agent 会话目录失败: {error}"))?;
+    let path = directory.join(format!("{session_id}.json"));
+    let temporary = directory.join(format!("{session_id}.tmp"));
+    fs::write(&temporary, serde_json::to_vec_pretty(&session).map_err(|error| format!("序列化项目 Agent 会话失败: {error}"))?)
+        .map_err(|error| format!("写入项目 Agent 会话失败: {error}"))?;
+    // Windows 上 fs::rename 会直接替换已存在的目标文件，先删除反而会多出一个文件缺失的窗口
+    fs::rename(&temporary, &path).map_err(|error| format!("保存项目 Agent 会话失败: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+// 百度网盘备份实际走前端 HTTP 备份包（platform.ts），Rust 的目录打包只用于本地导出，
+// 所以会话文件需要单独导出成一个 JSON 挂进 clientState 才能真正备份到云端
+#[tauri::command]
+fn export_agent_chats(app: tauri::AppHandle) -> Result<Value, String> {
+    let root = app_data_directory(&app)?.join("agent-chats");
+    let mut sessions = serde_json::Map::new();
+    if !root.exists() {
+        return Ok(Value::Object(sessions));
+    }
+    for project in fs::read_dir(&root).map_err(|error| format!("读取 Agent 会话目录失败: {error}"))? {
+        let project = project.map_err(|error| format!("读取 Agent 会话目录失败: {error}"))?;
+        if !project.path().is_dir() {
+            continue;
+        }
+        let mut files = serde_json::Map::new();
+        for entry in fs::read_dir(project.path()).map_err(|error| format!("读取 Agent 会话失败: {error}"))? {
+            let path = entry.map_err(|error| format!("读取 Agent 会话失败: {error}"))?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_stem().map(|stem| stem.to_string_lossy().into_owned()).unwrap_or_default();
+            let content = fs::read_to_string(&path).map_err(|error| format!("读取 Agent 会话失败: {error}"))?;
+            // 单个会话损坏不应该拖垮整次备份
+            if let Ok(value) = serde_json::from_str::<Value>(&content) {
+                files.insert(name, value);
+            }
+        }
+        if !files.is_empty() {
+            sessions.insert(project.file_name().to_string_lossy().into_owned(), Value::Object(files));
+        }
+    }
+    Ok(Value::Object(sessions))
+}
+
+#[tauri::command]
+fn import_agent_chats(app: tauri::AppHandle, sessions: Value) -> Result<usize, String> {
+    let projects = sessions.as_object().ok_or_else(|| "Agent 会话备份格式无效".to_string())?;
+    let root = app_data_directory(&app)?.join("agent-chats");
+    let mut restored = 0usize;
+    for (project_id, files) in projects {
+        let project_id = validate_agent_chat_id(project_id, "小说 ID")?;
+        let Some(files) = files.as_object() else {
+            continue;
+        };
+        let directory = root.join(&project_id);
+        fs::create_dir_all(&directory).map_err(|error| format!("创建 Agent 会话目录失败: {error}"))?;
+        for (session_id, session) in files {
+            let session_id = validate_agent_chat_id(session_id, "会话 ID")?;
+            let bytes = serde_json::to_vec_pretty(session).map_err(|error| format!("序列化 Agent 会话失败: {error}"))?;
+            fs::write(directory.join(format!("{session_id}.json")), bytes).map_err(|error| format!("写入 Agent 会话失败: {error}"))?;
+            restored += 1;
+        }
+    }
+    Ok(restored)
 }
 
 #[tauri::command]
@@ -2157,6 +2254,10 @@ pub fn run() {
             restore_projects_from_baidu,
             backup_project_to_github,
             load_project_from_github,
+            load_agent_chat,
+            save_agent_chat,
+            export_agent_chats,
+            import_agent_chats,
             load_projects,
             save_projects,
             load_dismantle_books,
