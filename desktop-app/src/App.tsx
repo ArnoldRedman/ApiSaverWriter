@@ -6295,6 +6295,19 @@ function App() {
   };
   gatewayPricing.sort((left, right) => gatewayInputPrice(left) - gatewayInputPrice(right));
 
+  const startupReady = !('__TAURI_INTERNALS__' in window) || (deviceStorageReady && resourceStorageReady);
+  if (!startupReady) {
+    return (
+      <div className="startup-screen" role="status" aria-live="polite">
+        <div className="startup-mark" aria-hidden="true">文</div>
+        <h1>ApiSaverWriter</h1>
+        <p>{deviceStorageReady ? '正在载入本地写作资料…' : '正在启动本地数据服务…'}</p>
+        <span className="startup-spinner" aria-hidden="true" />
+        <small>首次启动可能需要几秒，请稍候</small>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
       {editingProject ? (
