@@ -1558,9 +1558,6 @@ function App() {
   const [projectFormMode, setProjectFormMode] = useState<'create' | 'edit'>('create');
   const [projectEditingId, setProjectEditingId] = useState<number | null>(null);
   const [showSettingsModal, setShowSettingsModal] = useState(false);
-  const [showSupportAnnouncement, setShowSupportAnnouncement] = useState(false);
-  const [announcementTab, setAnnouncementTab] = useState<'notice' | 'timeline'>('notice');
-  const [announcementDontShow, setAnnouncementDontShow] = useState(false);
   const [showMobileMore, setShowMobileMore] = useState(false);
   const [showOutlineTypeModal, setShowOutlineTypeModal] = useState(false);
   const [showTagPicker, setShowTagPicker] = useState(false);
@@ -1664,7 +1661,7 @@ function App() {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
   const [usageDays, setUsageDays] = useState<UsageDay[]>(() => { try { const value = JSON.parse(localStorage.getItem('writer-runtime-usage-days') || '[]'); return Array.isArray(value) ? value : []; } catch { return []; } });
-  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync' | 'support' | 'tutorial'>('model');
+  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync' | 'tutorial'>('model');
   const [cloudRemotePath, setCloudRemotePath] = useState(() => {
     const saved = localStorage.getItem('cloud-remote-path');
     return !saved || saved === 'ApiSaverWriter/projects' ? 'ApiSaverWriter/backup' : saved;
@@ -1713,14 +1710,6 @@ function App() {
     } catch { /* Runtime may not have started yet. */ }
   };
   useEffect(() => { void invoke<string>('start_agent_runtime').then(() => syncRuntimeUsage()); }, []);
-  useEffect(() => {
-    const key = 'apisaverwriter-support-announcement-seen';
-    if (localStorage.getItem(key) !== '1') {
-      const timer = window.setTimeout(() => { setAnnouncementDontShow(false); setShowSupportAnnouncement(true); }, 650);
-      return () => window.clearTimeout(timer);
-    }
-    return undefined;
-  }, []);
   useEffect(() => {
     const timer = window.setInterval(() => { void syncRuntimeUsage(); }, 5000);
     return () => window.clearInterval(timer);
@@ -4567,29 +4556,6 @@ function App() {
     setSettingsSection('model');
   };
 
-  const openSupportLink = async (url: string, label: string, fallbackText: string) => {
-    try {
-      await invoke('open_external_url', { url });
-    } catch {
-      // Web preview and mobile builds do not expose the desktop opener.
-      const opened = window.open(url, '_blank', 'noopener,noreferrer');
-      if (!opened) window.location.href = url;
-    }
-    setNotice({ title: `正在打开${label}`, content: `${fallbackText} 已复制，正在跳转 QQ 官方页面。` });
-  };
-
-  const openQQGroup = async () => {
-    const groupNumber = '1019592334';
-    try { await navigator.clipboard.writeText(groupNumber); } catch { /* Clipboard permission is optional. */ }
-    await openSupportLink('https://qm.qq.com/q/Oc3ZAaU08K', 'QQ 群', `QQ群号 ${groupNumber}`);
-  };
-
-  const openCustomerQQ = async () => {
-    const customerQQ = '2805099052';
-    try { await navigator.clipboard.writeText(customerQQ); } catch { /* Clipboard permission is optional. */ }
-    await openSupportLink('https://qm.qq.com/q/BJKvbHWSK4', '客服 QQ', `客服 QQ ${customerQQ}`);
-  };
-
   const openTutorial = async () => {
     const url = 'https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb?from=from_copylink';
     try {
@@ -4599,11 +4565,6 @@ function App() {
       if (!opened) window.location.href = url;
     }
     setNotice({ title: '正在打开使用教程', content: '已在浏览器打开飞书使用教程。' });
-  };
-
-  const dismissSupportAnnouncement = (permanent = false) => {
-    if (permanent) localStorage.setItem('apisaverwriter-support-announcement-seen', '1');
-    setShowSupportAnnouncement(false);
   };
 
   const checkCloudSyncStatus = async () => {
@@ -6389,7 +6350,6 @@ function App() {
                 <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
                 <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>余额、模型价格与个人日志</small></button>
                 <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘云端备份与恢复</small></button>
-                <button className={settingsSection === 'support' ? 'active' : ''} onClick={() => setSettingsSection('support')}><strong>联系与支持</strong><small>加入 QQ 群，获取帮助与公告</small></button>
                 <button className={settingsSection === 'tutorial' ? 'active' : ''} onClick={() => setSettingsSection('tutorial')}><strong>使用教程</strong><small>快速了解核心工作流</small></button>
               </nav>
             <div className="modal-body settings-content">
@@ -6583,15 +6543,9 @@ function App() {
                 {cloudSyncMessage && <p className={`model-list-message ${/失败|错误|未找到|未登录/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
                 <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
               </section>}
-              {settingsSection === 'support' && <section className="settings-support-card">
-                <div className="settings-support-hero"><div className="settings-support-icon" aria-hidden="true">群</div><div><strong>联系与支持</strong><small>加入官方 QQ 群，获取版本更新、使用帮助和问题反馈支持。</small></div></div>
-                <div className="settings-support-group"><div><span>官方 QQ 交流群</span><strong>1019592334</strong><small>点击后打开官方 QQ 群页面，并自动复制群号。</small></div><button className="btn-primary" onClick={() => void openQQGroup()}>加入 QQ 群</button></div>
-                <div className="settings-support-group settings-customer-group"><div><span>唯一客服 QQ</span><strong>2805099052</strong><small>充值或账号问题请联系唯一客服，谨防冒充。</small></div><button className="btn-secondary" onClick={() => void openCustomerQQ()}>联系客服</button></div>
-                <div className="settings-support-notice"><strong>系统公告</strong><p>请在反馈问题时附上应用版本、运行平台和可复现步骤。我们会在群公告同步版本变更与维护通知。若网站无法充值，请联系客服充值。</p></div>
-              </section>}
               {settingsSection === 'tutorial' && <section className="settings-tutorial-card">
-                <div className="settings-tutorial-heading"><strong>使用教程</strong><small>官方飞书文档会持续更新最新功能说明与操作步骤。</small></div>
-                <div className="settings-support-group settings-tutorial-link"><div><span>ApiSaverWriter 使用教程</span><strong>飞书文档</strong><small>点击后在浏览器打开完整教程。</small></div><button className="btn-primary" onClick={() => void openTutorial()}>打开教程</button></div>
+                <div className="settings-tutorial-heading"><strong>使用教程</strong><small>飞书文档会持续更新最新功能说明与操作步骤。</small></div>
+                <div className="settings-tutorial-link"><div><span>ApiSaverWriter 使用教程</span><strong>飞书文档</strong><small>点击后在浏览器打开完整教程。</small></div><button className="btn-primary" onClick={() => void openTutorial()}>打开教程</button></div>
               </section>}
               <p className="settings-hint">保存后，编辑器中的 AI 智能体会使用模型与网络配置。密钥仅保存到本机。</p>
             </div>
@@ -6604,18 +6558,6 @@ function App() {
         </div>
       )}
 
-      {showSupportAnnouncement && (
-        <div className="modal-overlay support-announcement-overlay" onClick={() => dismissSupportAnnouncement()}>
-          <div className="modal support-announcement-modal" role="dialog" aria-modal="true" aria-labelledby="support-announcement-title" onClick={(event) => event.stopPropagation()}>
-            <div className="support-announcement-brand"><span className="support-announcement-mark" aria-hidden="true">ASW</span><div><strong>ApiSaverWriter</strong><small>系统公告</small></div><button className="modal-close" aria-label="关闭" onClick={() => dismissSupportAnnouncement()}>×</button></div>
-            <div className="support-announcement-tabs" role="tablist" aria-label="公告栏目"><button role="tab" aria-selected={announcementTab === 'notice'} className={announcementTab === 'notice' ? 'active' : ''} onClick={() => setAnnouncementTab('notice')}>公告</button><button role="tab" aria-selected={announcementTab === 'timeline'} className={announcementTab === 'timeline' ? 'active' : ''} onClick={() => setAnnouncementTab('timeline')}>更新记录</button></div>
-            <div className="support-announcement-body">
-              {announcementTab === 'notice' ? <><span className="support-announcement-kicker">欢迎使用 ApiSaverWriter</span><h3 id="support-announcement-title">写作资料、智能体与备份，都在一个工作台完成</h3><p>建议首次使用先在设置中完成模型配置，再创建作品并生成世界观。遇到模型、同步或数据恢复问题，可加入官方 QQ 群获得支持。</p><div className="support-announcement-callout"><strong>官方支持群</strong><span>1019592334</span><button className="btn-primary" onClick={() => void openQQGroup()}>加入 QQ 群</button></div><div className="support-announcement-contact"><span>唯一客服 QQ：<strong>2805099052</strong></span><button className="btn-secondary" onClick={() => void openCustomerQQ()}>联系客服</button></div></> : <><span className="support-announcement-kicker">最近更新</span><div className="support-announcement-timeline"><div><b>设置中心</b><span>新增联系与支持、使用教程入口。</span></div><div><b>数据安全</b><span>百度网盘支持完整应用备份与手动选择恢复版本。</span></div><div><b>智能写作</b><span>章节、大纲和卡片支持连续会话与流式生成。</span></div></div></>}
-            </div>
-            <div className="support-announcement-footer"><label><input type="checkbox" checked={announcementDontShow} onChange={(event) => setAnnouncementDontShow(event.target.checked)} /> 下次不再自动显示</label><button className="btn-secondary" onClick={() => dismissSupportAnnouncement(announcementDontShow)}>稍后查看</button><button className="btn-primary" onClick={() => { dismissSupportAnnouncement(true); setShowSettingsModal(true); setSettingsSection('support'); }}>打开联系与支持</button></div>
-          </div>
-        </div>
-      )}
 
       {showCloudBackupPicker && (
         <div className="modal-overlay cloud-backup-picker-overlay" onClick={() => setShowCloudBackupPicker(false)}>

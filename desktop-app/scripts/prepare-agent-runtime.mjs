@@ -10,6 +10,29 @@ const runtimeRoot = join(desktopRoot, 'src-tauri', 'runtime', 'agent-runtime');
 const sidecarEntry = join(workspaceRoot, 'sidecars', 'agent-runtime', 'dist', 'main.js');
 const nodeBinary = process.env.APISAVERWRITER_NODE_BINARY || process.execPath;
 const mobileTarget = ['android', 'ios'].includes(String(process.env.TAURI_ENV_PLATFORM || '').toLowerCase());
+const sqliteCheck = "const Database = require('better-sqlite3'); const db = new Database(':memory:'); db.close();";
+
+const runNpm = (args) => {
+  if (process.platform === 'win32') {
+    execFileSync('cmd.exe', ['/d', '/s', '/c', `npm ${args.join(' ')}`], { cwd: workspaceRoot, stdio: 'inherit' });
+    return;
+  }
+  execFileSync('npm', args, { cwd: workspaceRoot, stdio: 'inherit' });
+};
+
+const ensureNativeDependencies = () => {
+  try {
+    execFileSync(nodeBinary, ['-e', sqliteCheck], { cwd: workspaceRoot, stdio: 'pipe' });
+  } catch {
+    console.log(`Rebuilding better-sqlite3 for Node ${process.version} (ABI ${process.versions.modules})...`);
+    runNpm(['rebuild', 'better-sqlite3']);
+    try {
+      execFileSync(nodeBinary, ['-e', sqliteCheck], { cwd: workspaceRoot, stdio: 'pipe' });
+    } catch (error) {
+      throw new Error(`better-sqlite3 与打包 Node.js 不兼容，自动重编译后仍无法加载：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+};
 
 const copyPackage = (name) => {
   const source = join(workspaceRoot, 'node_modules', ...name.split('/'));
@@ -28,17 +51,8 @@ if (mobileTarget) {
   process.exit(0);
 }
 
-if (process.platform === 'win32') {
-  execFileSync('cmd.exe', ['/d', '/s', '/c', 'npm run build --workspace @apisaverwriter/agent-runtime'], {
-    cwd: workspaceRoot,
-    stdio: 'inherit',
-  });
-} else {
-  execFileSync('npm', ['run', 'build', '--workspace', '@apisaverwriter/agent-runtime'], {
-    cwd: workspaceRoot,
-    stdio: 'inherit',
-  });
-}
+runNpm(['run', 'build', '--workspace', '@apisaverwriter/agent-runtime']);
+ensureNativeDependencies();
 buildSync({
   entryPoints: [sidecarEntry],
   bundle: true,
@@ -58,5 +72,6 @@ const packagedNode = join(runtimeRoot, process.platform === 'win32' ? 'node.exe'
 if (!existsSync(nodeBinary)) throw new Error(`找不到用于打包的 Node.js：${nodeBinary}`);
 copyFileSync(nodeBinary, packagedNode);
 if (process.platform !== 'win32') chmodSync(packagedNode, 0o755);
+execFileSync(packagedNode, ['-e', sqliteCheck], { cwd: runtimeRoot, stdio: 'pipe' });
 
 console.log(`Agent runtime prepared: ${runtimeRoot}`);
