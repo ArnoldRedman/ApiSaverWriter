@@ -35,7 +35,8 @@ ApiSaverWriter/
 │   ├── src/services/            agent-client、native-client 等应用端口
 │   ├── src/platform/            移动书源、云同步等平台适配器
 │   └── src-tauri/src/
-│       ├── lib.rs               Tauri command 组合与备份/系统能力
+│       ├── lib.rs               Tauri command 组合与百度备份/系统能力
+│       ├── github_backup.rs     GitHub 差异、AI 提交说明、提交与恢复
 │       ├── project_store.rs     小说 Markdown/metadata 持久化
 │       ├── resource_store.rs    书库、榜单、拆书和文风存储
 │       └── runtime.rs           Node Agent 进程与 JSON 行 RPC 桥
