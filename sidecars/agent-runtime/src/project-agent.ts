@@ -1,13 +1,14 @@
 import { z } from "zod";
-import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@apisaverwriter/contracts";
+import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@apisaverwriter/contracts";
 export { ProjectAgentChangeSchema };
-export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentOutlineRequest } from "@apisaverwriter/contracts";
+export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@apisaverwriter/contracts";
 import { ApiSaverClient } from "./models/api-saver.js";
 import { byteLength, compactText } from "./context/context-optimizer.js";
 
 // 三个委托口子都指向应用里已经存在的智能体
 export interface ProjectAgentDelegates {
   chapter: (request: ProjectAgentChapterRequest) => Promise<ProjectAgentChapterCreate>;
+  chapterRevise: (request: ProjectAgentChapterReviseRequest) => Promise<ProjectAgentChapterUpdate>;
   outline: (request: ProjectAgentOutlineRequest) => Promise<ProjectAgentOutlineUpsert>;
   card: (request: ProjectAgentCardRequest) => Promise<ProjectAgentCardUpsert>;
 }
@@ -192,6 +193,7 @@ type ProjectAgentTurn = z.infer<typeof agentTurnSchema>;
 const changeTypeNames = new Set<string>([
   "project.update", "outline.upsert", "card.upsert", "memory.document.upsert",
   "graph.node.upsert", "graph.edge.upsert", "chapter.draft_next",
+  "chapter.revise", "chapter.delete",
 ]);
 
 function parseAgentTurn(value: string): ProjectAgentTurn {
@@ -269,7 +271,7 @@ const systemPrompt = `你是应用内的小说项目助手，可以多轮检索�
 4. 一次最多 16 项变更，任务大就分批，并在 message 里说明本轮范围。
 5. 不确定就先 search 或 open，不要靠猜。
 
-changes 里每一项只能是下列七种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
+changes 里每一项只能是下列九种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
 {"type":"project.update","summary":"修改简介","patch":{"synopsis":"..."}}
 {"type":"outline.write","summary":"重写总纲","targetId":1,"kind":"总纲","title":"...","instruction":"要改成什么样"}
 {"type":"card.write","summary":"更新角色卡","targetId":2,"cardType":"角色卡","title":"林舟","instruction":"要补充或修正什么"}
@@ -277,11 +279,19 @@ changes 里每一项只能是下列七种之一，字段必须原样铺平，不
 {"type":"graph.node.upsert","summary":"新增节点","targetId":"entity:林舟","label":"林舟","nodeType":"entity","category":"人物","content":"...","nodeStatus":"..."}
 {"type":"graph.edge.upsert","summary":"补充关系","targetId":"entity:林舟->entity:沈砚:同盟","source":"entity:林舟","target":"entity:沈砚","label":"同盟","weight":0.8}
 {"type":"chapter.draft_next","summary":"起草下一章","title":"第 12 章 夜访","instruction":"承接上一章并推进线索","outlineId":3}
+{"type":"chapter.revise","summary":"修订第 8 章","targetId":8,"instruction":"去掉 AI 味，保留情节和人物口吻"}
+{"type":"chapter.delete","summary":"删除空稿章节","targetId":9,"title":"第 9 章"}
 
-重要：大纲、卡片、章节正文都不由你撰写。outline.write、card.write、chapter.draft_next 只需要给出 instruction，
+重要：大纲、卡片、章节正文都不由你撰写。outline.write、card.write、chapter.draft_next、chapter.revise 只需要给出 instruction，
 应用会转交给对应的大纲智能体、卡片智能体和章节智能体去生成，它们有各自的专用提示词和技能。
 你在 instruction 里把要求写清楚就行，不要在 changes 里塞正文。
-只有 project.update 用 patch；memory.document.upsert 和图谱两项因为没有专用智能体，才由你直接给出内容。`;
+只有 project.update 用 patch；memory.document.upsert 和图谱两项因为没有专用智能体，才由你直接给出内容。
+
+章节修订和删除的额外约束：
+- chapter.revise 和 chapter.delete 的 targetId 必须是项目索引里真实存在的章节 id，不是第几章的序号。
+- 修订前先 open 该章正文，确认真的需要改，不要凭标题猜。
+- chapter.revise 会重写整章正文，一次最多提 3 章；更多章节请分批，并在 message 里说明已处理范围和剩下的部分。
+- 删除是不可恢复操作：只有作者明确要求删除时才能提，不要自作主张清理你觉得多余的章节。`;
 
 export async function runProjectAgent(
   input: ProjectAgentInput,
@@ -355,6 +365,9 @@ export async function runProjectAgent(
   if (input.mode === "discuss") return { message: plan.message, changes: [], toolEvents };
 
   const changes: ProjectAgentChange[] = [];
+  // 修订一章要跑一次完整的正文重写，成本接近写新章；单轮硬限 3 章，超出部分如实告知而不静默丢弃
+  const reviseLimit = 3;
+  let revisedCount = 0;
   for (const raw of plan.changes) {
     // 逐条校验：一条写坏只丢这一条并如实报出来，不连累其余变更和回复正文
     const parsed = plannerChangeSchema.safeParse(raw);
@@ -364,9 +377,17 @@ export async function runProjectAgent(
       continue;
     }
     const change = parsed.data;
-    // 三种写入意图都转交给应用里已有的专用智能体，产出结果再变成待确认提案
+    if (change.type === "chapter.revise") {
+      revisedCount += 1;
+      if (revisedCount > reviseLimit) {
+        toolEvents.push({ tool: "chapter.revise", status: "error", message: `单轮最多修订 ${reviseLimit} 章，章节 ${change.targetId} 本轮未处理，请再说一次继续` });
+        continue;
+      }
+    }
+    // 写入意图都转交给应用里已有的专用智能体，产出结果再变成待确认提案
     const delegateFor = {
       "chapter.draft_next": { label: "章节智能体", run: () => delegates.chapter(change as ProjectAgentChapterRequest) },
+      "chapter.revise": { label: "章节修订智能体", run: () => delegates.chapterRevise(change as ProjectAgentChapterReviseRequest) },
       "outline.write": { label: "大纲智能体", run: () => delegates.outline(change as ProjectAgentOutlineRequest) },
       "card.write": { label: "卡片智能体", run: () => delegates.card(change as ProjectAgentCardRequest) },
     }[change.type as string];
@@ -377,7 +398,7 @@ export async function runProjectAgent(
     try {
       const produced = await delegateFor.run();
       changes.push(ProjectAgentChangeSchema.parse(produced));
-      toolEvents.push({ tool: change.type, status: "complete", message: `${delegateFor.label}已完成《${produced.title}》` });
+      toolEvents.push({ tool: change.type, status: "complete", message: `${delegateFor.label}已完成《${produced.title || `章节 ${String((produced as { targetId?: number }).targetId ?? "")}`}》` });
     } catch (error) {
       toolEvents.push({ tool: change.type, status: "error", message: `${delegateFor.label}失败：${error instanceof Error ? error.message : String(error)}` });
     }

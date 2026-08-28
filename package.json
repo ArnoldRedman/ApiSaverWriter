@@ -6,8 +6,9 @@
   "workspaces": ["packages/contracts", "packages/model-protocol", "sidecars/agent-runtime"],
   "scripts": {
     "pretest": "npm run build:shared",
-    "test": "npm run test:runtime",
+    "test": "npm run test:runtime && npm run test:desktop",
     "test:runtime": "npm --workspace @apisaverwriter/agent-runtime test",
+    "test:desktop": "npm --prefix desktop-app test",
     "pretypecheck": "npm run build:shared",
     "typecheck": "npm run typecheck:contracts && npm run typecheck:model-protocol && npm run typecheck:runtime",
     "typecheck:runtime": "npm --workspace @apisaverwriter/agent-runtime run typecheck",
@@ -16,7 +17,7 @@
     "build:shared": "npm --workspace @apisaverwriter/contracts run build && npm --workspace @apisaverwriter/model-protocol run build",
     "check:rust": "cargo check --manifest-path desktop-app/src-tauri/Cargo.toml",
     "test:rust": "cargo test --manifest-path desktop-app/src-tauri/Cargo.toml",
-    "check": "npm run build:shared && npm run test:runtime && npm run typecheck:contracts && npm run typecheck:model-protocol && npm run typecheck:runtime && npm --prefix sidecars/agent-runtime run build && npm --prefix desktop-app run lint && npm --prefix desktop-app run build && npm run check:rust && npm run test:rust",
+    "check": "npm run build:shared && npm run test:runtime && npm run typecheck:contracts && npm run typecheck:model-protocol && npm run typecheck:runtime && npm --prefix sidecars/agent-runtime run build && npm --prefix desktop-app run lint && npm --prefix desktop-app run test && npm --prefix desktop-app run build && npm run check:rust && npm run test:rust",
     "dev:agent": "npm --workspace @apisaverwriter/agent-runtime run dev",
     "sync:feishu-release": "node scripts/sync-feishu-release.mjs"
   }

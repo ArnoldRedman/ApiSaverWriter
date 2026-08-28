@@ -104,6 +104,20 @@ export const normalizeProjectAgentChange = (value: unknown, project: Project, in
     if (!title || !content) return null;
     return { type, id, status, summary, title, content, chapterPlan: typeof value.chapterPlan === 'string' ? value.chapterPlan.slice(0, 30_000) : undefined, chapterSummary: typeof value.chapterSummary === 'string' ? value.chapterSummary.slice(0, 3000) : undefined };
   }
+  if (type === 'chapter.update') {
+    const targetId = projectAgentNumber(value.targetId);
+    const target = targetId ? project.chapters.find(item => item.id === targetId) : undefined;
+    const content = projectAgentString(value.content, 120_000);
+    // 修订必须命中一个真存在的章节，否则丢弃，不能退化成新建
+    if (!targetId || !target || !content) return null;
+    return { type, id, status, summary, targetId, title: projectAgentString(value.title, 160) || undefined, content, baseUpdatedAt: storedBase || target.updatedAt };
+  }
+  if (type === 'chapter.delete') {
+    const targetId = projectAgentNumber(value.targetId);
+    const target = targetId ? project.chapters.find(item => item.id === targetId) : undefined;
+    if (!targetId || !target) return null;
+    return { type, id, status, summary, targetId, title: target.title };
+  }
   return null;
 };
 

@@ -18,7 +18,7 @@ const project = {
   graphEdges: [],
 };
 
-const delegates = () => ({ chapter: vi.fn(), outline: vi.fn(), card: vi.fn() });
+const delegates = () => ({ chapter: vi.fn(), chapterRevise: vi.fn(), outline: vi.fn(), card: vi.fn() });
 
 const clientWith = (content: string) => ({
   chat: vi.fn().mockResolvedValue({ content, model: "test" }),
@@ -224,5 +224,45 @@ describe("project agent", () => {
     expect(card).toHaveBeenCalledOnce();
     expect(result.changes).toHaveLength(1);
     expect(result.toolEvents.filter(event => event.tool === "change.reject")).toHaveLength(1);
+  });
+
+  it("delegates a chapter revise and returns a chapter.update proposal", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "已修订第二章。", changes: [
+        { type: "chapter.revise", summary: "去 AI 味", targetId: 2, instruction: "保留情节和人物口吻" },
+      ] }),
+      model: "test",
+    });
+    const chapterRevise = vi.fn().mockResolvedValue({
+      type: "chapter.update", summary: "去 AI 味", targetId: 2, content: "夜雨敲在窗框上。",
+    });
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "把第二章的 AI 味去掉", project,
+    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapterRevise });
+
+    expect(chapterRevise).toHaveBeenCalledWith(expect.objectContaining({ targetId: 2, instruction: "保留情节和人物口吻" }));
+    expect(result.changes).toEqual([{ type: "chapter.update", summary: "去 AI 味", targetId: 2, content: "夜雨敲在窗框上。" }]);
+  });
+
+  it("caps revises per turn so one request cannot rewrite the whole book", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "开始批量修订。", changes: Array.from({ length: 5 }, (_, index) => ({
+        type: "chapter.revise", summary: `修订 ${index + 1}`, targetId: index + 1, instruction: "润色",
+      })) }),
+      model: "test",
+    });
+    const chapterRevise = vi.fn().mockImplementation((request: { targetId: number; summary: string }) => Promise.resolve({
+      type: "chapter.update", summary: request.summary, targetId: request.targetId, content: "修订后正文。",
+    }));
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "把全书都润色一遍", project,
+    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapterRevise });
+
+    // 前 3 章真的执行，剩下的如实报错而不静默丢弃
+    expect(chapterRevise).toHaveBeenCalledTimes(3);
+    expect(result.changes).toHaveLength(3);
+    expect(result.toolEvents.filter(event => event.tool === "chapter.revise" && event.status === "error")).toHaveLength(2);
   });
 });

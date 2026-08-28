@@ -14,9 +14,9 @@
   - 503 兼容重试会移除该字段；400 当前不会触发兼容重试。
   - 只有目标中转站出现 400，或确认忽略该字段时，再扩展重试规则。
 
-- [ ] **支持项目 Agent 修订既有章节**
-  - 当前变更协议只支持 `chapter.draft_next`，执行后生成 `chapter.create`，不能覆盖已有章节。
-  - 需要新增类似 `chapter.revise` 的变更类型，并同步桌面/移动端白名单、Runtime schema、章节智能体委托、前端冲突快照和确认应用逻辑。
+- [ ] **批量变更的整轮预算上限**
+  - 单个 fetch 已有超时，但一次 `project.agent.chat` 仍可串行跑多个委派，没有整轮上限。
+  - 修订已硬限 3 章，`chapter.draft_next` 仍可达 16 项；需要时再加统一的时间或数量预算。
 
 - [ ] **扩展小说目录导入格式**
   - `desktop-app/scripts/import-story-folder.mjs` 仍只适配 StoryForge 的 `story_data/{chapters,outlines,bible,state}` 结构。
@@ -27,6 +27,12 @@
   - 若源目录以后提供可靠的逐章摘要，可再导入；当前可在应用中运行章节智能体生成。
 
 ## 已完成
+
+- [x] **项目 Agent 可以修订和删除既有章节**
+  - 变更协议新增 `chapter.revise`（规划意图）、`chapter.update`（落地结果）和 `chapter.delete`。
+  - 修订委派给 `text.transform` 的 `revise` 模式，模型不能自己往 changes 里写正文。
+  - 单轮修订硬限 3 章，超出部分以 toolEvent 如实告知而不静默丢弃。
+  - 章节删除的级联清理收敛到 `domain/chapter.ts`，UI 删除和 Agent 删除共用同一份逻辑。
 
 - [x] **自定义 API、Anthropic Messages、配置档案与配置检测**
   - 桌面 Runtime 和移动端均有 OpenAI/Anthropic 两套传输实现。
@@ -85,10 +91,11 @@
 ## 本轮验证
 
 ```text
-npm test                                      通过：13 个文件，69 个测试
+npm test                                      通过：Runtime 13 个文件 75 个测试，桌面 2 个测试
 npm run typecheck                             通过：Contracts + Model Protocol + Agent Runtime
 npm --prefix sidecars/agent-runtime run build 通过
 npm --prefix desktop-app run lint             通过：0 警告
+npm --prefix desktop-app run test             通过：章节删除级联清理
 npm --prefix desktop-app run build            通过：严格 tsc -b + Vite（有 chunk 大小警告）
 npm run check:rust                            通过
 npm run test:rust                             通过

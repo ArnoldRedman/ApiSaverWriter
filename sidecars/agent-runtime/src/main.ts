@@ -6,7 +6,7 @@ import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
-import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
+import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { createModelClient, networkProxyConfig, stringList } from "./application/model-client.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
@@ -256,6 +256,28 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           chapterSummary: typeof result.summary === "string" ? result.summary : undefined,
         };
       };
+      // 修订已有章节：走 text.transform 的 revise 模式，不重跑整张章节写作图，也不会改动其他章节
+      const delegateChapterRevise = async (request: ProjectAgentChapterReviseRequest) => {
+        const chapters = projectList("chapters");
+        const target = chapters.find(item => Number(item.id) === request.targetId);
+        if (!target) throw new Error(`找不到待修订的章节 ID ${request.targetId}`);
+        const original = String(target.content || "").trim();
+        if (!original) throw new Error(`章节《${String(target.title || "")}》没有正文可修订`);
+        emitProjectEvent({ type: "progress", data: { step: "chapter-revise", progress: 36, message: `已委托修订《${String(target.title || "章节")}》` } });
+        const result = await delegateResult(`revise-${request.targetId}`, "text.transform", {
+          ...req.params,
+          runId: runId ? `${runId}:revise-${request.targetId}` : "",
+          mode: "revise",
+          instruction: request.instruction,
+          content: original,
+          projectTitle: String(projectRecord.title || "未命名小说"),
+          chapterTitle: String(target.title || "当前章节"),
+        });
+        const content = String(result.content || "").trim();
+        if (!content) throw new Error("修订智能体没有返回可用正文");
+        return { type: "chapter.update" as const, summary: request.summary, targetId: request.targetId, content };
+      };
+
       emitProjectEvent({ type: "progress", data: { step: "project-plan", progress: 20, message: "正在分析请求并制定受控操作计划" } });
       const result = await runProjectAgent({
         mode: mode === "execute" ? "execute" : "discuss",
@@ -267,7 +289,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         maxSteps: req.params?.maxSteps,
         // 每次工具调用都推一条进度，让抽屉里能看到它在检索什么
         onStep: step => emitProjectEvent({ type: "progress", data: { step: `project-${step.kind}`, progress: 24, message: step.message } }),
-      }, client, { chapter: delegateChapter, outline: delegateOutline, card: delegateCard });
+      }, client, { chapter: delegateChapter, chapterRevise: delegateChapterRevise, outline: delegateOutline, card: delegateCard });
       emitProjectEvent({ type: "complete", data: { message: result.changes.length ? `已生成 ${result.changes.length} 项待确认变更` : "项目 Agent 已完成回复" } });
       return { id: req.id, result };
     }
