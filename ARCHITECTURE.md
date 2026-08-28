@@ -1,416 +1,93 @@
-# 技术架构文档
+# ApiSaverWriter 架构
 
-## 系统概述
+本文只描述当前仓库中的实际实现。产品功能和使用方式见 [README.md](README.md)，未完成事项见 [TODO.md](TODO.md)。
 
-ApiSaverWriter 是一个基于 TypeScript + SQLite + Tauri 的桌面小说写作应用，采用前后端分离架构。
+## 总体结构
 
-## 技术栈
-
-### 后端
-- **语言**: TypeScript (ES2022)
-- **数据库**: SQLite3 + better-sqlite3
-- **全文搜索**: FTS5 (SQLite Full-Text Search)
-- **网络请求**: node-fetch
-- **HTML 解析**: cheerio
-
-### 前端
-- **框架**: React 18 + TypeScript
-- **桌面框架**: Tauri 2.x (Rust)
-- **构建工具**: Vite 5.x
-- **样式**: 纯 CSS (深色主题)
-
-### 测试
-- **测试框架**: Vitest
-- **覆盖率**: 13 个单元测试，100% 核心功能覆盖
-
-## 数据库设计
-
-### 表结构
-
-#### skills 表（技能库）
-
-```sql
-CREATE TABLE skills (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL,
-  category TEXT NOT NULL,
-  description TEXT,
-  content TEXT NOT NULL,
-  tags TEXT,              -- JSON 数组
-  examples TEXT,          -- JSON 数组
-  rating REAL DEFAULT 0,
-  usage_count INTEGER DEFAULT 0,
-  is_builtin BOOLEAN DEFAULT 0,
-  created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-  updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX idx_skills_category ON skills(category);
-CREATE INDEX idx_skills_rating ON skills(rating);
+```text
+ApiSaverWriter/
+├── desktop-app/                React + TypeScript + Tauri 客户端
+│   ├── src/App.tsx             主界面与业务状态
+│   ├── src/platform.ts         桌面 invoke 包装与移动端直连实现
+│   └── src-tauri/src/lib.rs    原生存储、备份、系统能力和桌面 Agent 进程管理
+├── sidecars/agent-runtime/     Node.js/TypeScript 写作智能体
+│   ├── src/main.ts             JSON 行 RPC 入口
+│   ├── src/project-agent.ts    项目 Agent 变更规划与委托
+│   ├── src/graphs/             章节写作工作流
+│   ├── src/context/            上下文裁剪与持久缓存
+│   ├── src/models/             OpenAI/Anthropic 模型协议
+│   ├── src/storage/            SQLite、FTS5 和可选向量检索
+│   └── src/streaming/          Agent 进度事件
+├── src/                        技能管理、拆书分析和书源基础模块
+├── schema/                     数据结构参考
+├── scripts/                    构建与发布脚本
+└── docs/                       专题文档与截图
 ```
 
-#### skills_fts 表（全文搜索）
+## 平台运行方式
 
-```sql
-CREATE VIRTUAL TABLE skills_fts USING fts5(
-  name, 
-  description, 
-  content,
-  content=skills,
-  content_rowid=id,
-  tokenize='unicode61'
-);
+### 桌面端
 
--- 触发器自动同步
-CREATE TRIGGER skills_ai AFTER INSERT ON skills BEGIN
-  INSERT INTO skills_fts(rowid, name, description, content)
-  VALUES (new.id, new.name, new.description, new.content);
-END;
+React 通过 Tauri command 调用 `desktop-app/src-tauri/src/lib.rs`。Rust 层负责：
 
-CREATE TRIGGER skills_ad AFTER DELETE ON skills BEGIN
-  DELETE FROM skills_fts WHERE rowid = old.id;
-END;
+- 启动 `sidecars/agent-runtime/dist/main.js` Node 子进程。
+- 使用 stdin/stdout 发送 JSON 行 RPC，并把流式事件转发给前端。
+- 保存本地小说数据、导入导出、备份恢复和系统文件操作。
 
-CREATE TRIGGER skills_au AFTER UPDATE ON skills BEGIN
-  UPDATE skills_fts 
-  SET name = new.name,
-      description = new.description,
-      content = new.content
-  WHERE rowid = old.id;
-END;
-```
+Agent Runtime 负责模型请求、上下文整理、章节写作、记忆生成、项目 Agent 和书源处理。
 
-## 核心模块
+### Android 与 iOS
 
-### 1. SkillManager（技能管理）
+移动端不启动 Node 子进程。`desktop-app/src/platform.ts` 使用同一组前端调用名，在 Tauri 原生 HTTP 通道上直接实现模型请求和必要业务逻辑：
 
-**职责**：
-- 技能的 CRUD 操作
-- 全文搜索（FTS5）
-- 分类筛选
-- 标签管理
-- 使用统计
+- OpenAI Chat Completions 兼容协议。
+- Anthropic Messages 协议。
+- SSE 流式正文和本机 token 统计。
+- 本地项目与备份仍由 Tauri 数据层管理。
 
-**关键方法**：
+移动端构建要求见 [desktop-app/MOBILE.md](desktop-app/MOBILE.md)。
 
-```typescript
-class SkillManager {
-  // 搜索技能（支持全文搜索、分类、标签、评分）
-  searchSkills(options?: SkillSearchOptions): Skill[]
-  
-  // 获取单个技能
-  getSkill(id: number): Skill | null
-  
-  // 添加技能
-  addSkill(skill: Omit<Skill, 'id'>): number
-  
-  // 更新技能
-  updateSkill(id: number, updates: Partial<Skill>): void
-  
-  // 删除技能
-  deleteSkill(id: number): void
-  
-  // 记录使用
-  recordUsage(id: number): void
-  
-  // 加载内置技能
-  private loadBuiltinSkills(): void
-}
-```
+## 模型协议
 
-**内置技能列表**：
-- 冲突开场
-- 悬念营造
-- 伏笔铺垫
-- 情感渲染
-- 对话塑造
-- 环境烘托
-- 心理描写
-- 动作描写
-- 节奏控制
-- 转折设计
+设置档案决定实际 wire mode：
 
-### 2. BookAnalyzer（拆书分析）
+| 模式 | 对话端点 | 认证 |
+| --- | --- | --- |
+| OpenAI 兼容 | `/v1/chat/completions` | `Authorization: Bearer` |
+| Anthropic Messages | `/v1/messages` | `x-api-key` + `anthropic-version` |
 
-**职责**：
-- 分析章节结构
-- 识别写作技巧
-- 评估节奏快慢
-- 提取可复用技能
+两种模式都支持模型列表、配置诊断和流式输出。上下文设置以 Token 为单位，发送前会为最大输出预留空间并按 tokenizer 裁剪输入；Anthropic 还会通过 `/v1/messages/count_tokens` 进行服务端校准。OpenAI 兼容的私有模型若不公开 tokenizer，则按其兼容模型族编码，最终用量以上游响应中的 usage 为准。Anthropic 的 system、thinking block、`text_delta` 与 usage 结构会在传输层转换，避免推理内容进入章节正文。
 
-**分析维度**：
+## 写作与项目 Agent
 
-```typescript
-interface ChapterAnalysisResult {
-  chapterNumber: number;
-  title: string;
-  wordCount: number;
-  
-  // 结构分析
-  structure: {
-    opening: string;      // 开头方式
-    development: string;  // 发展模式
-    climax: string;       // 高潮设计
-    ending: string;       // 结尾类型
-  };
-  
-  // 节奏分析
-  pacing: {
-    speed: 'fast' | 'medium' | 'slow';
-    rhythm: string;
-    avgSentenceLength: number;
-  };
-  
-  // 技巧识别
-  techniques: TechniqueExtraction[];
-  
-  // 可学习点
-  learnings: string[];
-}
-```
+章节写作由 `chapter.write` RPC 进入 Agent Runtime，主要流程为：
 
-**识别规则**：
+1. 裁剪并缓存项目资料。
+2. 检索最近章节、记忆、卡片和知识图谱。
+3. 根据章纲和作者指令生成正文。
+4. 审查并按需修订。
+5. 返回正文、摘要和流式进度事件。
 
-| 技巧类型 | 识别规则 | 示例 |
-|---------|---------|------|
-| 对话 | 引号数量 > 3 对 | "你好吗？""很好！" |
-| 环境描写 | 包含景物词汇 | 夕阳、微风、花香 |
-| 心理描写 | 包含心理动词 | 想到、觉得、担心 |
-| 动作描写 | 动作动词密度高 | 跑、跳、推开门 |
-| 悬念设置 | 疑问句、省略号 | "那是什么？" |
-| 冲突 | 对立情绪词 | 愤怒 vs 冷静 |
+项目 Agent 使用“先生成待确认变更，再由用户应用”的方式工作。当前支持小说资料、大纲、卡片、记忆文档、图谱和新章节草稿；不支持直接修订已有章节，详见 `TODO.md`。
 
-### 3. BaseScraper（爬虫基类）
+## 本地数据
 
-**职责**：
-- 定义爬虫接口
-- 统一数据格式
-- 错误处理
+小说项目、章节、大纲、卡片、记忆文档和图谱存放在应用数据目录。桌面端还支持：
 
-```typescript
-interface NovelRanking {
-  title: string;        // 书名
-  author: string;       // 作者
-  category: string;     // 分类
-  rank: number;         // 排名
-  description?: string; // 简介
-  tags?: string[];      // 标签
-  url?: string;         // 链接
-  cover?: string;       // 封面
-  stats?: {            // 数据
-    words?: number;
-    chapters?: number;
-    favorites?: number;
-  };
-}
+- 完整备份与恢复。
+- GitHub 小说仓库同步。
+- 百度网盘同步。
+- StoryForge 目录导入。
 
-abstract class BaseScraper {
-  abstract fetchRankings(options?: ScraperOptions): Promise<NovelRanking[]>;
-}
-```
+API Key、个人作品和备份不应进入 Git 仓库。
 
-### 4. FanqieScraper（番茄小说爬虫）
-
-**实现**：
-- 抓取番茄小说热榜
-- 解析 HTML 结构
-- 提取书籍信息
-
-**注意事项**：
-- 需要设置正确的 User-Agent
-- 遵守 robots.txt
-- 控制请求频率（防止被封）
-- 处理反爬机制
-
-## 前端架构
-
-### 组件树
-
-```
-App
-├── Sidebar（侧边栏）
-│   ├── Logo
-│   └── Nav
-│       ├── Projects
-│       ├── Skills
-│       ├── Rankings
-│       └── Analysis
-└── Main（主内容）
-    ├── ProjectsView
-    ├── SkillsView
-    ├── RankingsView
-    └── AnalysisView
-```
-
-### 状态管理
-
-使用 React Hooks（useState + useEffect）进行简单状态管理：
-
-```typescript
-const [activeTab, setActiveTab] = useState<TabType>('projects');
-const [skills, setSkills] = useState<Skill[]>([]);
-const [rankings, setRankings] = useState<NovelRanking[]>([]);
-const [loading, setLoading] = useState(false);
-```
-
-未来可考虑引入 Zustand 或 Jotai 进行更复杂的状态管理。
-
-### Tauri 集成
-
-**IPC 通信**（前后端调用）：
-
-```rust
-// Rust 后端命令
-#[tauri::command]
-fn search_skills(query: String) -> Vec<Skill> {
-    // 调用 TypeScript 核心库
-}
-
-#[tauri::command]
-fn analyze_chapter(content: String) -> AnalysisResult {
-    // 调用分析引擎
-}
-```
-
-```typescript
-// 前端调用
-import { invoke } from '@tauri-apps/api/core';
-
-const skills = await invoke('search_skills', { query: '对话' });
-const result = await invoke('analyze_chapter', { content });
-```
-
-## 性能优化
-
-### 数据库优化
-
-1. **索引策略**
-   - category, rating 字段创建索引
-   - FTS5 自动建立倒排索引
-
-2. **查询优化**
-   - 使用 LIMIT 分页
-   - prepared statements 防止 SQL 注入
-   - 批量插入使用事务
-
-3. **全文搜索优化**
-   - FTS5 使用 BM25 排序算法
-   - 支持中文分词（unicode61）
-   - 增量索引更新（触发器）
-
-### 前端优化
-
-1. **懒加载**
-   - 路由级别代码分割
-   - 图片懒加载
-
-2. **虚拟列表**
-   - 长列表使用 react-window
-
-3. **防抖节流**
-   - 搜索输入防抖
-   - 滚动加载节流
-
-## 安全考虑
-
-1. **SQL 注入防护**
-   - 使用参数化查询
-   - 严格的输入验证
-
-2. **XSS 防护**
-   - React 自动转义
-   - DOMPurify 清理 HTML
-
-3. **爬虫合规**
-   - 遵守 robots.txt
-   - 合理的请求间隔
-   - 声明 User-Agent
-
-## 部署
-
-### 开发环境
+## 验证命令
 
 ```bash
-npm install
-cd desktop-app && npm install
-npm run tauri dev
+npm test
+npm run typecheck
+npm --prefix sidecars/agent-runtime run build
+npm --prefix desktop-app run build
 ```
 
-### 生产构建
-
-```bash
-cd desktop-app
-npm run tauri build
-```
-
-**输出**：
-- macOS: `.dmg` 安装包
-- Windows: `.exe` 或 `.msi`
-- Linux: `.deb` 或 `.AppImage`
-
-## 监控与日志
-
-- 使用 console.log 记录关键操作
-- Tauri 提供系统日志集成
-- 未来可接入 Sentry 错误追踪
-
-## 扩展性
-
-### 插件系统（规划中）
-
-```typescript
-interface WriterPlugin {
-  name: string;
-  version: string;
-  install(writer: NovelWriter): void;
-}
-
-// 示例插件
-const grammarPlugin: WriterPlugin = {
-  name: 'grammar-checker',
-  version: '1.0.0',
-  install(writer) {
-    writer.on('beforeSave', (content) => {
-      return checkGrammar(content);
-    });
-  }
-};
-```
-
-### AI 集成（规划中）
-
-```typescript
-interface AIProvider {
-  complete(prompt: string): Promise<string>;
-  analyze(text: string): Promise<AnalysisResult>;
-}
-
-// OpenAI 实现
-class OpenAIProvider implements AIProvider {
-  async complete(prompt: string) {
-    // 调用 GPT API
-  }
-}
-
-// Claude 实现
-class ClaudeProvider implements AIProvider {
-  async complete(prompt: string) {
-    // 调用 Claude API
-  }
-}
-```
-
-## 贡献指南
-
-1. Fork 项目
-2. 创建特性分支：`git checkout -b feature/amazing-feature`
-3. 提交改动：`git commit -m 'Add amazing feature'`
-4. 推送分支：`git push origin feature/amazing-feature`
-5. 提交 Pull Request
-
-## 相关资源
-
-- [Tauri 文档](https://tauri.app/)
-- [React 文档](https://react.dev/)
-- [SQLite FTS5 文档](https://www.sqlite.org/fts5.html)
-- [better-sqlite3 文档](https://github.com/WiseLibs/better-sqlite3)
+桌面严格类型检查需运行 `cd desktop-app && npx tsc -b`；其存量错误记录在 [TODO.md](TODO.md)。
