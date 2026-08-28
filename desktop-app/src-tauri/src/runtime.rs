@@ -25,6 +25,24 @@ pub(crate) struct AgentRuntimeState {
     process: Arc<Mutex<Option<AgentRuntimeProcess>>>,
 }
 
+/// Agent 子进程最近的 stderr 输出，请求失败时回传给界面，便于定位真实原因
+static AGENT_STDERR: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn record_agent_stderr(line: String) {
+    if let Ok(mut buffer) = AGENT_STDERR.lock() {
+        buffer.push(line);
+        let overflow = buffer.len().saturating_sub(20);
+        if overflow > 0 { buffer.drain(0..overflow); }
+    }
+}
+
+fn recent_agent_stderr() -> String {
+    match AGENT_STDERR.lock() {
+        Ok(buffer) if !buffer.is_empty() => format!("\nAgent 进程日志：\n{}", buffer.join("\n")),
+        _ => String::new(),
+    }
+}
+
 fn node_executable() -> Result<PathBuf, String> {
     let mut candidates = Vec::new();
     if let Some(path) = bundled_agent_resource("node") {
@@ -117,8 +135,17 @@ fn spawn_agent_runtime() -> Result<AgentRuntimeProcess, String> {
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
-            while reader.read_line(&mut line).is_ok() {
-                if line.is_empty() { break; }
+            loop {
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                let text = line.trim_end().to_string();
+                if !text.is_empty() {
+                    // Agent 子进程的崩溃栈和错误日志以前被直接丢弃，排查时看不到任何线索
+                    eprintln!("[agent-runtime] {text}");
+                    record_agent_stderr(text);
+                }
                 line.clear();
             }
         });
@@ -126,16 +153,29 @@ fn spawn_agent_runtime() -> Result<AgentRuntimeProcess, String> {
     Ok(AgentRuntimeProcess { child, stdin, stdout: BufReader::new(stdout) })
 }
 
-#[tauri::command]
-pub fn start_agent_runtime(state: State<'_, AgentRuntimeState>) -> Result<String, String> {
-    let mut process = state.process.lock().map_err(|_| "Agent runtime 状态锁定失败".to_string())?;
+fn start_agent_runtime_blocking(process: Arc<Mutex<Option<AgentRuntimeProcess>>>) -> Result<String, String> {
     let script = agent_runtime_script()?;
+    // 必须用 try_lock：某个模型请求正在占用管道时，预热不能排队等待，
+    // 否则调用方（界面按钮、用量轮询）会一直挂在这里，看起来就是整个应用卡死
+    let mut process = match process.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => return Ok(format!("Agent runtime busy: {}", script.display())),
+    };
     let running = process.as_mut().map(|runtime| runtime.child.try_wait().map(|status| status.is_none()).unwrap_or(false)).unwrap_or(false);
     if !running {
         if let Some(mut old) = process.take() { let _ = old.child.kill(); }
         *process = Some(spawn_agent_runtime()?);
     }
     Ok(format!("Agent runtime ready: {}", script.display()))
+}
+
+#[tauri::command]
+pub async fn start_agent_runtime(state: State<'_, AgentRuntimeState>) -> Result<String, String> {
+    // 探测 node 可执行文件和拉起子进程都是阻塞 IO，不能跑在主线程上
+    let process = state.process.clone();
+    tauri::async_runtime::spawn_blocking(move || start_agent_runtime_blocking(process))
+        .await
+        .map_err(|error| format!("Agent 预热线程退出：{error}"))?
 }
 
 #[tauri::command]
@@ -152,20 +192,32 @@ fn call_agent_rpc_blocking(app: tauri::AppHandle, process: Arc<Mutex<Option<Agen
         if let Err(error) = active.stdin.write_all(format!("{}\n", request).as_bytes()).and_then(|_| active.stdin.flush()) {
             let _ = active.child.kill();
             if attempt == 0 { continue; }
-            return Err(format!("发送 Agent 请求失败: {error}"));
+            return Err(format!("发送 Agent 请求失败: {error}{}", recent_agent_stderr()));
         }
         let mut response: Option<Value> = None;
         for line in active.stdout.by_ref().lines() {
-            let line = line.map_err(|error| format!("读取 Agent 进度失败: {error}"))?;
+            let line = match line {
+                Ok(value) => value,
+                Err(error) => {
+                    // 读通道坏掉后必须结束这个进程，否则残留输出会串到下一次请求上
+                    let _ = active.child.kill();
+                    return Err(format!("读取 Agent 输出失败: {error}{}", recent_agent_stderr()));
+                }
+            };
             if line.trim().is_empty() { continue; }
-            let payload: Value = serde_json::from_str(&line)
-                .map_err(|error| format!("解析 Agent 输出失败: {error}"))?;
+            // 依赖库偶尔往 stdout 打印非 JSON 提示；直接丢弃，不能因此判定整次请求失败
+            let Ok(payload) = serde_json::from_str::<Value>(&line) else {
+                eprintln!("[agent-runtime] 非 JSON 输出被忽略: {}", line.chars().take(200).collect::<String>());
+                continue;
+            };
             if payload.get("type").and_then(Value::as_str) == Some("agent_stream") {
                 if let Some(event) = payload.get("event") {
                     let mut event = event.clone();
                     if let Some(run_id) = payload.get("runId") { event["runId"] = run_id.clone(); }
-                    app.emit("agent-progress", event)
-                        .map_err(|error| format!("发送 Agent 进度失败: {error}"))?;
+                    // 进度事件发送失败不应中断正在进行的生成
+                    if let Err(error) = app.emit("agent-progress", event) {
+                        eprintln!("[agent-runtime] 转发进度事件失败: {error}");
+                    }
                 }
                 continue;
             }
@@ -174,13 +226,13 @@ fn call_agent_rpc_blocking(app: tauri::AppHandle, process: Arc<Mutex<Option<Agen
         }
         if let Some(response) = response {
             if let Some(error) = response.get("error") {
-                return Err(error.get("message").and_then(Value::as_str).unwrap_or("Agent 执行失败").to_string());
+                return Err(format!("{}{}", error.get("message").and_then(Value::as_str).unwrap_or("Agent 执行失败"), recent_agent_stderr()));
             }
             return Ok(response.get("result").cloned().unwrap_or(response));
         }
         if let Some(mut old) = runtime.take() { let _ = old.child.kill(); }
     }
-    Err("Agent 重启后仍未返回结果，请检查网络设置".to_string())
+    Err(format!("Agent 重启后仍未返回结果，请检查网络设置{}", recent_agent_stderr()))
 }
 
 #[tauri::command]

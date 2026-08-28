@@ -71,6 +71,20 @@ function normalizeAnthropicRoot(value?: string): string {
 // which is where the stronger levels become meaningful.
 
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
+
+/** 所有出网请求都必须带超时。Agent Runtime 每次只处理一个 RPC，
+ * 上游一旦挂住不返回，整个 Runtime 乃至界面都会跟着卡死 */
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  try {
+    return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) } as RequestInit);
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "";
+    if (name === "TimeoutError" || name === "AbortError") {
+      throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒无响应）：${url}`);
+    }
+    throw error;
+  }
+}
 const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
 
 function supportsOpenAIJsonMode(model: string): boolean {
@@ -447,12 +461,12 @@ export class ApiSaverClient {
       try {
         const { system, turns } = toAnthropicMessages(fitted);
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json", ...this.authHeaders(key) },
           body: JSON.stringify({ model, system: system || undefined, messages: turns }),
           ...(dispatcher ? { dispatcher } : {}),
-        } as RequestInit);
+        } as RequestInit, 20_000);
         if (!response.ok) return fitted;
         const data = await response.json() as { input_tokens?: number };
         const actual = Number(data.input_tokens) || 0;
@@ -480,10 +494,10 @@ export class ApiSaverClient {
     const lookup = (async () => {
       try {
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
           headers: { ...this.authHeaders(key), Accept: "application/json" },
           ...(dispatcher ? { dispatcher } : {}),
-        } as RequestInit);
+        } as RequestInit, 20_000);
         if (!response.ok) return undefined;
         const payload = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
         const models = new Set((payload.data ?? payload.models ?? [])
@@ -543,10 +557,10 @@ export class ApiSaverClient {
   private async probeModels(key: string, endpoint: string): Promise<{ models?: string[]; error?: string }> {
     try {
       const dispatcher = proxyDispatcherFor(endpoint, this.config);
-      const response = await fetch(endpoint, {
+      const response = await fetchWithTimeout(endpoint, {
         headers: { ...this.authHeaders(key), Accept: "application/json" },
         ...(dispatcher ? { dispatcher } : {}),
-      } as RequestInit);
+      } as RequestInit, 20_000);
       const raw = await response.text();
       if (!response.ok) {
         return { error: apiErrorMessage(response.status, raw, response.statusText, 1, proxyRouteHint(endpoint, this.config), `，${endpoint}`, this.wireMode) };
@@ -637,13 +651,13 @@ export class ApiSaverClient {
     const requestJSON = async (path: string, key?: string): Promise<Record<string, unknown>> => {
       const url = endpoint(path);
       const dispatcher = proxyDispatcherFor(url, this.config);
-      const response = await fetch(url, {
+      const response = await fetchWithTimeout(url, {
         headers: {
           Accept: "application/json",
           ...(key ? { Authorization: `Bearer ${key}` } : {}),
         },
         ...(dispatcher ? { dispatcher } : {}),
-      } as RequestInit);
+      } as RequestInit, 20_000);
       const body = await response.text();
       if (!response.ok) throw new Error(`${path} 请求失败（${response.status}）：${body.replace(/\s+/g, " ").slice(0, 180)}`);
       try { return JSON.parse(body) as Record<string, unknown>; }
@@ -740,12 +754,12 @@ export class ApiSaverClient {
         const requestKey = apiKeys[(attempt - 1) % Math.max(1, apiKeys.length)] || this.config.apiKey;
         const requestHeaders = { ...headers, ...this.authHeaders(requestKey) };
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
-        const response = await fetch(endpoint, {
+        const response = await fetchWithTimeout(endpoint, {
           method: "POST",
           headers: requestHeaders,
           body,
           ...(dispatcher ? { dispatcher } : {}),
-        } as RequestInit);
+        } as RequestInit, 300_000);
         if (response.ok) {
           const data = await response.json() as Record<string, unknown>;
           if (mode === "anthropic") {
@@ -828,12 +842,12 @@ export class ApiSaverClient {
     let response: Response | null = null;
     let lastStreamError = "";
     for (const key of apiKeys) {
-      const candidate = await fetch(endpoint, {
+      const candidate = await fetchWithTimeout(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...this.authHeaders(key) },
         body: streamBody,
         ...(dispatcher ? { dispatcher } : {}),
-      } as RequestInit);
+      } as RequestInit, 120_000);
       if (candidate.ok && candidate.body) {
         response = candidate;
         break;
@@ -846,10 +860,14 @@ export class ApiSaverClient {
     const reader = responseBody.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
     try {
       streamLoop: while (true) {
+        // 每次 read 单独计时，并在胜出后立即清除定时器，避免累积悬空计时器拖住进程
+        let timer: NodeJS.Timeout | undefined;
         const next = await Promise.race([
           reader.read(),
-          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("SSE 首个响应超时")), content ? 45000 : 30000)),
-        ]); if (next.done) break;
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error(content ? "SSE 后续内容超时" : "SSE 首个响应超时")), content ? 45000 : 30000);
+          }),
+        ]).finally(() => { if (timer) clearTimeout(timer); }); if (next.done) break;
         buffer += decoder.decode(next.value, { stream: true });
         const lines = buffer.split("\n"); buffer = lines.pop() || "";
         for (const line of lines) {
@@ -892,6 +910,8 @@ export class ApiSaverClient {
         }
       }
     } catch (error) {
+      // 连接异常后必须主动释放读取器，否则底层 socket 不会关闭，后续请求会受连接池耗尽影响
+      void reader.cancel().catch(() => undefined);
       if (!content) {
         const fallback = await this.chat(messages, options);
         onChunk?.(fallback.content);

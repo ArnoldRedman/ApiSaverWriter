@@ -1250,7 +1250,11 @@ function App() {
   const [gatewayUsageError, setGatewayUsageError] = useState('');
   const activeAgentRunRef = useRef('');
   const runtimeUsageSessionRef = useRef<RuntimeUsageSummary | null>(null);
+  const runtimeUsageInFlightRef = useRef(false);
   const syncRuntimeUsage = async () => {
+    // Runtime 一次只能处理一个 RPC：长任务进行中时用量轮询会堆积排队，必须跳过
+    if (runtimeUsageInFlightRef.current) return;
+    runtimeUsageInFlightRef.current = true;
     try {
       const latest = await agentRpc<RuntimeUsageSummary>('usage.summary', {});
       const prior = runtimeUsageSessionRef.current;
@@ -1276,7 +1280,9 @@ function App() {
         });
         return next;
       });
-    } catch { /* Runtime may not have started yet. */ }
+    } catch { /* Runtime may not have started yet. */ } finally {
+      runtimeUsageInFlightRef.current = false;
+    }
   };
   useEffect(() => { void invoke<string>('start_agent_runtime').then(() => syncRuntimeUsage()); }, []);
   useEffect(() => {

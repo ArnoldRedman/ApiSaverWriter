@@ -652,15 +652,38 @@ async function main() {
     buffer = lines.pop() ?? "";
     for (const line of lines) {
       if (!line.trim()) continue;
+      let req: RuntimeRpcRequest | undefined;
       try {
-        const req = JSON.parse(line) as RuntimeRpcRequest;
+        req = JSON.parse(line) as RuntimeRpcRequest;
+      } catch (err) {
+        console.error(`[runtime] 请求解析失败：${err instanceof Error ? err.message : String(err)}`);
+        process.stdout.write(JSON.stringify({ error: { code: -32700, message: "Parse error" } }) + "\n");
+        continue;
+      }
+      try {
         const res = await rpcRegistry.dispatch(req);
+        // 失败原因写到 stderr，桌面端会把最近日志一起回传，避免界面只看到一句空泛错误
+        if (res.error) console.error(`[runtime] ${req.method} 失败：${res.error.message}`);
         process.stdout.write(JSON.stringify(res) + "\n");
       } catch (err) {
-        process.stdout.write(JSON.stringify({ error: { code: -32700, message: "Parse error" } }) + "\n");
+        // dispatch 之外的意外异常也必须回一条响应，否则桌面端会一直等待而表现为卡死
+        const message = err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err);
+        console.error(`[runtime] ${req.method} 抛出未捕获异常：${message}`);
+        process.stdout.write(JSON.stringify({ id: req.id, error: { code: -32000, message: err instanceof Error ? err.message : String(err) } }) + "\n");
       }
     }
   }
 }
 
-main().catch(console.error);
+// 未捕获异常只写日志：进程若直接退出，桌面端正在等待的请求会变成无响应
+process.on("unhandledRejection", reason => {
+  console.error(`[runtime] 未处理的 Promise 拒绝：${reason instanceof Error ? `${reason.message}\n${reason.stack ?? ""}` : String(reason)}`);
+});
+process.on("uncaughtException", error => {
+  console.error(`[runtime] 未捕获异常：${error.message}\n${error.stack ?? ""}`);
+});
+
+main().catch(error => {
+  console.error(`[runtime] 主循环退出：${error instanceof Error ? `${error.message}\n${error.stack ?? ""}` : String(error)}`);
+  process.exit(1);
+});
