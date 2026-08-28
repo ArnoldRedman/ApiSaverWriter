@@ -52,6 +52,20 @@ export const registerContentHandlers = (registry: RpcRegistry): RpcRegistry => r
     }
     return { title: trimmed(parsed.title), synopsis: trimmed(parsed.synopsis) };
   })
+  .register("github.commit.describe", async params => {
+    const projectTitle = String(params.projectTitle || "未命名小说");
+    const changes = params.changes && typeof params.changes === "object" ? params.changes : {};
+    const fallbackTitle = String(params.fallbackTitle || `更新《${projectTitle}》创作资料`);
+    const fallbackBody = String(params.fallbackBody || "");
+    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const prompt = `你是 Git 提交信息编辑。程序已经计算出《${projectTitle}》本次备份的真实差异。\n\n真实差异 JSON：\n${JSON.stringify(changes, null, 2)}\n\n程序回退标题：${fallbackTitle}\n程序明细：\n${fallbackBody}\n\n只返回 JSON：{"title":"中文提交标题","body":"2-5 行中文概述"}\n规则：title 不超过 60 个字符；body 不超过 1000 个字符；只能概括给定差异，不得编造章节、人物、剧情或数量；明确说明新增几章、修改哪几章、删除哪几章，其他资料按大纲/卡片/记忆/图谱分类概括。`;
+    const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 800, retryAttempts: 2 });
+    const parsed = parseJsonContent(response.content);
+    return {
+      title: trimmed(parsed?.title, fallbackTitle).replace(/[\r\n]+/gu, " ").slice(0, 60) || fallbackTitle,
+      body: trimmed(parsed?.body, fallbackBody).slice(0, 1000) || fallbackBody,
+    };
+  })
   .register("skill.write", async params => {
     const { name, category, description, content, tags } = params;
     if (!name && !description && !content) throw new Error("缺少创建技能所需参数");

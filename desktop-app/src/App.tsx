@@ -4436,9 +4436,19 @@ function App() {
       const snapshot = editingProject?.id === selected.id ? editingProject : selected;
       const currentProjects = projects.map(project => project.id === snapshot.id ? snapshot : project);
       await nativeClient.saveProjects(currentProjects);
-      const result = await invoke<{ repositoryUrl: string; branch: string; commit: string; changed: boolean }>('backup_project_to_github', {
+      const result = await invoke<{ repositoryUrl: string; branch: string; commit: string; changed: boolean; commitTitle?: string }>('backup_project_to_github', {
         repositoryUrl,
         project: snapshot,
+        agentParams: {
+          apiKey: agentConfig.apiKey.trim(),
+          apiKeys: agentConfig.apiKeys,
+          baseURL: agentConfig.baseURL.trim(),
+          model: agentConfig.model.trim() || fallbackModels[0],
+          apiMode: agentConfig.apiMode,
+          reasoningMode: agentConfig.reasoningMode,
+          contextWindow: agentConfig.contextWindow,
+          ...agentNetworkParams(agentConfig),
+        },
       });
       const linkedProject = { ...snapshot, githubRepositoryUrl: result.repositoryUrl };
       const linkedProjects = currentProjects.map(project => project.id === linkedProject.id ? linkedProject : project);
@@ -4447,7 +4457,7 @@ function App() {
       if (editingProject?.id === linkedProject.id) setEditingProject(linkedProject);
       setGithubRepositoryUrl(result.repositoryUrl);
       setCloudSyncMessage(result.changed
-        ? `GitHub 备份完成：${result.branch}@${result.commit}`
+        ? `GitHub 备份完成：${result.branch}@${result.commit}${result.commitTitle ? ` · ${result.commitTitle}` : ''}`
         : `GitHub 已是最新版本：${result.branch}@${result.commit}`);
     } catch (error) {
       setCloudSyncMessage(String(error));
@@ -6544,11 +6554,11 @@ function App() {
                   <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
                 </section>
                 <section className="settings-sync-card settings-github-card">
-                  <div className="settings-network-header"><div><strong>GitHub 小说备份与恢复</strong><small>一个仓库对应一本小说，提交章节、大纲、卡片、记忆和知识图谱</small></div><span className="settings-sync-badge github">Git</span></div>
+                  <div className="settings-network-header"><div><strong>GitHub 小说备份与恢复</strong><small>一个仓库对应一本小说，AI 会根据真实差异生成提交标题和章节变更说明</small></div><span className="settings-sync-badge github">Git</span></div>
                   <label className="form-group settings-sync-path"><span>本地小说</span><select className="input" value={githubProjectId ?? ''} onChange={event => selectGithubProject(Number(event.target.value))}><option value="">{projects.length ? '选择一本小说' : '本地还没有小说'}</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label>
                   <label className="form-group settings-sync-path"><span>GitHub 仓库链接</span><input className="input" value={githubRepositoryUrl} onChange={event => setGithubRepositoryUrl(event.target.value)} placeholder="https://github.com/owner/novel.git" spellCheck={false} /><small>支持 HTTPS 或 SSH；使用本机 Git 登录状态，不在应用中保存 Token。</small></label>
                   <div className="settings-sync-actions"><button className="btn-primary" disabled={cloudSyncRunning || !githubProjectId || isMobileRuntime()} onClick={() => void backupProjectToGithub()}>备份到 GitHub</button><button className="btn-secondary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void restoreProjectFromGithub()}>从 GitHub 恢复</button></div>
-                  <p className="settings-network-note">目标仓库必须为空，或已经是 ApiSaverWriter 规范小说仓库；不会提交 API Key 和应用账号配置。桌面端需安装 Git 并提前完成 GitHub 登录。</p>
+                  <p className="settings-network-note">提交正文会列出新增、修改和删除的章节，以及大纲、卡片、记忆、图谱变更数量；不会提交 API Key 和应用账号配置。目标仓库必须为空或已是 ApiSaverWriter 规范仓库，桌面端需安装 Git 并提前完成登录。</p>
                 </section>
                 {cloudSyncMessage && <p className={`model-list-message settings-sync-message ${/失败|错误|未找到|未登录|拒绝|无效|不是规范/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
               </>}

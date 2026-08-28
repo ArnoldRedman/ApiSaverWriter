@@ -28,6 +28,11 @@
 
 ## 已完成
 
+- [x] **GitHub 备份生成可读的 AI 提交说明**
+  - Rust 根据远端 `project.json` 和本次 staged diff 计算新增、修改、删除章节及其他创作资料数量。
+  - AI 只负责把真实差异组织成中文标题和概述；commit 正文始终附带程序生成的章节清单。
+  - 未配置 API Key 或 AI 调用失败时自动使用详细回退信息，不阻塞 GitHub 备份。
+
 - [x] **项目 Agent 可以修订和删除既有章节**
   - 变更协议新增 `chapter.revise`（规划意图）、`chapter.update`（落地结果）和 `chapter.delete`。
   - 修订委派给 `text.transform` 的 `revise` 模式，模型不能自己往 changes 里写正文。
@@ -91,12 +96,12 @@
 ## 本轮验证
 
 ```text
-npm test                                      通过：Runtime 13 个文件 75 个测试，桌面 2 个测试
+npm test                                      通过：Runtime 14 个文件 76 个测试，桌面 2 个测试
 npm run typecheck                             通过：Contracts + Model Protocol + Agent Runtime
 npm --prefix sidecars/agent-runtime run build 通过
 npm --prefix desktop-app run lint             通过：0 警告
 npm --prefix desktop-app run test             通过：章节删除级联清理
 npm --prefix desktop-app run build            通过：严格 tsc -b + Vite（有 chunk 大小警告）
 npm run check:rust                            通过
-npm run test:rust                             通过
+npm run test:rust                             通过：7 个测试
 ```
