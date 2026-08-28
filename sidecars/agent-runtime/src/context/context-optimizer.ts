@@ -9,7 +9,6 @@ export interface ContextReport {
   retrievedBytes?: number;
   draftInputBytes?: number;
   reviewInputBytes?: number;
-  estimatedInputTokens?: number;
   contextProfile?: "剧情" | "战斗" | "情感" | "转场";
   sections: Record<string, number>;
   upstreamUsage?: {
@@ -184,9 +183,10 @@ export class LruCache<Value> {
   }
 }
 
-export function contextBudgetBytes(contextWindowKB?: number, capKB = 18, minimumKB = 6): number {
-  const configured = Math.max(16, Number(contextWindowKB) || 128) * 1024;
-  return Math.min(capKB * 1024, Math.max(minimumKB * 1024, Math.floor(configured * 0.16)));
+export function contextBudgetBytes(contextWindowKTokens?: number, capKB = 18, minimumKB = 6): number {
+  // 这里只分配各资料区的预打包空间；最终硬上限由模型 tokenizer 执行
+  const configuredTokens = Math.max(16, Number(contextWindowKTokens) || 128) * 1024;
+  return Math.min(capKB * 1024, Math.max(minimumKB * 1024, Math.floor(configuredTokens * 3 * 0.16)));
 }
 
 function compactList(value: unknown, maxItems: number, itemBytes: number): string[] {
@@ -391,9 +391,9 @@ export function prepareChapterInput(input: {
   memoryDocuments?: unknown;
   knowledgeGraph?: unknown;
   skills?: unknown;
-  contextWindowKB?: number;
+  contextWindowKTokens?: number;
 }): PreparedChapterInput {
-  const budgetBytes = contextBudgetBytes(input.contextWindowKB);
+  const budgetBytes = contextBudgetBytes(input.contextWindowKTokens);
   const contextProfile = resolveContextProfile(input.instruction);
   const weights = CONTEXT_PROFILE_WEIGHTS[contextProfile];
   const allOutlines = Array.isArray(input.outlines)

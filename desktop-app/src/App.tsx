@@ -437,7 +437,6 @@ interface AgentDraftResult {
     retrievedBytes?: number;
     draftInputBytes?: number;
     reviewInputBytes?: number;
-    estimatedInputTokens?: number;
     contextProfile?: '剧情' | '战斗' | '情感' | '转场';
     sections?: Record<string, number>;
     upstreamUsage?: {
@@ -835,9 +834,9 @@ const isDefaultApiService = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) =
   config.apiMode === 'openai' && normalizeBaseURL(config.baseURL, 'openai') === defaultBaseURL;
 
 const contextWindowPresets = [64, 128, 200, 256, 512, 1024, 2048];
-const maxContextWindowKB = 2048;
-const formatContextWindow = (value: number) => value >= 1024 ? `${(value / 1024).toFixed(value % 1024 ? 1 : 0)}M` : `${value}K`;
-const clampContextWindow = (value: unknown) => Math.min(maxContextWindowKB, Math.max(16, Number(value) || 128));
+const maxContextWindowKTokens = 2048;
+const formatContextWindow = (value: number) => value >= 1024 ? `${(value / 1024).toFixed(value % 1024 ? 1 : 0)}M tokens` : `${value}K tokens`;
+const clampContextWindow = (value: unknown) => Math.min(maxContextWindowKTokens, Math.max(16, Number(value) || 128));
 const reasoningModes: Array<{ value: ReasoningMode; hint: string }> = [
   { value: 'auto', hint: '不发送思考参数，由模型自行决定' },
   { value: 'off', hint: '明确关闭思考' },
@@ -879,8 +878,7 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     ...(Array.isArray(parsed.enabledModels) ? parsed.enabledModels : []).filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map(item => item.trim()),
     model,
   ]));
-  // Legacy releases stored a byte count here. The KB ceiling is 2048, so any
-  // larger number can only be the old unit.
+  // 旧版本曾保存字节数；超过 4096 的值只可能来自旧单位，迁移为 K tokens 档位
   const storedWindow = Number((parsed as Record<string, unknown>).contextWindowKB ?? parsed.contextWindow) || 0;
   const storedReasoning = (parsed as Record<string, unknown>).reasoningMode;
   return {
@@ -893,7 +891,7 @@ const normalizeAgentConfig = (value: unknown): AgentConfig => {
     modelKeyMap,
     model,
     enabledModels,
-    contextWindow: clampContextWindow(storedWindow > maxContextWindowKB * 2 ? storedWindow / 1024 : storedWindow),
+    contextWindow: clampContextWindow(storedWindow > maxContextWindowKTokens * 2 ? storedWindow / 1024 : storedWindow),
     // `custom` disappeared with the English effort scale; it behaved as medium.
     reasoningMode: storedReasoning === 'custom' ? 'medium'
       : reasoningModes.some(item => item.value === storedReasoning) ? storedReasoning as ReasoningMode : 'auto',
@@ -5920,7 +5918,7 @@ function App() {
     setShowSettingsModal(false);
     setNotice({
       title: '设置已保存',
-      content: `${saved.serviceName}·${apiModeLabel(saved.apiMode)}·${resolvedEndpoint(saved)}，模型 ${selectedModel}，上下文 ${formatContextWindow(saved.contextWindow)} 字符，思考强度 ${saved.reasoningMode}。`,
+      content: `${saved.serviceName}·${apiModeLabel(saved.apiMode)}·${resolvedEndpoint(saved)}，模型 ${selectedModel}，上下文 ${formatContextWindow(saved.contextWindow)}，思考强度 ${saved.reasoningMode}。`,
     });
   };
 
@@ -6953,7 +6951,6 @@ function App() {
                       {agentDraft.contextReport.contextProfile && <span>动态档案：{agentDraft.contextReport.contextProfile}</span>}
                       <span>发送上下文 {((agentDraft.contextReport.draftInputBytes || agentDraft.contextReport.packedBytes || 0) / 1024).toFixed(1)} KB</span>
                       {agentDraft.contextReport.prunedBytes ? <span>已裁剪 {(agentDraft.contextReport.prunedBytes / 1024).toFixed(1)} KB</span> : null}
-                      {agentDraft.contextReport.estimatedInputTokens ? <span>估算输入 {agentDraft.contextReport.estimatedInputTokens.toLocaleString()} tokens</span> : null}
                       {agentDraft.contextReport.upstreamUsage?.requests ? <><span>中转输入 {agentDraft.contextReport.upstreamUsage.inputTokens.toLocaleString()} tokens</span><span>中转输出 {agentDraft.contextReport.upstreamUsage.outputTokens.toLocaleString()} tokens</span><span>中转总计 {agentDraft.contextReport.upstreamUsage.totalTokens.toLocaleString()} tokens</span><span>上游缓存命中 {agentDraft.contextReport.upstreamUsage.cachedInputTokens.toLocaleString()} tokens</span><span>上游缓存命中率 {agentDraft.contextReport.upstreamUsage.inputTokens ? `${((agentDraft.contextReport.upstreamUsage.cachedInputTokens / agentDraft.contextReport.upstreamUsage.inputTokens) * 100).toFixed(1)}%` : '未返回输入用量'}</span></> : <span>中转站未返回用量与缓存字段</span>}
                     </div>}
                     <textarea className="agent-draft-preview" value={agentDisplayContent || agentDraft.draftContent} onChange={(event) => { setAgentDisplayContent(event.target.value); setAgentDraft({ ...agentDraft, draftContent: event.target.value }); }} />
@@ -7305,7 +7302,7 @@ function App() {
                   </div>
                   <div className="settings-grid-two">
                     <div className="form-group">
-                      <label>上下文窗口 <strong>{formatContextWindow(settingsDraft.contextWindow)}</strong> <small>字符预算，超出部分会在发送前截断</small></label>
+                      <label>上下文窗口 <strong>{formatContextWindow(settingsDraft.contextWindow)}</strong> <small>应用侧 Token 上限，包含输入与最大输出；请按模型厂商上限选择，本设置不会扩大模型能力。OpenAI 兼容模型按 tokenizer 裁剪，Anthropic 在接口支持时用 count_tokens 校准</small></label>
                       <div className="settings-chip-row">
                         {contextWindowPresets.map(preset => <button
                           key={preset}
@@ -7314,7 +7311,7 @@ function App() {
                           onClick={() => setSettingsDraft({ ...settingsDraft, contextWindow: preset })}
                         >{formatContextWindow(preset)}</button>)}
                       </div>
-                      <input className="settings-range" type="range" min="16" max={maxContextWindowKB} step="16" value={settingsDraft.contextWindow} onChange={(event) => setSettingsDraft({ ...settingsDraft, contextWindow: clampContextWindow(event.target.value) })} />
+                      <input className="settings-range" type="range" min="16" max={maxContextWindowKTokens} step="16" value={settingsDraft.contextWindow} onChange={(event) => setSettingsDraft({ ...settingsDraft, contextWindow: clampContextWindow(event.target.value) })} />
                     </div>
                     <div className="form-group">
                       <label>思考强度 <small>reasoning effort</small></label>

@@ -31,7 +31,7 @@ describe("project agent", () => {
       instruction: "整理林舟前往旧仓库前掌握的线索和待确认事项",
       project,
       activeChapterId: 2,
-      contextWindowKB: 64,
+      contextWindowKTokens: 64,
     });
 
     expect(context.packet).toContain("角色卡｜21｜林舟");

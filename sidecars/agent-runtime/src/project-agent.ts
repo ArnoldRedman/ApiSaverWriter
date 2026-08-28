@@ -169,7 +169,7 @@ interface ProjectAgentInput {
   project: Record<string, unknown>;
   history?: Array<{ role?: unknown; content?: unknown }>;
   activeChapterId?: unknown;
-  contextWindowKB?: unknown;
+  contextWindowKTokens?: unknown;
   maxSteps?: unknown;
   onStep?: (step: { kind: "search" | "open"; message: string }) => void;
 }
@@ -287,7 +287,7 @@ export function buildProjectAgentContext(input: ProjectAgentInput): { packet: st
     })),
   ].sort((left, right) => right.score - left.score);
 
-  const budget = Math.min(36_000, Math.max(12_000, (Number(input.contextWindowKB) || 128) * 1024 * 0.28));
+  const budget = Math.min(36_000, Math.max(12_000, (Number(input.contextWindowKTokens) || 128) * 1024 * 0.28));
   const inventory = projectInventory(project, input.activeChapterId);
   const sections: string[] = [`## 项目索引\n${compactText(inventory, Math.min(14_000, Math.floor(budget * 0.28)))}`];
   const sources: string[] = [];

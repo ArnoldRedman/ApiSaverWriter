@@ -2,7 +2,7 @@ import { ChatAnthropic } from "@langchain/anthropic";
 import { ChatOpenAI } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ProxyAgent } from "undici";
-import { normalizePromptWhitespace } from "../context/context-optimizer.js";
+import { fitMessagesToTokenBudget } from "../context/token-budget.js";
 
 export type ApiSaverProvider = "openai" | "claude";
 
@@ -179,7 +179,8 @@ export interface ApiSaverClientConfig {
   defaultModel?: string;
   apiMode?: ApiWireMode | "responses";
   reasoningMode?: string;
-  contextWindowKB?: number;
+  /** 上下文上限，单位为 1024 tokens */
+  contextWindowKTokens?: number;
   proxyEnabled?: boolean;
   proxyURL?: string;
   proxyBypassLocal?: boolean;
@@ -436,28 +437,6 @@ const proxyRouteHint = (targetURL: string, config: Pick<ApiSaverClientConfig, "p
   }
 };
 
-function limitMessagesToKB(messages: ChatMessage[], contextWindowKB?: number): ChatMessage[] {
-  // Final transport-level pass catches raw document fields that bypassed the
-  // context packer. It affects only the request payload, never local files.
-  const normalizedMessages = messages.map(message => ({
-    ...message,
-    content: normalizePromptWhitespace(message.content),
-  }));
-  const budget = Math.floor(Number(contextWindowKB || 0) * 1024);
-  if (!budget || normalizedMessages.reduce((sum, message) => sum + message.content.length, 0) <= budget) return normalizedMessages;
-  let remaining = budget;
-  return normalizedMessages.map(message => {
-    if (remaining <= 0) return { ...message, content: "" };
-    const content = message.content.length <= remaining
-      ? message.content
-      : remaining <= 4096
-        ? message.content.slice(0, remaining)
-        : `${message.content.slice(0, remaining - 2048)}\n...[上下文已按 KB 限制截断]...\n${message.content.slice(-2048)}`;
-    remaining -= content.length;
-    return { ...message, content };
-  }).filter(message => message.content.trim());
-}
-
 export class ApiSaverClient {
   private config: ApiSaverClientConfig;
 
@@ -484,6 +463,43 @@ export class ApiSaverClient {
     return this.wireMode === "anthropic"
       ? { "x-api-key": key, "anthropic-version": ANTHROPIC_VERSION }
       : { Authorization: `Bearer ${key}` };
+  }
+
+  // Anthropic 提供官方 count_tokens 端点；先用本地 tokenizer 裁剪，再用
+  // 服务端真实计数校准。中转站未实现该端点时仍保持兼容编码的硬上限。
+  private async fitContextMessages(messages: ChatMessage[], maxOutputTokens: number, model: string, key: string): Promise<ChatMessage[]> {
+    const contextTokens = Math.floor(Number(this.config.contextWindowKTokens || 0) * 1024);
+    if (!contextTokens) return messages;
+    if (maxOutputTokens >= contextTokens) {
+      throw new Error(`当前输出和思考预算需要 ${maxOutputTokens.toLocaleString()} tokens，已超过 ${contextTokens.toLocaleString()} tokens 的上下文窗口`);
+    }
+    const inputBudget = contextTokens - maxOutputTokens;
+    let localBudget = inputBudget;
+    let fitted = fitMessagesToTokenBudget(messages, localBudget, model);
+    if (this.wireMode !== "anthropic") return fitted;
+
+    const endpoint = `${normalizeAnthropicRoot(this.config.baseURL)}/v1/messages/count_tokens`;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        const { system, turns } = toAnthropicMessages(fitted);
+        const dispatcher = proxyDispatcherFor(endpoint, this.config);
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...this.authHeaders(key) },
+          body: JSON.stringify({ model, system: system || undefined, messages: turns }),
+          ...(dispatcher ? { dispatcher } : {}),
+        } as RequestInit);
+        if (!response.ok) return fitted;
+        const data = await response.json() as { input_tokens?: number };
+        const actual = Number(data.input_tokens) || 0;
+        if (!actual || actual <= inputBudget) return fitted;
+        localBudget = Math.max(256, Math.floor(localBudget * inputBudget / actual * 0.98));
+        fitted = fitMessagesToTokenBudget(messages, localBudget, model);
+      } catch {
+        return fitted;
+      }
+    }
+    return fitted;
   }
 
   describeRoute(): { mode: ApiWireMode; models: string; chat: string } {
@@ -717,13 +733,13 @@ export class ApiSaverClient {
   ): Promise<{ content: string; model: string; usage?: ApiUsage }> {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
     const mode = this.wireMode;
-    const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
-    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const apiKeys = await this.keysForModel(configuredKeys, model);
     const reasoningMode = this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     // Anthropic rejects a thinking budget that is not strictly below max_tokens.
     const maxTokens = Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0);
+    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    const apiKeys = await this.keysForModel(configuredKeys, model);
+    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKeys[0] || this.config.apiKey);
     const endpoint = this.endpoints().chat;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     let body: string;
@@ -823,14 +839,14 @@ export class ApiSaverClient {
     const model = options.model || this.config.defaultModel || "gpt-4o-mini";
     const mode = this.wireMode;
     const endpoint = this.endpoints().chat;
-    const contextMessages = limitMessagesToKB(messages, this.config.contextWindowKB);
     const dispatcher = proxyDispatcherFor(endpoint, this.config);
-    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const apiKeys = await this.keysForModel(configuredKeys, model);
-    if (!apiKeys.length) throw new Error("缺少 API Key");
     const reasoningMode = this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     const maxTokens = Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0);
+    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
+    const apiKeys = await this.keysForModel(configuredKeys, model);
+    if (!apiKeys.length) throw new Error("缺少 API Key");
+    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKeys[0]);
     const streamBody = mode === "anthropic"
       ? (() => {
         const { system, turns } = toAnthropicMessages(contextMessages);

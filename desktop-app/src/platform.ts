@@ -2,6 +2,7 @@ import { invoke as nativeInvoke } from '@tauri-apps/api/core';
 import { gzip, gunzip } from 'fflate';
 import SparkMD5 from 'spark-md5';
 import qianyueSourceData from './data/qianyue-novel-sources.json';
+import { fitMessagesToTokenBudget } from './utils/token-budget';
 
 type InvokeArgs = Record<string, unknown> | undefined;
 type MobileParams = Record<string, unknown>;
@@ -765,8 +766,9 @@ const mobileMemoryMessages = (params: MobileParams): ChatMessage[] => {
   const projectTitle = stringValue(params.projectTitle, '未命名小说');
   const chapterTitle = stringValue(params.chapterTitle, '未命名章节');
   const content = stringValue(params.content);
-  const contextWindowKB = Math.max(16, Number(params.contextWindow) || 128);
-  const chapterBudget = Math.min(20 * 1024, Math.max(8 * 1024, Math.floor(contextWindowKB * 1024 * 0.16)));
+  const contextWindowKTokens = Math.max(16, Number(params.contextWindow) || 128);
+  // 章节记忆的预打包空间按中文约 3 UTF-8 bytes/token 分配；最终请求仍由 tokenizer 裁剪
+  const chapterBudget = Math.min(20 * 1024, Math.max(8 * 1024, Math.floor(contextWindowKTokens * 1024 * 3 * 0.16)));
   const chapterContent = mobileCompactPromptText(content, chapterBudget);
   const cards = Array.isArray(params.cards)
     ? params.cards.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>
@@ -911,10 +913,26 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   // Anthropic rejects a thinking budget that is not strictly below max_tokens.
   const requestedMaxTokens = Math.max(0, Math.min(8000, Number(params.maxOutputTokens) || 0));
   const maxTokens = Math.max(jsonMode ? 1300 : 6000, requestedMaxTokens, thinkingBudget ? thinkingBudget + 1024 : 0);
+  const contextTokens = Math.max(16, Number(params.contextWindow) || 128) * 1024;
+  if (maxTokens >= contextTokens) throw new Error(`当前输出和思考预算需要 ${maxTokens.toLocaleString()} tokens，已超过 ${contextTokens.toLocaleString()} tokens 的上下文窗口`);
+  let contextMessages = await fitMessagesToTokenBudget(messages, contextTokens - maxTokens, model);
+  if (apiMode === 'anthropic') {
+    // 官方及兼容中转若支持 count_tokens，用服务端 tokenizer 再校准一次
+    const countEndpoint = `${base}/v1/messages/count_tokens`;
+    try {
+      const { system, turns } = toAnthropicMessages(contextMessages);
+      const countResponse = await fetcher(countEndpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(keys[0], apiMode) }, body: JSON.stringify({ model, system: system || undefined, messages: turns }) });
+      if (countResponse.ok) {
+        const actual = Number(((await countResponse.json()) as Record<string, unknown>).input_tokens) || 0;
+        const budget = contextTokens - maxTokens;
+        if (actual > budget) contextMessages = await fitMessagesToTokenBudget(messages, Math.max(256, Math.floor(budget * budget / actual * 0.98)), model);
+      }
+    } catch { /* 不支持 count_tokens 的中转继续使用兼容 tokenizer */ }
+  }
   const headers: Record<string, string> = { 'Content-Type': 'application/json', Accept: onChunk ? 'text/event-stream' : 'application/json' };
   const body: Record<string, unknown> = apiMode === 'anthropic'
     ? (() => {
-      const { system, turns } = toAnthropicMessages(messages);
+      const { system, turns } = toAnthropicMessages(contextMessages);
       return {
         model,
         max_tokens: maxTokens,
@@ -926,7 +944,7 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
       };
     })()
     : {
-      model, messages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk),
+      model, messages: contextMessages, temperature, max_tokens: maxTokens, stream: Boolean(onChunk),
       ...(onChunk ? { stream_options: { include_usage: true } } : {}),
       ...(jsonMode && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}),
       ...(openAIReasoningEffort[reasoningMode] ? { reasoning_effort: openAIReasoningEffort[reasoningMode] } : {}),

@@ -250,7 +250,7 @@ interface ChapterGraphConfig {
   model?: string;
   apiMode?: ApiWireMode | "responses";
   reasoningMode?: string;
-  contextWindowKB?: number;
+  contextWindowKTokens?: number;
   proxyEnabled?: boolean;
   proxyURL?: string;
   proxyBypassLocal?: boolean;
@@ -267,7 +267,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
     defaultModel: config.model,
     apiMode: config.apiMode,
     reasoningMode: config.reasoningMode,
-    contextWindowKB: config.contextWindowKB,
+    contextWindowKTokens: config.contextWindowKTokens,
     proxyEnabled: config.proxyEnabled,
     proxyURL: config.proxyURL,
     proxyBypassLocal: config.proxyBypassLocal,
@@ -509,7 +509,6 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const contextReport = previousReport ? {
         ...previousReport,
         reviewInputBytes,
-        estimatedInputTokens: Math.ceil(((previousReport.draftInputBytes || 0) + reviewInputBytes) / 3),
       } : undefined;
 
       const response = await client.chat([

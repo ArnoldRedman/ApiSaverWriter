@@ -88,8 +88,8 @@ function renderRecentTurns(state: AgentSessionState): string {
     : "";
 }
 
-function compactAgentSession(state: AgentSessionState, contextWindowKB: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
-  const threshold = Math.floor(Math.max(16, Number(contextWindowKB) || 128) * 1024 * 0.8);
+function compactAgentSession(state: AgentSessionState, contextWindowKTokens: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
+  const threshold = Math.floor(Math.max(16, Number(contextWindowKTokens) || 128) * 1024 * 0.8);
   const rendered = renderAgentSession(state);
   if (baseBytes + byteLength(rendered) < threshold) return { state, compressed: false };
 
@@ -116,7 +116,7 @@ function compactAgentSession(state: AgentSessionState, contextWindowKB: unknown,
   };
 }
 
-function appendAgentSession(state: AgentSessionState, instruction: string, conclusion: string, contextWindowKB: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
+function appendAgentSession(state: AgentSessionState, instruction: string, conclusion: string, contextWindowKTokens: unknown, baseBytes: number): { state: AgentSessionState; compressed: boolean } {
   const next: AgentSessionState = {
     version: 1,
     summary: state.summary,
@@ -127,7 +127,7 @@ function appendAgentSession(state: AgentSessionState, instruction: string, concl
     }],
     compressedAt: state.compressedAt,
   };
-  return compactAgentSession(next, contextWindowKB, baseBytes);
+  return compactAgentSession(next, contextWindowKTokens, baseBytes);
 }
 
 // Byte-stable prompt for compatible upstream prefix caches. Dynamic chapter
@@ -1428,7 +1428,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         defaultModel: String(model || ""),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       // A failing configuration is the normal outcome here, so the report is a
@@ -1446,7 +1446,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         proxyEnabled: Boolean(proxyEnabled),
         proxyURL: String(proxyURL || ""),
         proxyBypassLocal: proxyBypassLocal === true,
@@ -1465,7 +1465,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         defaultModel: String(model),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       // Some relay models spend hidden reasoning tokens before emitting the
@@ -1486,7 +1486,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const tagRecord = tags && typeof tags === "object" ? tags as Record<string, unknown> : {};
@@ -1541,7 +1541,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const prompt = `你是 skill-creator。请把用户的小说写作需求整理成一个可复用技能。\n\n名称：${String(name || "待命名技能")}\n分类：${String(category || "write")}\n用途：${String(description || "暂无")}\n草稿：${String(content || "暂无")}\n标签：${stringList(tags).join("、") || "暂无"}\n\n只返回 JSON：\n{\n  "name": "短名称（英文 kebab-case）",\n  "category": "setup|write|review|polish|import|analyze|tool|creator",\n  "description": "一句话用途",\n  "tags": ["标签"],\n  "content": "Markdown 技能正文，包含触发条件、输入、步骤、输出格式、质量检查和失败处理"\n}\n不要输出 JSON 以外的文字。`;
@@ -1602,7 +1602,7 @@ async function handleRequest(req: RPCRequest): Promise<RPCResponse> {
         defaultModel: String(model || "gpt-5.5"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const cardContext = Array.isArray(cards) && cards.length
@@ -1782,7 +1782,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       const client = new ApiSaverClient({
         apiKey: String(apiKey), apiKeys: stringList(apiKeys, 12), baseURL: String(baseURL || "https://api.apisaver.com/v1"),
         defaultModel: String(model || "gpt-4o-mini"), apiMode: normalizeWireMode(apiMode),
-        reasoningMode: String(reasoningMode || "auto"), contextWindowKB: Number(contextWindow) || undefined, ...networkProxyConfig(req.params),
+        reasoningMode: String(reasoningMode || "auto"), contextWindowKTokens: Number(contextWindow) || undefined, ...networkProxyConfig(req.params),
       });
       const samples = books.slice(0, 60).map((item, index) => {
         const book = item && typeof item === "object" ? item as Record<string, unknown> : {};
@@ -1804,7 +1804,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const source = compactText(sourceContent, Math.min(contextBudgetBytes(Number(contextWindow) || undefined, 35, 18), 28_000));
@@ -1851,7 +1851,7 @@ ${source}
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const sampleText = compactText(samples.map((sample, index) => {
@@ -1897,7 +1897,7 @@ ${sampleText}
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const wordLimit = Math.max(600, Math.min(8000, Math.floor(Number(targetWords) || 2200)));
@@ -1926,7 +1926,7 @@ ${compactText(detailedOutline, 14_000)}`;
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const prompt = `你是《${String(projectTitle || "未命名小说")}》的章节作者。把下列原创章节素材转换成符合目标小说设定的可编辑正文。
@@ -1960,7 +1960,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const extraRequirement = String(instruction || "").trim();
@@ -2001,7 +2001,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       // 三个委托都直接复用应用里已有的专用智能体 RPC，Agent 自己不写内容。
@@ -2145,7 +2145,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         project: projectRecord,
         history: Array.isArray(history) ? history as Array<{ role?: unknown; content?: unknown }> : [],
         activeChapterId,
-        contextWindowKB: contextWindow,
+        contextWindowKTokens: contextWindow,
         maxSteps: req.params?.maxSteps,
         // 每次工具调用都推一条进度，让抽屉里能看到它在检索什么
         onStep: step => emitProjectEvent({ type: "progress", data: { step: `project-${step.kind}`, progress: 24, message: step.message } }),
@@ -2165,7 +2165,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         defaultModel: String(model || "gpt-5.5"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
@@ -2233,7 +2233,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
         defaultModel: String(model || "gpt-4o-mini"),
         apiMode: normalizeWireMode(apiMode),
         reasoningMode: String(reasoningMode || "auto"),
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
         ...networkProxyConfig(req.params),
       });
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
@@ -2387,7 +2387,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
       const prepared = cachedPreparation || prepareChapterInput({
         instruction: String(instruction), outline, outlines, activeOutlineId, cards, previousChapters,
         memories, memoryDocuments, knowledgeGraph, skills: req.params?.skills,
-        contextWindowKB: Number(contextWindow) || undefined,
+        contextWindowKTokens: Number(contextWindow) || undefined,
       });
       chapterPreparationCache.set(preparationKey, prepared);
       if (!cachedPreparation) void writePersistentContext(`chapter-prep-${preparationKey}`, prepared);
@@ -2489,7 +2489,7 @@ ${compactText(rewriteContent || detailedOutline, 14_000)}`;
           model: String(model || "gpt-4o-mini"),
           apiMode: normalizeWireMode(apiMode),
           reasoningMode: String(reasoningMode || "auto"),
-          contextWindowKB: Number(contextWindow) || undefined,
+          contextWindowKTokens: Number(contextWindow) || undefined,
           ...networkProxyConfig(req.params),
           streamEmitter,
         });

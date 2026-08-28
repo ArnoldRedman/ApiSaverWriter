@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { countMessageTokens } from "../src/context/token-budget.js";
 import { ApiSaverClient, buildModelConfig, createChatModel, resetModelKeyRoutingCache, seedModelKeyRoutingCache } from "../src/models/api-saver.js";
 
 afterEach(() => {
@@ -96,6 +97,20 @@ describe("API Saver model configuration", () => {
     await expect(client.chat([{ role: "user", content: "测试" }])).resolves.toMatchObject({ content: "OK" });
     expect(fetchMock.mock.calls[0][0]).toBe("http://127.0.0.1:8000/v1/models");
     expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:8000/v1/chat/completions");
+  });
+
+  it("enforces the configured context window with tokenizer counts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(new Response(JSON.stringify({
+      model: "gpt-4o",
+      choices: [{ message: { content: "OK" } }],
+    }), { status: 200 }));
+    const client = new ApiSaverClient({ apiKey: "k", baseURL: "https://example.test/v1", defaultModel: "gpt-4o", contextWindowKTokens: 16 });
+
+    await client.chat([{ role: "user", content: "中".repeat(600) }], { max_tokens: 16_000, retryAttempts: 1 });
+
+    const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { messages: Array<{ role: "user"; content: string }> };
+    expect(countMessageTokens(body.messages, "gpt-4o")).toBeLessThanOrEqual(16 * 1024 - 16_000);
+    expect(body.messages[0].content.length).toBeLessThan(600);
   });
   it("uses the API key that advertised the selected model", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")

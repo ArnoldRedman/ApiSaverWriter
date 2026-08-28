@@ -53,7 +53,7 @@ describe("context optimizer", () => {
       cards: [{ title: "沈砚", type: "角色卡", content: "性格敏感" }],
       knowledgeGraph: { nodes: [{ id: "a", label: "沈砚", type: "entity" }], edges: [] },
       skills: [{ name: "story-long-write", category: "write", description: "续写", tags: ["章节"], content: "保持视角" }],
-      contextWindowKB: 16,
+      contextWindowKTokens: 16,
     };
     const first = prepareChapterInput(input);
     const second = prepareChapterInput({ ...input, outlines: [...input.outlines] });

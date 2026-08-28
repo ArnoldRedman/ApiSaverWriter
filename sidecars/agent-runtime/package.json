@@ -20,6 +20,7 @@
     "better-sqlite3": "^12.5.0",
     "cheerio": "^1.0.0",
     "iconv-lite": "^0.6.3",
+    "js-tiktoken": "^1.0.21",
     "sqlite-vec": "^0.1.9",
     "undici": "^7.29.0",
     "zod": "^4.1.12"
