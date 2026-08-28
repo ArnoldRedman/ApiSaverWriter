@@ -1338,6 +1338,8 @@ function App() {
   const [aiToolRunning, setAIToolRunning] = useState(false);
   const [aiToolResult, setAIToolResult] = useState<AIToolResult | null>(null);
   const [selectionSnapshot, setSelectionSnapshot] = useState<{ start: number; end: number; source: string } | null>(null);
+  const [chapterJumpQuery, setChapterJumpQuery] = useState('');
+  const chaptersListRef = useRef<HTMLDivElement | null>(null);
   const chapterEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
@@ -2820,6 +2822,41 @@ function App() {
     setActiveCardId(null);
     setSelectedCardIds([]);
     setActiveChapterMemoryId(null);
+  };
+
+  // 选中章节并把它滚到列表可见区域，长篇不必手动滚动查找
+  const selectChapter = (chapter: Chapter) => {
+    setActiveChapter(chapter);
+    setSelectionSnapshot(null);
+    setSearchMatchIndex(0);
+    goalNoticeChapterRef.current = null;
+    // 等本次渲染提交后再滚动，否则读到的还是旧的列表位置
+    window.requestAnimationFrame(() => {
+      chaptersListRef.current?.querySelector(`[data-chapter-id="${chapter.id}"]`)?.scrollIntoView({ block: 'center' });
+    });
+  };
+
+  // 跳转框接受「12」「第 12 章」和标题关键字三种写法
+  const jumpToChapterByQuery = () => {
+    if (!editingProject) return;
+    const query = chapterJumpQuery.trim();
+    if (!query) return;
+    const chapters = editingProject.chapters;
+    const orderMatch = /^第?\s*(\d+)\s*章?$/.exec(query);
+    const target = (orderMatch ? chapters[Number(orderMatch[1]) - 1] : undefined)
+      || chapters.find(chapter => chapter.title.includes(query));
+    if (!target) {
+      setNotice({ title: '没有找到章节', content: `当前小说共 ${chapters.length} 章，没有匹配「${query}」的章节序号或标题。` });
+      return;
+    }
+    selectChapter(target);
+    setChapterJumpQuery('');
+  };
+
+  const jumpToLatestChapter = () => {
+    const latest = editingProject?.chapters.at(-1);
+    if (!latest) return;
+    selectChapter(latest);
   };
 
   const handleAddChapter = () => {
@@ -5485,12 +5522,26 @@ function App() {
                     <span>字</span>
                   </div>
                   <button className="btn-add-chapter" onClick={handleAddChapter}>+ 新建章节</button>
-                  <div className="chapters-list">
+                  <div className="chapter-jump-row">
+                    <input
+                      className="input"
+                      type="text"
+                      placeholder="跳转：章节序号或标题"
+                      aria-label="跳转到指定章节"
+                      value={chapterJumpQuery}
+                      onChange={event => setChapterJumpQuery(event.target.value)}
+                      onKeyDown={event => { if (event.key === 'Enter') jumpToChapterByQuery(); }}
+                    />
+                    <button type="button" onClick={jumpToChapterByQuery} disabled={!chapterJumpQuery.trim()}>跳转</button>
+                    <button type="button" onClick={jumpToLatestChapter} disabled={!editingProject.chapters.length}>最新章</button>
+                  </div>
+                  <div className="chapters-list" ref={chaptersListRef}>
                     {editingProject.chapters.map(chapter => (
                       <div
                         key={chapter.id}
+                        data-chapter-id={chapter.id}
                         className={`chapter-item ${activeChapter?.id === chapter.id ? 'active' : ''}`}
-                        onClick={() => { setActiveChapter(chapter); setSelectionSnapshot(null); setSearchMatchIndex(0); goalNoticeChapterRef.current = null; }}
+                        onClick={() => selectChapter(chapter)}
                       >
                         <div className="chapter-copy">
                           <div className="chapter-title">{chapter.title}</div>

@@ -1741,6 +1741,11 @@ select.input {
   padding: 16px;
 }
 
+/* 章节面板自身不滚动：统计、本章目标、新建和跳转固定在顶部，
+   只有章节列表自己滚动，否则长篇下滚后跳转框会被带出可视区 */
+.chapters-panel { display: flex; flex-direction: column; overflow: hidden; }
+.chapters-panel > .chapters-list { flex: 1; min-height: 0; overflow-y: auto; }
+
 .skills-panel { display: flex; flex-direction: column; gap: 10px; }
 .skills-panel-toolbar { display: flex; gap: 7px; }
 .skills-panel-toolbar .select { min-width: 0; flex: 1; }
@@ -2531,6 +2536,11 @@ select.input {
 .project-style-binding .select { width: 100%; }
 .chapter-target-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; margin: 0 0 10px; color: #94A3B8; font-size: 11px; }
 .chapter-target-row .input { min-width: 0; padding: 7px 8px; font-size: 12px; }
+.chapter-jump-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 6px; margin: 0 0 10px; }
+.chapter-jump-row .input { min-width: 0; padding: 7px 8px; font-size: 12px; }
+.chapter-jump-row button { padding: 7px 8px; border: 1px solid #334155; border-radius: 6px; background: #1E293B; color: #CBD5E1; font-size: 11px; white-space: nowrap; cursor: pointer; }
+.chapter-jump-row button:hover:not(:disabled) { border-color: #38BDF8; color: #7DD3FC; }
+.chapter-jump-row button:disabled { opacity: 0.5; cursor: not-allowed; }
 .chapter-editor-toolbar { flex-shrink: 0; display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 9px 18px; border-bottom: 1px solid #1E293B; background: #0F172A; }
 .chapter-toolbar-search { display: flex; align-items: center; gap: 7px; }
 .search-shortcut { color: #64748B; font-size: 10px; white-space: nowrap; }
@@ -2991,6 +3001,8 @@ select.input {
   .editor-sidebar-tabs button { flex: 0 0 auto; width: auto; min-width: 68px; padding: 8px 9px; border: 1px solid #263A52; border-radius: 7px; font-size: 11px; text-align: center; white-space: nowrap; }
   .editor-sidebar-tabs button.active { border-color: #38BDF8; }
   .chapters-panel, .outline-panel, .cards-panel, .knowledge-panel, .skills-panel { max-height: 34dvh; padding: 10px 12px; overflow-y: auto; }
+  /* 窄屏下面板本身就很短，再套一层滚动容器反而难用 */
+  .chapters-panel > .chapters-list { flex: none; min-height: auto; overflow: visible; }
   .chapter-item, .outline-document-item, .knowledge-card-item { min-height: 44px; }
   .editor-main { width: 100%; flex: 0 0 auto; min-height: 56dvh; overflow: visible; }
   .editor-workspace, .chapter-workspace, .outline-workspace, .card-workspace, .project-style-workspace, .memory-document-editor, .memory-snapshot-editor, .knowledge-graph-workspace { min-height: 56dvh; height: auto; padding: 16px 12px calc(24px + env(safe-area-inset-bottom)); overflow: visible; }
@@ -3168,6 +3180,7 @@ select.input {
   .editor-sidebar-tabs button { flex: 0 0 auto; min-width: 66px; min-height: 35px; padding: 7px 10px; border: 1px solid var(--m-line); border-radius: 9px; background: transparent; color: var(--m-muted); font-size: 11px; font-weight: 700; white-space: nowrap; }
   .editor-sidebar-tabs button.active { border-color: rgba(232, 163, 91, .65); background: var(--m-amber-soft); color: var(--m-amber); }
   .chapters-panel, .outline-panel, .cards-panel, .knowledge-panel, .skills-panel { max-height: 25dvh; padding: 8px 12px 12px; overflow-y: auto; }
+  .chapters-panel > .chapters-list { flex: none; min-height: auto; overflow: visible; }
   .chapter-item, .outline-document-item, .knowledge-card-item { min-height: 48px; margin-bottom: 5px; padding: 9px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; }
   .chapter-item.active, .outline-document-item.active, .knowledge-card-item.active { border-color: rgba(119, 214, 194, .38); background: #172a2e; }
   .editor-main { flex: 0 0 auto; width: 100%; min-height: 0; height: auto; }
