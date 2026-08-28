@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { agentRpcMethods, ProjectAgentChangeSchema } from "@apisaverwriter/contracts";
+import { agentRpcMethods, ProjectAgentChangeSchema, ProjectAgentPlannerChangeSchema } from "@apisaverwriter/contracts";
 import { RpcRegistry } from "../src/rpc/registry.js";
 
 describe("RPC registry", () => {
@@ -45,6 +45,16 @@ describe("RPC registry", () => {
 
   it("shares the project change allowlist across frontend and runtime", () => {
     expect(ProjectAgentChangeSchema.parse({ type: "chapter.create", summary: "创建章节", title: "第一章", content: "正文" }).type).toBe("chapter.create");
-    expect(() => ProjectAgentChangeSchema.parse({ type: "chapter.delete", summary: "非法操作" })).toThrow();
+    // 修订和删除必须带一个真存在的 targetId，缺少时必须直接报错
+    expect(() => ProjectAgentChangeSchema.parse({ type: "chapter.delete", summary: "缺少目标" })).toThrow();
+    expect(() => ProjectAgentChangeSchema.parse({ type: "chapter.update", summary: "缺少目标", content: "正文" })).toThrow();
+    expect(ProjectAgentChangeSchema.parse({ type: "chapter.delete", summary: "删除空稿", targetId: 9 }).type).toBe("chapter.delete");
+    expect(ProjectAgentChangeSchema.parse({ type: "chapter.update", summary: "修订第 8 章", targetId: 8, content: "新正文" }).type).toBe("chapter.update");
+  });
+
+  it("lets the planner ask for a revise but never hand-write chapter content", () => {
+    expect(ProjectAgentPlannerChangeSchema.parse({ type: "chapter.revise", summary: "去 AI 味", targetId: 8, instruction: "保留情节" }).type).toBe("chapter.revise");
+    // 规划阶段不接受 chapter.update：正文只能由专用智能体产出
+    expect(() => ProjectAgentPlannerChangeSchema.parse({ type: "chapter.update", summary: "直接写正文", targetId: 8, content: "模型自己写的正文" })).toThrow();
   });
 });

@@ -7,6 +7,7 @@ import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionChapter, AIDetectionLabel, AIDetectionSegment, AIDetectionReport, MemoryDocumentKind, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
+import { removeChapterFromProject } from './domain/chapter';
 import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
@@ -755,6 +756,8 @@ const projectAgentChangeTargetKey = (change: ProjectAgentChange) => {
   if (change.type === 'memory.document.upsert') return `memory:${change.kind}`;
   if (change.type === 'graph.node.upsert') return `graph-node:${change.targetId}`;
   if (change.type === 'graph.edge.upsert') return `graph-edge:${change.targetId}`;
+  // 修订和删除指向同一章时互斥：先应用的那条会让另一条失效
+  if (change.type === 'chapter.update' || change.type === 'chapter.delete') return `chapter:${change.targetId}`;
   return `chapter:new:${change.title}`;
 };
 
@@ -768,10 +771,11 @@ const projectAgentRebase = (change: ProjectAgentChange, project: Project): Proje
   if (change.type === 'memory.document.upsert') return { ...change, baseUpdatedAt: project.memoryDocuments.find(item => item.kind === change.kind)?.updatedAt };
   if (change.type === 'graph.node.upsert') return { ...change, baseUpdatedAt: project.graphNodes.find(item => item.id === change.targetId)?.updatedAt };
   if (change.type === 'graph.edge.upsert') return { ...change, baseUpdatedAt: project.graphEdges.find(item => item.id === change.targetId)?.updatedAt };
+  if (change.type === 'chapter.update') return { ...change, baseUpdatedAt: project.chapters.find(item => item.id === change.targetId)?.updatedAt };
   return change;
 };
 
-const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentChange[]): { project: Project; createdChapterId?: number } => {
+const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentChange[]): { project: Project; createdChapterId?: number; deletedChapterIds: number[] } => {
   const order: Record<ProjectAgentRawChange['type'], number> = {
     'project.update': 0,
     'outline.upsert': 1,
@@ -780,6 +784,9 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
     'graph.node.upsert': 4,
     'graph.edge.upsert': 5,
     'chapter.create': 6,
+    'chapter.update': 7,
+    // 删除最后执行：否则同批次里针对该章的其他变更会找不到目标
+    'chapter.delete': 8,
   };
   const pending = changes.filter(change => change.status === 'pending').sort((left, right) => order[left.type] - order[right.type]);
   if (!pending.length) throw new Error('没有待应用的变更');
@@ -818,11 +825,17 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
     if (change.type === 'chapter.create') {
       if (project.chapters.some(item => item.title.trim() === change.title.trim())) throw new Error(`章节《${change.title}》已经存在`);
     }
+    if (change.type === 'chapter.update' || change.type === 'chapter.delete') {
+      const target = project.chapters.find(item => item.id === change.targetId);
+      if (!target) throw new Error(`找不到章节 ID ${change.targetId}`);
+      if (change.type === 'chapter.update') stale(change.baseUpdatedAt, target.updatedAt, `章节《${target.title}》`);
+    }
   }
 
   let next: Project = { ...project };
   let serial = Date.now();
   let createdChapterId: number | undefined;
+  const deletedChapterIds: number[] = [];
   for (const change of pending) {
     if (change.type === 'project.update') {
       next = { ...next, ...change.patch };
@@ -914,6 +927,29 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       next = { ...next, graphEdges: existing ? next.graphEdges.map(item => item.id === edge.id ? edge : item) : [...next.graphEdges, edge] };
       continue;
     }
+    if (change.type === 'chapter.update') {
+      const target = next.chapters.find(item => item.id === change.targetId);
+      if (!target) throw new Error(`找不到章节 ID ${change.targetId}`);
+      const updated: Chapter = {
+        ...target,
+        title: change.title?.trim() || target.title,
+        content: change.content,
+        wordCount: countNovelCharacters(change.content),
+        updatedAt: now,
+      };
+      next = {
+        ...next,
+        chapters: next.chapters.map(item => item.id === updated.id ? updated : item),
+        // 图谱节点标题跟随章节标题；正文变了但章节记忆仍是旧的，由作者重新保存时刷新
+        graphNodes: next.graphNodes.map(node => node.id === `chapter:${updated.id}` ? { ...node, label: updated.title, updatedAt: now } : node),
+      };
+      continue;
+    }
+    if (change.type === 'chapter.delete') {
+      deletedChapterIds.push(change.targetId);
+      next = removeChapterFromProject(next, change.targetId);
+      continue;
+    }
     if (change.type === 'chapter.create') {
       const chapter: Chapter = {
         id: ++serial,
@@ -965,6 +1001,7 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       updatedAt: now,
     },
     createdChapterId,
+    deletedChapterIds,
   };
 };
 
@@ -1101,6 +1138,7 @@ function App() {
   const [activeTagTab, setActiveTagTab] = useState<TagTab>('主分类');
   const [tagDraft, setTagDraft] = useState<Record<TagTab, string[]>>(defaultProjectTags);
   const [projectPendingDeletion, setProjectPendingDeletion] = useState<Project | null>(null);
+  const [chapterPendingDeletion, setChapterPendingDeletion] = useState<Chapter | null>(null);
   const [showNewSkillModal, setShowNewSkillModal] = useState(false);
   const [skillEditingId, setSkillEditingId] = useState<number | string | null>(null);
   const [notice, setNotice] = useState<{ title: string; content: string } | null>(null);
@@ -2875,6 +2913,30 @@ function App() {
     setActiveChapter(newChapter);
   };
 
+  // 删除章节：级联清理复用 domain/chapter，与项目 Agent 的 chapter.delete 走同一份逻辑
+  const handleDeleteChapter = async () => {
+    const project = editingProjectRef.current;
+    const target = chapterPendingDeletion;
+    setChapterPendingDeletion(null);
+    if (!project || !target) return;
+    const updated = removeChapterFromProject(project, target.id);
+    const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
+    setProjects(nextProjects);
+    setEditingProject(updated);
+    if (activeChapter?.id === target.id) {
+      setActiveChapter(updated.chapters.at(-1) || null);
+      setSelectionSnapshot(null);
+      setSearchMatchIndex(0);
+    }
+    try {
+      if ('__TAURI_INTERNALS__' in window) await nativeClient.saveProjects(nextProjects);
+      else localStorage.setItem('projects', JSON.stringify(nextProjects));
+      setNotice({ title: '章节已删除', content: `《${target.title}》及其章节记忆、图谱关系已清理；绑定的章纲已解除关联但保留。` });
+    } catch (error) {
+      setNotice({ title: '章节已删除但保存失败', content: String(error) });
+    }
+  };
+
   const handleUpdateChapterContent = (content: string) => {
     if (!activeChapter || !editingProject) return;
     const wordCount = countNovelCharacters(content);
@@ -3730,6 +3792,7 @@ function App() {
         setActiveChapter(chapter);
         setEditorSidebarTab('chapters');
       } else if (activeChapter) {
+        // 当前章被删或被修订时都要重新取，否则编辑器还持有旧对象
         setActiveChapter(result.project.chapters.find(item => item.id === activeChapter.id) || result.project.chapters[0] || null);
       }
       const appliedIds = new Set(pending.map(change => change.id));
@@ -3743,7 +3806,7 @@ function App() {
         }),
         updatedAt: new Date().toISOString(),
       } : current);
-      setNotice({ title: '项目 Agent 变更已应用', content: `已写入 ${pending.length} 项变更。` });
+      setNotice({ title: '项目 Agent 变更已应用', content: `已写入 ${pending.length} 项变更${result.deletedChapterIds.length ? `，其中删除 ${result.deletedChapterIds.length} 个章节` : ''}。` });
     } catch (error) {
       setNotice({ title: '无法应用项目 Agent 变更', content: String(error) });
     }
@@ -5266,6 +5329,8 @@ function App() {
       case 'graph.node.upsert': return '更新图谱节点';
       case 'graph.edge.upsert': return '更新图谱关系';
       case 'chapter.create': return '新建章节草稿';
+      case 'chapter.update': return '修订章节正文';
+      case 'chapter.delete': return '删除章节';
     }
   };
   const projectAgentChangeDetail = (change: ProjectAgentChange) => {
@@ -5275,11 +5340,16 @@ function App() {
     if (change.type === 'memory.document.upsert') return `${change.kind} · ${change.title}`;
     if (change.type === 'graph.node.upsert') return `${change.nodeType} · ${change.label}`;
     if (change.type === 'graph.edge.upsert') return `${change.source} -[${change.label}]-> ${change.target}`;
+    if (change.type === 'chapter.delete') return `${change.title || `章节 ${change.targetId}`} · 删除后不可恢复`;
+    if (change.type === 'chapter.update') {
+      const target = editingProject?.chapters.find(item => item.id === change.targetId);
+      return `${target?.title || `章节 ${change.targetId}`} · ${countNovelCharacters(change.content).toLocaleString()} 字${target ? `（原 ${target.wordCount.toLocaleString()} 字）` : ''}`;
+    }
     return `${change.title} · ${countNovelCharacters(change.content).toLocaleString()} 字`;
   };
   const projectAgentChangePreview = (change: ProjectAgentChange) => {
     if (change.type === 'project.update') return JSON.stringify(change.patch, null, 2);
-    if (change.type === 'outline.upsert' || change.type === 'card.upsert' || change.type === 'memory.document.upsert' || change.type === 'chapter.create') return change.content;
+    if (change.type === 'outline.upsert' || change.type === 'card.upsert' || change.type === 'memory.document.upsert' || change.type === 'chapter.create' || change.type === 'chapter.update') return change.content;
     if (change.type === 'graph.node.upsert') return change.content || change.nodeStatus || projectAgentChangeDetail(change);
     return projectAgentChangeDetail(change);
   };
@@ -5556,6 +5626,15 @@ function App() {
                             handleOpenChapterLocation(chapter);
                           }}
                         >打开位置</button>
+                        <button
+                          className="icon-delete"
+                          title="删除章节"
+                          aria-label={`删除${chapter.title}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setChapterPendingDeletion(chapter);
+                          }}
+                        >×</button>
                       </div>
                     ))}
                   </div>
@@ -6709,6 +6788,25 @@ function App() {
             <div className="work-tags-footer">
               <p>主分类必选且只能选一个，主题、角色、情节最多可选两个</p>
               <div><button className="btn-secondary" onClick={() => setShowTagPicker(false)}>取消</button><button className="btn-primary" onClick={confirmProjectTags}>确认</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {chapterPendingDeletion && (
+        <div className="modal-overlay" onClick={() => setChapterPendingDeletion(null)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="delete-chapter-title" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="delete-chapter-title">删除章节</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setChapterPendingDeletion(null)}>×</button>
+            </div>
+            <div className="modal-body">
+              <p>确定删除《{chapterPendingDeletion.title}》吗？当前 {chapterPendingDeletion.wordCount.toLocaleString()} 字。</p>
+              <p className="delete-warning">正文、本章节记忆和图谱关系会一并清理；绑定的章纲会保留但解除关联。此操作不可撤销。</p>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setChapterPendingDeletion(null)}>取消</button>
+              <button className="btn-danger" onClick={() => void handleDeleteChapter()}>确认删除</button>
             </div>
           </div>
         </div>

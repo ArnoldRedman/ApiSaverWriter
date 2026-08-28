@@ -531,8 +531,8 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const mode = params.mode === 'execute' ? 'execute' : 'discuss';
   const runId = stringValue(params.runId);
   emitProgress(runId, { type: 'progress', data: { step: 'project-search', progress: 8, message: '正在检索当前小说资料' } });
-  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next';
-  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
+  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next, chapter.revise, chapter.delete';
+  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样"}，单轮最多 3 章；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
   emitProgress(runId, { type: 'progress', data: { step: 'project-plan', progress: 22, message: '正在分析请求并制定操作计划' } });
   const response = await mobileChat({ ...params, maxOutputTokens: 6500 }, [
     { role: 'system', content: '保持小说资料一致，只返回约定 JSON；所有修改都只是待确认提案。' },
@@ -546,16 +546,45 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const chapters = Array.isArray(project.chapters) ? project.chapters : [];
   const outlines = Array.isArray(project.outlines) ? project.outlines : [];
   for (const item of planned) {
-    if (!item || typeof item !== 'object' || (item as Record<string, unknown>).type !== 'chapter.draft_next') {
+    const kind = item && typeof item === 'object' ? (item as Record<string, unknown>).type : '';
+    if (kind !== 'chapter.draft_next' && kind !== 'chapter.revise') {
       changes.push(item);
       continue;
     }
     const request = item as Record<string, unknown>;
+    const { project: _project, history: _history, instruction: _projectInstruction, mode: _projectMode, ...modelParams } = params;
+    if (kind === 'chapter.revise') {
+      // 修订走 text.transform 的 revise 模式，与桌面端同一条路径
+      const targetId = Number(request.targetId);
+      const target = chapters.find(entry => entry && typeof entry === 'object' && Number((entry as Record<string, unknown>).id) === targetId) as Record<string, unknown> | undefined;
+      try {
+        if (!target) throw new Error(`找不到待修订的章节 ID ${targetId}`);
+        const original = stringValue(target.content).trim();
+        if (!original) throw new Error(`章节《${stringValue(target.title)}》没有正文可修订`);
+        emitProgress(runId, { type: 'progress', data: { step: 'chapter-revise', progress: 36, message: `正在修订《${stringValue(target.title, '章节')}》` } });
+        const revised = await mobileAgentRpc<Record<string, unknown>>('text.transform', {
+          ...modelParams,
+          runId: runId ? `${runId}:revise-${targetId}` : '',
+          maxOutputTokens: 8000,
+          mode: 'revise',
+          instruction: stringValue(request.instruction),
+          content: original,
+          projectTitle: project.title,
+          chapterTitle: target.title,
+        });
+        const revisedContent = stringValue(revised.content).trim();
+        if (!revisedContent) throw new Error('修订智能体没有返回可用正文');
+        changes.push({ type: 'chapter.update', summary: stringValue(request.summary, '修订章节'), targetId, content: revisedContent });
+        toolEvents.push({ tool: 'chapter.revise', status: 'complete', message: `《${stringValue(target.title, '章节')}》已修订` });
+      } catch (error) {
+        toolEvents.push({ tool: 'chapter.revise', status: 'error', message: error instanceof Error ? error.message : String(error) });
+      }
+      continue;
+    }
     try {
       emitProgress(runId, { type: 'progress', data: { step: 'chapter-delegate', progress: 36, message: '正在委托章节智能体起草下一章' } });
       const outlineId = Number(request.outlineId);
       const outline = outlines.find(entry => entry && typeof entry === 'object' && Number((entry as Record<string, unknown>).id) === outlineId) as Record<string, unknown> | undefined;
-      const { project: _project, history: _history, instruction: _projectInstruction, mode: _projectMode, ...modelParams } = params;
       const drafted = await mobileAgentRpc<Record<string, unknown>>('chapter.write', {
         ...modelParams,
         // 独立 runId：避免章节智能体的 complete 事件把项目 Agent 的进度提前推到 100%
