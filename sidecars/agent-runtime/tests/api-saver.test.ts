@@ -413,6 +413,16 @@ describe("Anthropic Messages wire protocol", () => {
     expect(report.checks.at(-1)?.detail).toContain("credit balance is too low");
   });
 
+  it("fails a hung upstream request with a timeout message instead of waiting forever", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValue(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+    const client = new ApiSaverClient({ apiKey: "k", baseURL: "https://example.test/v1", defaultModel: "gpt-test" });
+
+    await expect(client.chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
+      .rejects.toThrow(/请求超时/);
+    expect(fetchMock.mock.calls[0][1]?.signal).toBeInstanceOf(AbortSignal);
+  });
+
   it("fails the address check on an unusable URL without any network call", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch");
 

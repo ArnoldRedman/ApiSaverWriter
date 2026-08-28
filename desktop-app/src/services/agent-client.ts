@@ -11,6 +11,7 @@ export const agentRpc = async <Result>(
   method: AgentRpcMethod,
   params: Record<string, unknown>,
 ): Promise<Result> => {
-  await ensureAgentRuntime();
+  // 不再在每次 RPC 前调用 start_agent_runtime：该命令会争抢 Agent 进程锁，
+  // 长任务进行中时会把等待转嫁到主线程并冻结界面。call_agent_rpc 自己会按需拉起进程。
   return invoke<Result>('call_agent_rpc', { method, params });
 };
