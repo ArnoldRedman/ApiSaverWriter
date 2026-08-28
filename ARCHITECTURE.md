@@ -1,93 +1,125 @@
 # ApiSaverWriter 架构
 
-本文只描述当前仓库中的实际实现。产品功能和使用方式见 [README.md](README.md)，未完成事项见 [TODO.md](TODO.md)。
+本文描述当前仓库的运行边界、模块职责和重构约束。产品使用方式见 [README.md](README.md)，待办与阶段验收见 [TODO.md](TODO.md)。
 
-## 总体结构
+## 总体分层
+
+```text
+表现层       desktop-app/src/App.tsx 与 features/*
+应用层       desktop-app/src/services/*、Agent Runtime application/*
+端口/契约    packages/contracts、packages/model-protocol、services、RPC registry
+基础设施     Tauri adapters、Node model/storage/source adapters
+平台层       desktop-app/src-tauri、移动端 HTTP、文件系统和进程
+```
+
+依赖方向保持单向：
+
+```text
+UI / features -> application services -> contracts / ports -> platform adapters
+Runtime RPC -> application handlers -> models / context / storage / sources
+contracts 不依赖 desktop-app、agent-runtime 或 Tauri
+```
+
+不在当前项目中引入 Redux、DI 容器、事件总线、微服务或通用 Repository 框架。扩展通过新增领域模块和明确的 RPC 方法完成。
+
+## 目录结构
 
 ```text
 ApiSaverWriter/
-├── desktop-app/                React + TypeScript + Tauri 客户端
-│   ├── src/App.tsx             主界面与业务状态
-│   ├── src/platform.ts         桌面 invoke 包装与移动端直连实现
-│   └── src-tauri/src/lib.rs    原生存储、备份、系统能力和桌面 Agent 进程管理
-├── sidecars/agent-runtime/     Node.js/TypeScript 写作智能体
-│   ├── src/main.ts             JSON 行 RPC 入口
-│   ├── src/project-agent.ts    项目 Agent 变更规划与委托
-│   ├── src/graphs/             章节写作工作流
-│   ├── src/context/            上下文裁剪与持久缓存
-│   ├── src/models/             OpenAI/Anthropic 模型协议
-│   ├── src/storage/            SQLite、FTS5 和可选向量检索
-│   └── src/streaming/          Agent 进度事件
-├── src/                        技能管理、拆书分析和书源基础模块
-├── schema/                     数据结构参考
-├── scripts/                    构建与发布脚本
-└── docs/                       专题文档与截图
+├── packages/contracts/          跨端 RPC DTO、方法表、运行时参数校验
+├── packages/model-protocol/     OpenAI/Anthropic 共享纯协议规则
+├── desktop-app/
+│   ├── src/App.tsx              当前组合根，逐步收敛为页面组合器
+│   ├── src/domain/              Project、Library、Skill 等领域类型
+│   ├── src/features/            按功能组织的 UI 和会话模型
+│   ├── src/services/            agent-client、native-client 等应用端口
+│   ├── src/platform/            移动书源、云同步等平台适配器
+│   └── src-tauri/src/
+│       ├── lib.rs               Tauri command 组合与备份/系统能力
+│       ├── project_store.rs     小说 Markdown/metadata 持久化
+│       ├── resource_store.rs    书库、榜单、拆书和文风存储
+│       └── runtime.rs           Node Agent 进程与 JSON 行 RPC 桥
+├── sidecars/agent-runtime/src/
+│   ├── main.ts                  Runtime 组合根和 stdin/stdout 生命周期
+│   ├── rpc/                     registry 与按领域拆分的 RPC handler
+│   ├── application/             模型客户端工厂等应用服务
+│   ├── sources/                 书源、榜单、下载适配器
+│   ├── context/                 上下文打包、Token 预算、持久缓存
+│   ├── models/                  OpenAI/Anthropic 协议和 usage
+│   ├── graphs/                  章节写作图
+│   ├── storage/                 SQLite、FTS5、向量检索
+│   └── streaming/               Agent 进度事件
+├── schema/                      数据结构参考
+├── scripts/                     构建和发布脚本
+└── docs/                        专题文档与截图
 ```
 
-## 平台运行方式
+## 平台边界
 
 ### 桌面端
 
-React 通过 Tauri command 调用 `desktop-app/src-tauri/src/lib.rs`。Rust 层负责：
+React 通过 `src/services/agent-client.ts` 调用 Agent RPC，通过 `native-client.ts` 调用 Tauri 原生命令。Tauri 的 `runtime.rs` 负责：
 
-- 启动 `sidecars/agent-runtime/dist/main.js` Node 子进程。
-- 使用 stdin/stdout 发送 JSON 行 RPC，并把流式事件转发给前端。
-- 保存本地小说数据、导入导出、备份恢复和系统文件操作。
+- 启动和回收 Node Agent 子进程。
+- 通过 stdin/stdout 传输 JSON 行 RPC。
+- 转发流式进度事件。
 
-Agent Runtime 负责模型请求、上下文整理、章节写作、记忆生成、项目 Agent 和书源处理。
+`lib.rs` 负责本地项目/资源文件、备份恢复、系统命令和 Tauri command 注册。Node Agent 负责模型、上下文、章节写作、记忆、项目 Agent 和书源。
 
 ### Android 与 iOS
 
-移动端不启动 Node 子进程。`desktop-app/src/platform.ts` 使用同一组前端调用名，在 Tauri 原生 HTTP 通道上直接实现模型请求和必要业务逻辑：
+移动端复用前端端口，但不启动 Node 子进程。`src/platform/` 和 `src/platform.ts` 使用 Tauri HTTP 通道完成模型请求、书源访问和云同步；本地项目数据仍由 Tauri 数据层持久化。
 
-- OpenAI Chat Completions 兼容协议。
-- Anthropic Messages 协议。
-- SSE 流式正文和本机 token 统计。
-- 本地项目与备份仍由 Tauri 数据层管理。
+## 共享契约
 
-移动端构建要求见 [desktop-app/MOBILE.md](desktop-app/MOBILE.md)。
+`packages/contracts` 是跨端 RPC 的唯一方法清单，`packages/model-protocol` 是桌面与移动端共用的模型协议纯函数：
 
-## 模型协议
+- `AgentRpcMethodMap` 定义方法、参数和结果类型。
+- `agentRpcSchemas` 在 Runtime 边界校验输入。
+- `AgentProgressEvent`、`RpcError` 和 RPC envelope 统一桌面、移动端和 Runtime 约定。
+- 认证头、Anthropic system/messages 转换、thinking 档位、reasoning effort 和正文块过滤只保留一份共享实现。
 
-设置档案决定实际 wire mode：
+前端通过 `agentRpc()` 调用，Runtime 通过 `RpcRegistry` 注册。迁移期间旧 Handler 可以由 registry 委托，但新方法必须先加入共享契约。
 
-| 模式 | 对话端点 | 认证 |
-| --- | --- | --- |
-| OpenAI 兼容 | `/v1/chat/completions` | `Authorization: Bearer` |
-| Anthropic Messages | `/v1/messages` | `x-api-key` + `anthropic-version` |
+## Agent Runtime 模块
 
-两种模式都支持模型列表、配置诊断和流式输出。上下文设置以 Token 为单位，发送前会为最大输出预留空间并按 tokenizer 裁剪输入；Anthropic 还会通过 `/v1/messages/count_tokens` 进行服务端校准。OpenAI 兼容的私有模型若不公开 tokenizer，则按其兼容模型族编码，最终用量以上游响应中的 usage 为准。Anthropic 的 system、thinking block、`text_delta` 与 usage 结构会在传输层转换，避免推理内容进入章节正文。
+`main.ts` 只负责 Runtime 生命周期、上下文缓存和尚未迁移的组合逻辑。RPC 处理已按职责拆分：
 
-## 写作与项目 Agent
+- `rpc/model-handlers.ts`：模型列表、诊断、测试和用量。
+- `rpc/content-handlers.ts`：作品信息和技能生成。
+- `rpc/text-handlers.ts`：文本变换。
+- `rpc/library-handlers.ts`：书籍、榜单、拆书和文风相关 RPC。
+- `sources/library-service.ts`：Fanqie、千阅、其他书源和榜单抓取。
 
-章节写作由 `chapter.write` RPC 进入 Agent Runtime，主要流程为：
+章节写作仍由 `graphs/chapter-write.graph.ts` 编排，依次完成上下文准备、意图/技能选择、检索、计划、正文、审查和摘要。
 
-1. 裁剪并缓存项目资料。
-2. 检索最近章节、记忆、卡片和知识图谱。
-3. 根据章纲和作者指令生成正文。
-4. 审查并按需修订。
-5. 返回正文、摘要和流式进度事件。
+## 数据所有权
 
-项目 Agent 使用“先生成待确认变更，再由用户应用”的方式工作。当前支持小说资料、大纲、卡片、记忆文档、图谱和新章节草稿；不支持直接修订已有章节，详见 `TODO.md`。
+- Tauri 本地文件是项目和资源的持久化权威。
+- React 只保存当前界面快照；`domain/` 类型不负责 IO。
+- Agent Runtime 的缓存只保存有容量/生命周期限制的准备结果和会话摘要，不持有永久项目副本。
+- Agent 变更先生成待确认提案，再由前端应用，避免模型直接写本地文件。
 
-## 本地数据
+后续增量持久化应优先新增 `save_project`、`save_chapter` 等细粒度命令，逐步替代每次序列化完整项目数组；在此之前不改变现有文件格式。
 
-小说项目、章节、大纲、卡片、记忆文档和图谱存放在应用数据目录。桌面端还支持：
+## 性能与内存约束
 
-- 完整备份与恢复。
-- GitHub 小说仓库同步。
-- 百度网盘同步。
-- StoryForge 目录导入。
-
-API Key、个人作品和备份不应进入 Git 仓库。
+- 流式正文通过 `requestAnimationFrame` 批量提交 UI，避免每个 chunk 触发一次 React render。
+- 书源下载和分片上传使用固定并发，禁止无上限 `Promise.all`。
+- LRU、会话和模型缓存必须有容量或 TTL；请求结束后不得由闭包继续持有完整正文和 Prompt。
+- 上下文发送前使用模型 tokenizer 裁剪；Token 窗口为最大限制，不会扩大模型实际能力。
+- Rust 无 GC，重点控制 `serde_json::Value` 深拷贝、整目录重写和一次性读入；文件操作需要路径校验和原子替换。
+- 不调用手工 GC、不引入对象池；只有性能基线证明有分配热点时再优化。
 
 ## 验证命令
 
 ```bash
 npm test
 npm run typecheck
+npm run build:shared
 npm --prefix sidecars/agent-runtime run build
 npm --prefix desktop-app run build
+npm run check:rust
 ```
 
-桌面严格类型检查需运行 `cd desktop-app && npx tsc -b`；其存量错误记录在 [TODO.md](TODO.md)。
+发布工作流会先执行 `npm run check`，再构建各平台安装包。严格桌面 TypeScript 检查使用 `tsc -b`。

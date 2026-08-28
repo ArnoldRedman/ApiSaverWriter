@@ -26,8 +26,29 @@ permissions:
   contents: write
 
 jobs:
+  quality:
+    name: Architecture quality gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            desktop-app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
+      - run: npm ci
+      - run: npm ci --prefix desktop-app
+      - run: npm run check
+
   build:
     name: Build ${{ matrix.label }}
+    needs: quality
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 35
     strategy:

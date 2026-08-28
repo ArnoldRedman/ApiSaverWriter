@@ -95,17 +95,23 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 
 ```text
 ApiSaverWriter/
+├── packages/contracts/      # 桌面、移动端与 Agent Runtime 共享 RPC 契约
+├── packages/model-protocol/ # OpenAI/Anthropic 共享纯协议规则
 ├── desktop-app/             # React + TypeScript + Tauri 多端客户端
-│   ├── src/                 # 界面、平台适配、内置 Skills
+│   ├── src/domain/          # 项目、书库和技能领域模型
+│   ├── src/features/        # 按功能组织的 UI 与会话模型
+│   ├── src/services/        # Agent/原生能力端口
+│   ├── src/platform/        # 移动书源与云同步适配器
 │   └── src-tauri/           # Rust 原生能力与移动端工程
 ├── sidecars/agent-runtime/  # Node.js 写作智能体、上下文和本地存储
-├── src/                     # 技能、拆书、书源与基础能力
 ├── schema/                  # 本地数据结构
 └── scripts/                 # 版本发布和飞书同步脚本
 ```
 
-- **客户端**：React、TypeScript、Vite、Tauri 2。
-- **智能体运行时**：Node.js、TypeScript，负责会话、上下文缓存、Skill 路由和章节记忆。
+- **客户端**：React、TypeScript、Vite、Tauri 2，按 domain/features/services/platform 分层。
+- **智能体运行时**：Node.js、TypeScript，RPC registry 按模型、内容、书库和写作职责分发。
+- **共享契约**：`packages/contracts` 统一 RPC 方法、DTO、进度事件和运行时参数校验。
+- **共享模型协议**：`packages/model-protocol` 统一认证、thinking/reasoning 和 Anthropic 消息转换。
 - **本地数据**：项目资料保存在用户设备本地；同步由用户主动触发。
 
 ## 本地开发

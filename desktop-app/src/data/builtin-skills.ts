@@ -1,4 +1,4 @@
-import type { Skill } from '../App';
+import type { Skill } from '../domain/skill';
 import { advancedBuiltinSkills } from './advanced-skills';
 
 const builtinSkillDefinitions: Skill[] = [

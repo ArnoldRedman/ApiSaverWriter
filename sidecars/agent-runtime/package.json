@@ -4,14 +4,21 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "npm --prefix ../.. run build:shared",
     "dev": "tsx watch src/main.ts",
+    "prestart": "npm --prefix ../.. run build:shared",
     "start": "tsx src/main.ts",
     "gateway": "npm run build && node dist/gateway.js",
+    "prebuild": "npm --prefix ../.. run build:shared",
     "build": "tsc",
+    "pretest": "npm --prefix ../.. run build:shared",
     "test": "vitest run",
+    "pretypecheck": "npm --prefix ../.. run build:shared",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@apisaverwriter/contracts": "0.1.0",
+    "@apisaverwriter/model-protocol": "0.1.0",
     "@langchain/anthropic": "^1.1.2",
     "@langchain/core": "^1.1.10",
     "@langchain/langgraph": "^1.0.8",

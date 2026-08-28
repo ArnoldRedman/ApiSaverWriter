@@ -3,6 +3,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ProxyAgent } from "undici";
 import { fitMessagesToTokenBudget } from "../context/token-budget.js";
+import { anthropicText, anthropicThinkingBudget, authHeaders as protocolAuthHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from "@apisaverwriter/model-protocol";
 
 export type ApiSaverProvider = "openai" | "claude";
 
@@ -46,11 +47,8 @@ function normalizeOpenAIBaseURL(value?: string): string {
 export type ApiWireMode = "openai" | "anthropic";
 
 const DEFAULT_ANTHROPIC_ROOT = "https://api.anthropic.com";
-const ANTHROPIC_VERSION = "2023-06-01";
 
-export function normalizeWireMode(value: unknown): ApiWireMode {
-  return String(value ?? "").trim().toLowerCase() === "anthropic" ? "anthropic" : "openai";
-}
+export { normalizeWireMode };
 
 /** Anthropic addresses are stored as a root, because `/v1/messages` and
  * `/v1/models` hang off it. Users paste all three shapes, so accept them all. */
@@ -71,8 +69,6 @@ function normalizeAnthropicRoot(value?: string): string {
 // OpenAI's Chat Completions API only accepts these four efforts, so "max"
 // saturates at "high". Anthropic instead takes an explicit thinking budget,
 // which is where the stronger levels become meaningful.
-const openAIReasoningEffort: Record<string, string> = { minimal: "minimal", low: "low", medium: "medium", high: "high", max: "high" };
-const anthropicThinkingBudget: Record<string, number> = { low: 2048, medium: 6144, high: 12288, max: 24576 };
 
 const sleep = (milliseconds: number) => new Promise(resolve => setTimeout(resolve, milliseconds));
 const isQuotaExceeded = (value: string): boolean => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|余额不足|额度(?:已)?用尽/i.test(value);
@@ -328,38 +324,8 @@ function emptyCompletionError(data: Record<string, unknown>, maxTokens: number):
   return new Error(`API Saver 返回内容为空（响应字段：${topKeys || "无"}；choice：${choiceKeys || "无"}）`);
 }
 
-/** Anthropic keeps the system prompt out of the turn list and rejects a
- * conversation that does not start with a user turn, so fold both rules in
- * here rather than at every call site. */
-function toAnthropicMessages(messages: ChatMessage[]): { system: string; turns: Array<{ role: "user" | "assistant"; content: string }> } {
-  const system = messages
-    .filter(message => message.role === "system" && message.content.trim())
-    .map(message => message.content)
-    .join("\n\n");
-  const turns: Array<{ role: "user" | "assistant"; content: string }> = [];
-  for (const message of messages) {
-    if (message.role === "system" || !message.content.trim()) continue;
-    const role = message.role === "assistant" ? "assistant" : "user";
-    const previous = turns[turns.length - 1];
-    if (previous?.role === role) previous.content = `${previous.content}\n\n${message.content}`;
-    else turns.push({ role, content: message.content });
-  }
-  if (!turns.length) turns.push({ role: "user", content: system || "继续" });
-  if (turns[0].role === "assistant") turns.unshift({ role: "user", content: "请继续。" });
-  return { system, turns };
-}
-
 /** Only `text` blocks are prose. `thinking` and `tool_use` blocks share the
  * array and must not leak into a chapter. */
-function anthropicText(value: unknown): string {
-  if (!Array.isArray(value)) return extractText(value);
-  return value
-    .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === "object"))
-    .filter(block => block.type === "text")
-    .map(block => typeof block.text === "string" ? block.text : "")
-    .join("");
-}
-
 function emptyAnthropicError(data: Record<string, unknown>, maxTokens: number): Error {
   const stopReason = typeof data.stop_reason === "string" ? data.stop_reason : "";
   if (stopReason === "max_tokens") {
@@ -460,9 +426,7 @@ export class ApiSaverClient {
   }
 
   private authHeaders(key: string): Record<string, string> {
-    return this.wireMode === "anthropic"
-      ? { "x-api-key": key, "anthropic-version": ANTHROPIC_VERSION }
-      : { Authorization: `Bearer ${key}` };
+    return protocolAuthHeaders(key, this.wireMode);
   }
 
   // Anthropic 提供官方 count_tokens 端点；先用本地 tokenizer 裁剪，再用
