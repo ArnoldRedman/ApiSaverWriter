@@ -18,11 +18,6 @@
   - 当前变更协议只支持 `chapter.draft_next`，执行后生成 `chapter.create`，不能覆盖已有章节。
   - 需要新增类似 `chapter.revise` 的变更类型，并同步桌面/移动端白名单、Runtime schema、章节智能体委托、前端冲突快照和确认应用逻辑。
 
-- [ ] **让桌面构建执行严格 TypeScript 检查**
-  - `npm --prefix desktop-app run build` 当前能成功，但脚本中的 `tsc` 不会构建 solution references。
-  - `cd desktop-app && npx tsc -b` 仍有存量类型错误；清理后应把 `tsc -b` 接入 `build` 或独立 CI 检查。
-  - 根目录 `npm run typecheck` 目前只检查 Agent Runtime。
-
 - [ ] **扩展小说目录导入格式**
   - `desktop-app/scripts/import-story-folder.mjs` 仍只适配 StoryForge 的 `story_data/{chapters,outlines,bible,state}` 结构。
   - 如需导入其他目录布局，再按真实样本增加映射，不预先设计通用导入框架。
@@ -49,6 +44,36 @@
 - [x] **导入防覆盖保护**
   - 本地 `projects/` 非空时脚本会中止；可使用 `--dry-run` 或空的 `--app-data` 先验证。
 
+- [x] **架构重构阶段 0/1：质量门禁与共享契约**
+  - 新增 `packages/contracts`，统一 RPC 方法表、DTO、进度事件和运行时参数校验。
+  - 前端 Agent 调用统一经过 typed `agentRpcAs()`；Runtime 通过 `RpcRegistry` 注册和校验。
+  - 清理桌面严格 TypeScript 存量错误，构建改为 `tsc -b`；CI 打包前强制执行 `npm run check`。
+
+- [x] **第一批物理模块拆分**
+  - Runtime 书源、榜单、模型、内容和文本处理拆入 `sources/`、`application/`、`rpc/`。
+  - 移动百度同步和书源拆入 `platform/mobile/`；Rust Agent 进程桥拆入 `runtime.rs`。
+  - 前端 Project、Library、Skill、KnowledgeGraph、模型设置和项目 Agent 会话模型拆入 `domain/` 与 `features/`。
+  - `projects` 成为唯一项目状态源，编辑器只保存项目 ID；章节/大纲/卡片流式输出按动画帧批量提交。
+  - Rust project_store、resource_store、runtime 已独立；删除不在 workspace、构建或应用链路中的旧根 `src/`/`tests/` 原型。
+
+## 架构后续阶段
+
+- [ ] **继续收敛前端组合根**
+  - 按 projects/editor/agent/library/rankings/settings/sync 继续拆分 hooks 与页面组件。
+  - `projects` 已成为唯一项目状态源，编辑区只保存 projectId；后续继续拆章节选择与页面渲染。
+
+- [ ] **项目增量持久化**
+  - 新增细粒度保存命令，避免每次小编辑序列化并重写整个项目数组。
+  - 保持现有本地文件格式，先补往返与失败恢复测试再迁移。
+
+- [ ] **继续拆分 Rust 原生模块**
+  - project_store、resource_store 和 runtime 已拆出；后续继续拆 agent_chat_store、backup/github、backup/baidu、system。
+  - `lib.rs` 最终只保留插件、状态和 command 注册。
+
+- [x] **统一核心模型协议纯逻辑**
+  - 新增 `packages/model-protocol`，共享认证、Anthropic 消息转换、thinking/reasoning 档位和正文块过滤。
+  - 平台层保留 fetch/进程/文件 IO；地址、usage 和完整请求 body 的剩余重复在后续按测试迁移。
+
 ## 已知限制
 
 这些是当前明确边界，不等同于未完成任务；只有真实需求出现时再升级。
@@ -60,9 +85,11 @@
 ## 本轮验证
 
 ```text
-npm test                                      通过：11 个文件，62 个测试
-npm run typecheck                             通过：Agent Runtime
+npm test                                      通过：13 个文件，69 个测试
+npm run typecheck                             通过：Contracts + Model Protocol + Agent Runtime
 npm --prefix sidecars/agent-runtime run build 通过
-npm --prefix desktop-app run build            通过（有 chunk 大小警告）
-cd desktop-app && npx tsc -b                  未通过：仍有存量类型错误
+npm --prefix desktop-app run lint             通过：0 警告
+npm --prefix desktop-app run build            通过：严格 tsc -b + Vite（有 chunk 大小警告）
+npm run check:rust                            通过
+npm run test:rust                             通过
 ```

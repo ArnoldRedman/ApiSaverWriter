@@ -1,0 +1,50 @@
+import { describe, expect, it, vi } from "vitest";
+import { agentRpcMethods, ProjectAgentChangeSchema } from "@apisaverwriter/contracts";
+import { RpcRegistry } from "../src/rpc/registry.js";
+
+describe("RPC registry", () => {
+  it("rejects unknown methods before reaching business handlers", async () => {
+    const legacy = vi.fn();
+    const result = await new RpcRegistry(legacy).dispatch({ id: 1, method: "unknown.method", params: {} });
+    expect(result.error?.code).toBe(-32601);
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("validates shared request contracts and delegates known methods", async () => {
+    const legacy = vi.fn().mockResolvedValue({ id: 1, result: { ok: true } });
+    const registry = new RpcRegistry(legacy);
+    const result = await registry.dispatch({ id: 1, method: "chapter.write", params: { contextWindow: 128 } });
+    expect(result.result).toEqual({ ok: true });
+    expect(legacy).toHaveBeenCalledWith(expect.objectContaining({ method: "chapter.write", params: expect.objectContaining({ contextWindow: 128 }) }));
+  });
+
+  it("rejects malformed model params instead of passing them through", async () => {
+    const legacy = vi.fn().mockResolvedValue({ id: 1, result: {} });
+    const registry = new RpcRegistry(legacy);
+    const badMode = await registry.dispatch({ id: 1, method: "chapter.write", params: { apiMode: "grpc" } });
+    expect(badMode.error?.code).toBe(-32602);
+    const badKeys = await registry.dispatch({ id: 2, method: "chapter.write", params: { apiKeys: "not-an-array" } });
+    expect(badKeys.error?.code).toBe(-32602);
+    expect(legacy).not.toHaveBeenCalled();
+  });
+
+  it("keeps coerced param values instead of discarding them", async () => {
+    const legacy = vi.fn().mockResolvedValue({ id: 1, result: {} });
+    await new RpcRegistry(legacy).dispatch({ id: 1, method: "chapter.write", params: { contextWindow: "128", project: { title: "书" } } });
+    const forwarded = legacy.mock.calls[0][0] as { params: Record<string, unknown> };
+    expect(forwarded.params.contextWindow).toBe(128);
+    // 大体量业务字段必须原样透传，不被协议层丢弃
+    expect(forwarded.params.project).toEqual({ title: "书" });
+  });
+
+  it("keeps a single canonical method inventory", () => {
+    expect(new Set(agentRpcMethods).size).toBe(agentRpcMethods.length);
+    expect(agentRpcMethods).toContain("project.agent.chat");
+    expect(agentRpcMethods).toContain("chapter.write");
+  });
+
+  it("shares the project change allowlist across frontend and runtime", () => {
+    expect(ProjectAgentChangeSchema.parse({ type: "chapter.create", summary: "创建章节", title: "第一章", content: "正文" }).type).toBe("chapter.create");
+    expect(() => ProjectAgentChangeSchema.parse({ type: "chapter.delete", summary: "非法操作" })).toThrow();
+  });
+});

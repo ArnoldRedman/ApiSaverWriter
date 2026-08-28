@@ -1,130 +1,23 @@
 import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
+import { agentRpc } from './services/agent-client';
+import type { AgentProgressEvent, RuntimeUsageSummary } from '@apisaverwriter/contracts';
+import { nativeClient } from './services/native-client';
+import type { Skill } from './domain/skill';
+import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionChapter, AIDetectionLabel, AIDetectionSegment, AIDetectionReport, MemoryDocumentKind, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
+import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
+import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
+import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
+import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
+import { defaultBaseURL, defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, isDefaultApiService, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, orderApiKeysForModel, applyModelKeyRouting, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
 
-export interface Skill {
-  id: number | string;
-  name: string;
-  /** Stable routing key; built-in skills use displayName for Chinese UI text. */
-  displayName?: string;
-  category: string;
-  description: string;
-  tags: string[];
-  rating: number;
-  usageCount: number;
-  content: string;
-  builtin?: boolean;
-}
 
-interface Chapter {
-  id: number;
-  title: string;
-  content: string;
-  wordCount: number;
-  createdAt: string;
-  updatedAt: string;
-}
 
-interface OutlineNode {
-  id: number;
-  title: string;
-  description: string;
-  type: 'arc' | 'chapter' | 'scene';
-  children?: OutlineNode[];
-  status: 'planned' | 'writing' | 'completed';
-}
 
-type OutlineKind = '总纲' | '章纲' | '世界观与作品设定';
-
-interface OutlineDocument {
-  id: number;
-  kind: OutlineKind;
-  chapterId?: number;
-  title: string;
-  content: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-type CardType = '角色卡' | '物品卡' | '地点卡' | '势力卡' | '金手指卡';
-
-interface KnowledgeCard {
-  id: number;
-  type: CardType;
-  title: string;
-  content: string;
-  currentState?: string;
-  stateHistory?: Array<{ chapterId: number; chapterTitle: string; status: string; changes: string; updatedAt: string }>;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface ChapterMemory {
-  id: number;
-  chapterId: number;
-  chapterTitle: string;
-  summary: string;
-  keywords: string[];
-  characterStateChanges: string[];
-  knowledgeChanges: string[];
-  foreshadowingChanges: string[];
-  foreshadowingItems?: Array<{ text: string; status: 'active' | 'progressing' | 'resolved' | 'overdue'; priority: 'high' | 'normal' | 'low'; plantedChapter?: number; targetChapter?: number }>;
-  timelineEvents: string[];
-  canonFacts: string[];
-  conflicts: string[];
-  endingHook: string;
-  sourceChapterNumber?: number;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface AIDetectionChapter {
-  chapterId: number;
-  chapterTitle: string;
-  wordCount: number;
-  sentenceUniformity: number;
-  logicFrequency: number;
-  colloquialFrequency: number;
-  psychologicalFrequency: number;
-  paragraphUniformity: number;
-  aiRate: number;
-  humanRate: number;
-  segments: AIDetectionSegment[];
-  label: AIDetectionLabel;
-}
-
-type AIDetectionLabel = '人工' | '疑似 AI' | 'AI 特征';
-
-interface AIDetectionSegment {
-  order: number;
-  text: string;
-  confidence: number;
-  label: AIDetectionLabel;
-}
-
-interface AIDetectionReport {
-  updatedAt: string;
-  scope: 'chapter' | 'book';
-  chapters: AIDetectionChapter[];
-  averageAIRate: number;
-  level: string;
-  suggestion: string;
-  provider: '本地启发式';
-}
-
-type MemoryDocumentKind = '章节快照' | '人物状态' | '角色认知' | '伏笔追踪' | '时间线' | '设定事实' | '冲突';
-
-interface MemoryDocument {
-  id: string;
-  kind: MemoryDocumentKind;
-  title: string;
-  content: string;
-  updatedAt: string;
-  manuallyEdited?: boolean;
-}
 
 interface CloudBackupFile {
   name: string;
@@ -150,216 +43,12 @@ interface GitHubRestoreConflict {
   commit: string;
 }
 
-interface KnowledgeGraphNode {
-  id: string;
-  label: string;
-  type: 'chapter' | 'card' | 'outline' | 'entity';
-  category?: string;
-  content?: string;
-  sourcePath?: string;
-  status?: string;
-  sourceChapterIds?: number[];
-  updatedAt?: string;
-}
-
-interface KnowledgeGraphEdge {
-  id: string;
-  source: string;
-  target: string;
-  label: string;
-  weight?: number;
-  sourceChapterId?: number;
-  updatedAt?: string;
-}
-
-// 权重代表关系证据强度，不是模型猜测的“重要程度”。高权重关系会优先进入写作上下文。
-const defaultKnowledgeGraphWeight = (label: string): number => {
-  if (label === '本章引用') return 1;
-  if (label === '状态更新') return 0.95;
-  if (label === '章节主角') return 0.92;
-  if (label === '状态引用') return 0.88;
-  if (label === '正文提及') return 0.75;
-  if (label === '章节提及') return 0.7;
-  return 0.65;
-};
-
-const normalizeKnowledgeGraphWeight = (value: unknown, label: string): number => {
-  const parsed = typeof value === 'number' ? value : Number(value);
-  const weight = Number.isFinite(parsed) ? parsed : defaultKnowledgeGraphWeight(label);
-  return Math.round(Math.max(0.1, Math.min(1, weight)) * 100) / 100;
-};
-
-const normalizeKnowledgeGraphEdges = (value: unknown): KnowledgeGraphEdge[] => Array.isArray(value)
-  ? value.filter((edge): edge is Partial<KnowledgeGraphEdge> => Boolean(edge && typeof edge === 'object'))
-    .map(edge => ({
-      id: String(edge.id || `${edge.source || 'unknown'}->${edge.target || 'unknown'}:${edge.label || '关联'}`),
-      source: String(edge.source || ''),
-      target: String(edge.target || ''),
-      label: String(edge.label || '关联'),
-      weight: normalizeKnowledgeGraphWeight(edge.weight, String(edge.label || '关联')),
-      sourceChapterId: edge.sourceChapterId,
-      updatedAt: edge.updatedAt,
-    })).filter(edge => edge.source && edge.target)
-  : [];
-
-const upsertKnowledgeGraphEdge = (edges: KnowledgeGraphEdge[], next: KnowledgeGraphEdge) => {
-  const nextWeight = normalizeKnowledgeGraphWeight(next.weight, next.label);
-  const index = edges.findIndex(edge => edge.id === next.id);
-  if (index < 0) {
-    edges.push({ ...next, weight: nextWeight });
-    return;
-  }
-  const existing = edges[index];
-  // 同一关系出现多次时，只提高已有证据强度，避免一次弱抽取覆盖明确引用。
-  edges[index] = {
-    ...existing,
-    ...next,
-    weight: Math.max(normalizeKnowledgeGraphWeight(existing.weight, existing.label), nextWeight),
-    updatedAt: next.updatedAt || existing.updatedAt,
-  };
-};
-
-const graphNodeTypeLabel = (node: KnowledgeGraphNode) => {
-  if (node.type === 'chapter') return '章节';
-  if (node.type === 'outline') return '大纲';
-  if (node.type === 'card') return node.category || '知识卡';
-  return node.category || '实体';
-};
-
-const graphNodeGroup = (node: KnowledgeGraphNode) => {
-  const type = graphNodeTypeLabel(node);
-  if (/角色|人物/u.test(type)) return '重要角色';
-  if (/地点|场景/u.test(type)) return '地点与场景';
-  if (/势力|组织/u.test(type)) return '组织与势力';
-  if (/物品|金手指/u.test(type)) return '物品与设定';
-  if (node.type === 'chapter') return '章节事件';
-  if (node.type === 'outline') return '大纲设定';
-  return '其他实体';
-};
-
-const graphNodeRelativePath = (node: KnowledgeGraphNode) => node.sourcePath || `图谱/${graphNodeGroup(node)}/${node.label}.md`;
-
-const graphNodeProfile = (node: KnowledgeGraphNode) => node.content?.trim() || `## 基础信息\n- 节点类型：${graphNodeTypeLabel(node)}\n- 当前状态：${node.status || '待补充'}\n\n## 档案\n待补充。`;
-
-const createGraphNodeProfile = (type: KnowledgeGraphNode['type'], category?: string) => `## 基础信息\n- 节点类型：${type === 'entity' ? category || '实体' : type === 'card' ? category || '知识卡' : type === 'chapter' ? '章节' : '大纲'}\n- 当前状态：待补充\n\n## 档案\n待补充。`;
-
-interface Project {
-  id: number;
-  title: string;
-  genre: string;
-  subgenre?: string;
-  tags?: Partial<Record<TagTab, string[]>>;
-  cover?: string;
-  protagonist1?: string;
-  protagonist2?: string;
-  synopsis?: string;
-  status: 'writing' | 'completed';
-  chapters: Chapter[];
-  outline: OutlineNode[];
-  outlines: OutlineDocument[];
-  cards: KnowledgeCard[];
-  memories: ChapterMemory[];
-  memoryDocuments: MemoryDocument[];
-  graphNodes: KnowledgeGraphNode[];
-  graphEdges: KnowledgeGraphEdge[];
-  createdAt: string;
-  updatedAt: string;
-  wordCount: number;
-  // Legacy metadata is retained verbatim when an existing project is saved.
-  // Automatic publishing is no longer part of the application.
-  publishConfig?: unknown;
-  publishRecords?: unknown;
-  aiDetection?: AIDetectionReport;
-  chapterTargetWords?: number;
-  styleProfileId?: string;
-  sourceDismantleBookId?: string;
-  authorPreferences?: string[];
-  githubRepositoryUrl?: string;
-}
-
-type DismantleChapterStatus = 'pending' | 'analyzing' | 'analyzed' | 'rewritten';
-
-interface DismantleChapter {
-  id: string;
-  number: number;
-  title: string;
-  sourceContent: string;
-  wordCount: number;
-  summary: string;
-  detailedOutline: string;
-  plotBeats: string[];
-  characterDynamics: string[];
-  setupPayoff: string[];
-  pacing: string;
-  rewriteContent: string;
-  status: DismantleChapterStatus;
-  sourcePath?: string;
-  outlinePath?: string;
-  rewritePath?: string;
-  updatedAt: string;
-}
-
-interface DismantleBook {
-  id: string;
-  title: string;
-  sourceFileName: string;
-  chapters: DismantleChapter[];
-  boundProjectId?: number;
-  sourceLibraryBookId?: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-interface LibraryBookChapter {
-  id: string;
-  number: number;
-  title: string;
-  url: string;
-  content: string;
-  wordCount: number;
-  downloaded: boolean;
-  unavailableReason?: string;
-  outline?: string;
-}
-
-interface LibraryBook {
-  id: string;
-  title: string;
-  author: string;
-  source: string;
-  sourceId?: string;
-  sourceBookId?: string;
-  url: string;
-  intro: string;
-  cover?: string;
-  category?: string;
-  wordCount?: number;
-  chapters: LibraryBookChapter[];
-  downloadedAt?: string;
-  createdAt: string;
-  updatedAt: string;
-  localPath?: string;
-  fontCss?: string;
-}
-
-type RankingPlatform = 'fanqie' | 'qidian' | 'faloo';
-type RankingType = 'read' | 'new' | 'hot' | 'completed' | 'collect';
-type FanqieSection = 'male-read' | 'male-new' | 'female-read' | 'female-new';
-
 const fanqieSectionOptions: Array<{ value: FanqieSection; label: string; gender: 'male' | 'female'; list: 'read' | 'new' }> = [
   { value: 'male-read', label: '男频阅读', gender: 'male', list: 'read' },
   { value: 'male-new', label: '男频新书', gender: 'male', list: 'new' },
   { value: 'female-read', label: '女频阅读', gender: 'female', list: 'read' },
   { value: 'female-new', label: '女频新书', gender: 'female', list: 'new' },
 ];
-
-interface RankingCategoryOption {
-  id: string;
-  label: string;
-  url: string;
-  gender: 'male' | 'female';
-  list: 'read' | 'new';
-}
 
 const rankingTypeOptions = (platform: RankingPlatform): Array<{ value: RankingType; label: string }> => {
   if (platform === 'fanqie') return [{ value: 'read', label: '阅读榜' }, { value: 'new', label: '新书榜' }];
@@ -369,37 +58,6 @@ const rankingTypeOptions = (platform: RankingPlatform): Array<{ value: RankingTy
 };
 
 const rankingTypeLabel = (platform: RankingPlatform, type: RankingType) => rankingTypeOptions(platform).find(item => item.value === type)?.label || '榜单';
-
-interface RankingBook {
-  id: string;
-  title: string;
-  author: string;
-  intro: string;
-  cover?: string;
-  category?: string;
-  rank: number;
-  rankType: RankingType;
-  gender: 'male' | 'female' | 'all';
-  platform: 'fanqie' | 'qidian' | 'faloo';
-  sourceBookId?: string;
-  url: string;
-  wordCount?: number;
-  readCount?: number;
-  fetchedAt: string;
-  sourceName?: string;
-}
-
-interface WritingStyle {
-  id: string;
-  name: string;
-  description: string;
-  tags: string[];
-  content: string;
-  sourceBookId?: string;
-  createdAt: string;
-  updatedAt: string;
-  sourcePath?: string;
-}
 
 interface AIToolResult {
   mode: 'polish' | 'de-ai' | 'continue';
@@ -498,16 +156,6 @@ const chapterDraftFromStream = (raw: string, depth = 0): string => {
     : value;
 };
 
-interface RuntimeUsageSummary {
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-  cachedInputTokens: number;
-  cacheWriteTokens: number;
-  reasoningTokens: number;
-  requests: number;
-  startedAt: string;
-}
 interface UsageDay extends RuntimeUsageSummary { date: string }
 interface GatewayUsageAccount {
   keyIndex: number;
@@ -535,149 +183,6 @@ interface GatewayPricingEntry extends Record<string, unknown> {
 }
 interface AgentChatMessage { role: 'user' | 'assistant'; content: string; createdAt: string }
 
-type ProjectAgentMode = 'discuss' | 'execute';
-type ProjectAgentChangeStatus = 'pending' | 'applied' | 'dismissed';
-type ProjectAgentRawChange =
-  | { type: 'project.update'; summary: string; patch: Partial<Pick<Project, 'title' | 'synopsis' | 'genre' | 'subgenre' | 'protagonist1' | 'protagonist2' | 'status' | 'authorPreferences'>> }
-  | { type: 'outline.upsert'; summary: string; targetId?: number; kind: OutlineKind; title: string; content: string; chapterId?: number }
-  | { type: 'card.upsert'; summary: string; targetId?: number; cardType: CardType; title: string; content: string; currentState?: string }
-  | { type: 'memory.document.upsert'; summary: string; kind: MemoryDocumentKind; title: string; content: string }
-  | { type: 'graph.node.upsert'; summary: string; targetId: string; label: string; nodeType: KnowledgeGraphNode['type']; category?: string; content?: string; nodeStatus?: string }
-  | { type: 'graph.edge.upsert'; summary: string; targetId: string; source: string; target: string; label: string; weight?: number }
-  | { type: 'chapter.create'; summary: string; title: string; content: string; chapterPlan?: string; chapterSummary?: string };
-type ProjectAgentChange = ProjectAgentRawChange & { id: string; status: ProjectAgentChangeStatus; baseUpdatedAt?: string; baseFields?: Record<string, unknown> };
-interface ProjectAgentToolEvent { tool: string; status: 'complete' | 'error'; message: string }
-interface ProjectAgentMessage extends AgentChatMessage { id: string; toolEvents?: ProjectAgentToolEvent[]; changeIds?: string[]; error?: boolean }
-interface ProjectAgentSession {
-  version: 1;
-  projectId: number;
-  sessionId: string;
-  mode: ProjectAgentMode;
-  messages: ProjectAgentMessage[];
-  changes: ProjectAgentChange[];
-  updatedAt: string;
-}
-interface ProjectAgentResponse { message: string; changes?: unknown[]; toolEvents?: ProjectAgentToolEvent[] }
-
-const projectAgentSessionId = () => `project-agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-const projectAgentRecord = (value: unknown): value is Record<string, unknown> => Boolean(value && typeof value === 'object' && !Array.isArray(value));
-const projectAgentString = (value: unknown, max: number) => typeof value === 'string' && value.trim() && value.length <= max ? value.trim() : '';
-const projectAgentNumber = (value: unknown) => Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : undefined;
-
-const createProjectAgentSession = (projectId: number, sessionId = projectAgentSessionId()): ProjectAgentSession => ({
-  version: 1,
-  projectId,
-  sessionId,
-  mode: 'discuss',
-  messages: [],
-  changes: [],
-  updatedAt: new Date().toISOString(),
-});
-
-const normalizeProjectAgentChange = (value: unknown, project: Project, index = 0): ProjectAgentChange | null => {
-  if (!projectAgentRecord(value)) return null;
-  const type = projectAgentString(value.type, 80);
-  const summary = projectAgentString(value.summary, 200);
-  if (!summary) return null;
-  const id = projectAgentString(value.id, 160) || `change-${Date.now().toString(36)}-${index}-${Math.random().toString(36).slice(2, 7)}`;
-  const status: ProjectAgentChangeStatus = ['applied', 'dismissed'].includes(String(value.status)) ? value.status as ProjectAgentChangeStatus : 'pending';
-  const storedBase = typeof value.baseUpdatedAt === 'string' ? value.baseUpdatedAt : undefined;
-  if (type === 'project.update' && projectAgentRecord(value.patch)) {
-    const patch: Record<string, unknown> = {};
-    for (const key of ['title', 'synopsis', 'genre', 'subgenre', 'protagonist1', 'protagonist2'] as const) {
-      if (typeof value.patch[key] === 'string') patch[key] = value.patch[key];
-    }
-    if (value.patch.status === 'writing' || value.patch.status === 'completed') patch.status = value.patch.status;
-    if (Array.isArray(value.patch.authorPreferences)) patch.authorPreferences = value.patch.authorPreferences.filter(item => typeof item === 'string' && item.trim()).slice(0, 20);
-    if (!Object.keys(patch).length) return null;
-    // 只快照本次要改的字段：project.updatedAt 会被任意一次章节保存刷新，不能当作冲突依据
-    const source = project as unknown as Record<string, unknown>;
-    const baseFields = projectAgentRecord(value.baseFields) ? value.baseFields : Object.fromEntries(Object.keys(patch).map(key => [key, source[key]]));
-    return { type, id, status, summary, patch, baseFields } as ProjectAgentChange;
-  }
-  if (type === 'outline.upsert') {
-    const targetId = projectAgentNumber(value.targetId);
-    const target = targetId ? project.outlines.find(item => item.id === targetId) : undefined;
-    const kind = ['总纲', '章纲', '世界观与作品设定'].includes(String(value.kind)) ? value.kind as OutlineKind : null;
-    const title = projectAgentString(value.title, 160);
-    const content = projectAgentString(value.content, 60_000);
-    if (!kind || !title || !content || (targetId && !target)) return null;
-    return { type, id, status, summary, targetId, kind, title, content, chapterId: projectAgentNumber(value.chapterId), baseUpdatedAt: storedBase || target?.updatedAt };
-  }
-  if (type === 'card.upsert') {
-    const targetId = projectAgentNumber(value.targetId);
-    const target = targetId ? project.cards.find(item => item.id === targetId) : undefined;
-    const cardType = ['角色卡', '物品卡', '地点卡', '势力卡', '金手指卡'].includes(String(value.cardType)) ? value.cardType as CardType : null;
-    const title = projectAgentString(value.title, 120);
-    const content = projectAgentString(value.content, 40_000);
-    if (!cardType || !title || !content || (targetId && !target)) return null;
-    return { type, id, status, summary, targetId, cardType, title, content, currentState: typeof value.currentState === 'string' ? value.currentState.slice(0, 6000) : undefined, baseUpdatedAt: storedBase || target?.updatedAt };
-  }
-  if (type === 'memory.document.upsert') {
-    const kind = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'].includes(String(value.kind)) ? value.kind as MemoryDocumentKind : null;
-    const title = projectAgentString(value.title, 120);
-    const content = projectAgentString(value.content, 60_000);
-    const target = kind ? project.memoryDocuments.find(item => item.kind === kind) : undefined;
-    if (!kind || !title || !content) return null;
-    return { type, id, status, summary, kind, title, content, baseUpdatedAt: storedBase || target?.updatedAt };
-  }
-  if (type === 'graph.node.upsert') {
-    const targetId = projectAgentString(value.targetId, 160);
-    const label = projectAgentString(value.label, 120);
-    const nodeType = ['chapter', 'card', 'outline', 'entity'].includes(String(value.nodeType)) ? value.nodeType as KnowledgeGraphNode['type'] : null;
-    const target = project.graphNodes.find(item => item.id === targetId);
-    if (!targetId || !label || !nodeType) return null;
-    return { type, id, status, summary, targetId, label, nodeType, category: projectAgentString(value.category, 80) || undefined, content: typeof value.content === 'string' ? value.content.slice(0, 30_000) : undefined, nodeStatus: projectAgentString(value.nodeStatus, 1000) || undefined, baseUpdatedAt: storedBase || target?.updatedAt };
-  }
-  if (type === 'graph.edge.upsert') {
-    const targetId = projectAgentString(value.targetId, 240);
-    const source = projectAgentString(value.source, 160);
-    const target = projectAgentString(value.target, 160);
-    const label = projectAgentString(value.label, 80);
-    const existing = project.graphEdges.find(item => item.id === targetId);
-    const weight = typeof value.weight === 'number' && value.weight >= 0.1 && value.weight <= 1 ? value.weight : undefined;
-    if (!targetId || !source || !target || source === target || !label) return null;
-    return { type, id, status, summary, targetId, source, target, label, weight, baseUpdatedAt: storedBase || existing?.updatedAt };
-  }
-  if (type === 'chapter.create') {
-    const title = projectAgentString(value.title, 160);
-    const content = projectAgentString(value.content, 120_000);
-    if (!title || !content) return null;
-    return { type, id, status, summary, title, content, chapterPlan: typeof value.chapterPlan === 'string' ? value.chapterPlan.slice(0, 30_000) : undefined, chapterSummary: typeof value.chapterSummary === 'string' ? value.chapterSummary.slice(0, 3000) : undefined };
-  }
-  return null;
-};
-
-const normalizeProjectAgentSession = (value: unknown, project: Project, sessionId: string): ProjectAgentSession => {
-  if (!projectAgentRecord(value)) return createProjectAgentSession(project.id, sessionId);
-  const messages = Array.isArray(value.messages) ? value.messages.slice(-200).flatMap((item, index): ProjectAgentMessage[] => {
-    if (!projectAgentRecord(item) || (item.role !== 'user' && item.role !== 'assistant') || typeof item.content !== 'string') return [];
-    return [{
-      id: projectAgentString(item.id, 160) || `message-${index}`,
-      role: item.role,
-      content: item.content.slice(0, 30_000),
-      createdAt: typeof item.createdAt === 'string' ? item.createdAt : new Date().toISOString(),
-      toolEvents: Array.isArray(item.toolEvents) ? item.toolEvents.filter(projectAgentRecord).flatMap((event): ProjectAgentToolEvent[] => {
-        const tool = projectAgentString(event.tool, 120); const message = projectAgentString(event.message, 1000);
-        const status = event.status;
-        return tool && message && (status === 'complete' || status === 'error') ? [{ tool, message, status }] : [];
-      }).slice(0, 30) : undefined,
-      changeIds: Array.isArray(item.changeIds) ? item.changeIds.filter(id => typeof id === 'string').slice(0, 20) : undefined,
-      error: item.error === true,
-    }];
-  }) : [];
-  const changes = Array.isArray(value.changes) ? value.changes.slice(-80).map((item, index) => normalizeProjectAgentChange(item, project, index)).filter((item): item is ProjectAgentChange => Boolean(item)) : [];
-  return {
-    version: 1,
-    projectId: project.id,
-    sessionId,
-    mode: value.mode === 'execute' ? 'execute' : 'discuss',
-    messages,
-    changes,
-    updatedAt: typeof value.updatedAt === 'string' ? value.updatedAt : new Date().toISOString(),
-  };
-};
-
 interface AgentMemoryResult {
   summary?: string;
   keywords?: string[];
@@ -697,35 +202,12 @@ interface AgentMemoryResult {
 }
 
 type AgentStage = 'idle' | 'starting' | 'intent' | 'retrieve' | 'plan' | 'draft' | 'review' | 'done' | 'error';
-type ApiMode = 'openai' | 'anthropic';
-type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max';
 type AgentProgressStatus = 'pending' | 'active' | 'complete' | 'error';
 
 const skillCategoryLabels: Record<string, string> = {
   setup: '项目设置', write: '写作', review: '审查', polish: '润色',
   import: '导入', analyze: '分析', tool: '工具', creator: '创建器',
 };
-
-interface AgentConfig {
-  serviceName: string;
-  enabled: boolean;
-  apiMode: ApiMode;
-  baseURL: string;
-  apiKey: string;
-  apiKeys: string[];
-  // Model IDs returned by /v1/models are scoped to the authenticated key.
-  // Keep the relationship so calls never default to an unrelated first key.
-  modelKeyMap: Record<string, string[]>;
-  model: string;
-  // Models kept switchable in the editor. Per profile, because a Claude relay
-  // and an OpenAI relay never offer the same model IDs.
-  enabledModels: string[];
-  contextWindow: number;
-  reasoningMode: ReasoningMode;
-  proxyEnabled: boolean;
-  proxyURL: string;
-  proxyBypassLocal: boolean;
-}
 
 const agentStageLabel: Record<AgentStage, string> = {
   idle: '待命',
@@ -759,25 +241,6 @@ interface AgentProgressItem {
   progress: number;
 }
 
-interface AgentProgressEvent {
-  runId?: string;
-  type?: 'progress' | 'context' | 'chunk' | 'complete' | 'error';
-  data?: {
-    step?: string;
-    progress?: number;
-    text?: string;
-    message?: string;
-    error?: string;
-    context?: {
-      action: string;
-      source?: string;
-      status?: 'searching' | 'selected' | 'pruned' | 'loaded' | 'cached';
-      bytes?: number;
-      items?: number;
-    };
-  };
-}
-
 interface ContextTraceEvent {
   id: string;
   step: string;
@@ -799,52 +262,6 @@ const createAgentProgressItems = (): AgentProgressItem[] => agentWorkflowSteps.m
 const isAgentWorkflowStep = (value: string | undefined): value is AgentWorkflowStepId => Boolean(value && agentWorkflowSteps.some(step => step.id === value));
 const agentRunning = (stage: AgentStage) => !['idle', 'done', 'error'].includes(stage);
 
-const defaultBaseURL = 'https://api.apisaver.com/v1';
-const defaultAnthropicBaseURL = 'https://api.anthropic.com';
-const apiModes: Array<{ value: ApiMode; label: string; hint: string; placeholder: string; endpoint: string }> = [
-  { value: 'openai', label: 'OpenAI 兼容', hint: '走 /v1/chat/completions，请求头 Authorization: Bearer', placeholder: 'https://api.example.com/v1', endpoint: '/v1/chat/completions' },
-  { value: 'anthropic', label: 'Anthropic Messages', hint: '走 /v1/messages，请求头 x-api-key + anthropic-version', placeholder: 'https://api.anthropic.com', endpoint: '/v1/messages' },
-];
-const apiModeLabel = (mode: ApiMode) => apiModes.find(item => item.value === mode)?.label ?? 'OpenAI 兼容';
-const defaultBaseURLFor = (mode: ApiMode) => mode === 'anthropic' ? defaultAnthropicBaseURL : defaultBaseURL;
-/** OpenAI-compatible relays are addressed by their `/v1` root, Anthropic ones by
- * the host that serves `/v1/messages`. Returns '' for an unusable address so
- * callers can report it instead of silently falling back. */
-const normalizeBaseURL = (value: string, mode: ApiMode = 'openai') => {
-  const trimmed = value.trim().replace(/\/+$/, '');
-  if (!trimmed) return defaultBaseURLFor(mode);
-  try {
-    const parsed = new URL(trimmed);
-    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
-  } catch {
-    return '';
-  }
-  if (mode === 'anthropic') return trimmed.replace(/\/v1(?:\/messages)?$/i, '') || trimmed;
-  return /\/v1$/i.test(trimmed) ? trimmed : `${trimmed}/v1`;
-};
-/** Resolved URL the request will actually hit, shown next to the address field. */
-const resolvedEndpoint = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) => {
-  const base = normalizeBaseURL(config.baseURL, config.apiMode);
-  if (!base) return '';
-  return config.apiMode === 'anthropic' ? `${base}/v1/messages` : `${base}/chat/completions`;
-};
-// The gateway dashboard reads New API endpoints that only the managed ApiSaver
-// relay serves, so both the protocol and the host have to match.
-const isDefaultApiService = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) =>
-  config.apiMode === 'openai' && normalizeBaseURL(config.baseURL, 'openai') === defaultBaseURL;
-
-const contextWindowPresets = [64, 128, 200, 256, 512, 1024, 2048];
-const maxContextWindowKTokens = 2048;
-const formatContextWindow = (value: number) => value >= 1024 ? `${(value / 1024).toFixed(value % 1024 ? 1 : 0)}M tokens` : `${value}K tokens`;
-const clampContextWindow = (value: unknown) => Math.min(maxContextWindowKTokens, Math.max(16, Number(value) || 128));
-const reasoningModes: Array<{ value: ReasoningMode; hint: string }> = [
-  { value: 'auto', hint: '不发送思考参数，由模型自行决定' },
-  { value: 'off', hint: '明确关闭思考' },
-  { value: 'low', hint: 'Anthropic 思考预算 2K tokens' },
-  { value: 'medium', hint: 'Anthropic 思考预算 6K tokens' },
-  { value: 'high', hint: 'Anthropic 思考预算 12K tokens' },
-  { value: 'max', hint: 'Anthropic 思考预算 24K tokens；OpenAI 兼容接口没有 max，会按 high 发送' },
-];
 const memoryQuotaCooldownMs = 5 * 60 * 1000;
 let memoryQuotaRetryAt = 0;
 const isQuotaExceededError = (value: unknown) => /quota\s+(?:has\s+been\s+)?exceeded|insufficient[\s_-]*quota|billing[\s_-]*(?:limit|quota)|额度(?:已)?用尽|余额不足/iu.test(String(value));
@@ -858,122 +275,6 @@ const deviceBackedStateKeys = new Set([
   'writer-dismantle-books',
   'writer-writing-styles',
 ]);
-const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
-const normalizeAgentConfig = (value: unknown): AgentConfig => {
-  const parsed = value && typeof value === 'object' ? value as Partial<AgentConfig> & Record<string, unknown> : {};
-  const apiKeys = Array.from(new Set([
-    typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
-    ...(Array.isArray(parsed.apiKeys) ? parsed.apiKeys : []),
-  ].filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())));
-  const savedModelKeyMap = parsed.modelKeyMap && typeof parsed.modelKeyMap === 'object' ? parsed.modelKeyMap as Record<string, unknown> : {};
-  const modelKeyMap = Object.fromEntries(Object.entries(savedModelKeyMap).flatMap(([model, values]) => {
-    const mappedKeys = Array.isArray(values)
-      ? values.filter((key): key is string => typeof key === 'string' && apiKeys.includes(key))
-      : [];
-    return mappedKeys.length ? [[model, Array.from(new Set(mappedKeys))]] : [];
-  }));
-  const apiMode: ApiMode = parsed.apiMode === 'anthropic' ? 'anthropic' : 'openai';
-  const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0];
-  const enabledModels = Array.from(new Set([
-    ...(Array.isArray(parsed.enabledModels) ? parsed.enabledModels : []).filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map(item => item.trim()),
-    model,
-  ]));
-  // 旧版本曾保存字节数；超过 4096 的值只可能来自旧单位，迁移为 K tokens 档位
-  const storedWindow = Number((parsed as Record<string, unknown>).contextWindowKB ?? parsed.contextWindow) || 0;
-  const storedReasoning = (parsed as Record<string, unknown>).reasoningMode;
-  return {
-    serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : 'ApiSaver（省API）',
-    enabled: parsed.enabled !== false,
-    apiMode,
-    baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURLFor(apiMode), apiMode) || defaultBaseURLFor(apiMode),
-    apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
-    apiKeys,
-    modelKeyMap,
-    model,
-    enabledModels,
-    contextWindow: clampContextWindow(storedWindow > maxContextWindowKTokens * 2 ? storedWindow / 1024 : storedWindow),
-    // `custom` disappeared with the English effort scale; it behaved as medium.
-    reasoningMode: storedReasoning === 'custom' ? 'medium'
-      : reasoningModes.some(item => item.value === storedReasoning) ? storedReasoning as ReasoningMode : 'auto',
-    proxyEnabled: parsed.proxyEnabled === true,
-    proxyURL: typeof parsed.proxyURL === 'string' && parsed.proxyURL.trim() ? parsed.proxyURL : 'http://127.0.0.1:7897',
-    proxyBypassLocal: parsed.proxyBypassLocal === true,
-  };
-};
-
-interface AgentProfile extends AgentConfig {
-  id: string;
-}
-const profilesStorageKey = 'agent-profiles';
-const activeProfileStorageKey = 'agent-active-profile';
-const newProfileId = () => `profile-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-const normalizeAgentProfile = (value: unknown): AgentProfile => {
-  const parsed = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-  return {
-    ...normalizeAgentConfig(parsed),
-    id: typeof parsed.id === 'string' && parsed.id.trim() ? parsed.id.trim() : newProfileId(),
-  };
-};
-/** Reads the profile list, promoting a pre-upgrade single `agent-config` into
- * profile #1 so an existing install keeps its keys and models. */
-const loadAgentProfiles = (): { profiles: AgentProfile[]; activeId: string } => {
-  let profiles: AgentProfile[] = [];
-  try {
-    const saved = JSON.parse(localStorage.getItem(profilesStorageKey) || '[]') as unknown;
-    profiles = Array.isArray(saved) ? saved.map(normalizeAgentProfile) : [];
-  } catch {
-    profiles = [];
-  }
-  if (!profiles.length) {
-    try {
-      const legacy = localStorage.getItem('agent-config');
-      const legacyModels = JSON.parse(localStorage.getItem('agent-models') || '[]') as unknown;
-      profiles = [normalizeAgentProfile({
-        ...(legacy ? JSON.parse(legacy) as Record<string, unknown> : {}),
-        ...(Array.isArray(legacyModels) && legacyModels.length ? { enabledModels: legacyModels } : {}),
-      })];
-    } catch {
-      profiles = [normalizeAgentProfile({})];
-    }
-  }
-  const storedActive = localStorage.getItem(activeProfileStorageKey) || '';
-  return { profiles, activeId: profiles.some(profile => profile.id === storedActive) ? storedActive : profiles[0].id };
-};
-const profilePresets: Array<{ id: string; label: string; hint: string; config: Partial<AgentConfig> }> = [
-  { id: 'apisaver', label: 'ApiSaver（省API）', hint: 'OpenAI 兼容 · 官方中转站', config: { serviceName: 'ApiSaver（省API）', apiMode: 'openai', baseURL: defaultBaseURL, model: fallbackModels[0] } },
-  { id: 'anthropic', label: 'Anthropic 官方', hint: 'Messages · api.anthropic.com', config: { serviceName: 'Anthropic 官方', apiMode: 'anthropic', baseURL: defaultAnthropicBaseURL, model: 'claude-opus-5', enabledModels: ['claude-opus-5'] } },
-  { id: 'openai-relay', label: '自定义中转（OpenAI 兼容）', hint: '任意支持 /v1/chat/completions 的地址', config: { serviceName: '自定义中转站', apiMode: 'openai', baseURL: defaultBaseURL } },
-  { id: 'anthropic-relay', label: '自定义中转（Anthropic）', hint: '任意支持 /v1/messages 的地址', config: { serviceName: '自定义 Claude 中转', apiMode: 'anthropic', baseURL: defaultAnthropicBaseURL } },
-];
-
-/** Mirror of the runtime's `settings.diagnose` result. */
-interface DiagnosticCheck {
-  id: string;
-  label: string;
-  status: 'pass' | 'warn' | 'fail';
-  detail: string;
-}
-interface DiagnosticReport {
-  mode: ApiMode;
-  modelsEndpoint: string;
-  chatEndpoint: string;
-  checks: DiagnosticCheck[];
-}
-const diagnosticStatusIcon: Record<DiagnosticCheck['status'], string> = { pass: '✓', warn: '!', fail: '×' };
-const agentNetworkParams = (config: AgentConfig) => ({
-  proxyEnabled: config.proxyEnabled,
-  proxyURL: config.proxyURL.trim(),
-  proxyBypassLocal: config.proxyBypassLocal,
-});
-const orderApiKeysForModel = (config: Pick<AgentConfig, 'apiKey' | 'apiKeys' | 'modelKeyMap'>, model: string) => {
-  const all = Array.from(new Set([config.apiKey, ...(config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-  const preferred = (config.modelKeyMap?.[model] || []).filter(key => all.includes(key));
-  return Array.from(new Set([...preferred, ...all]));
-};
-const applyModelKeyRouting = <T extends AgentConfig>(config: T, model: string): T => {
-  const keys = orderApiKeysForModel(config, model);
-  return { ...config, model, apiKey: keys[0] || '', apiKeys: keys };
-};
 const outlineKinds: OutlineKind[] = ['总纲', '章纲', '世界观与作品设定'];
 const memoryDocumentKinds: MemoryDocumentKind[] = ['章节快照', '人物状态', '角色认知', '伏笔追踪', '时间线', '设定事实', '冲突'];
 
@@ -983,152 +284,7 @@ const asTextList = (value: unknown, limit = 20) => Array.isArray(value)
   : [];
 const memoryTextList = (value: string) => value.split(/\r?\n|、/).map(item => item.trim()).filter(Boolean).slice(0, 30);
 
-const localResourceId = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-const splitTxtIntoDismantleChapters = (text: string): Array<{ title: string; sourceContent: string }> => {
-  const cleaned = text.replace(/^\uFEFF/u, '').replace(/\r\n/gu, '\n').trim();
-  if (!cleaned) return [];
-  // 兼容网文 TXT 常见的标题行：第X章、Chapter X、1、标题、1. 标题、1 标题。
-  // 仅识别独立行，避免正文中的普通数字被错误切分。
-  const heading = new RegExp('^[\\t 　]*(?:第[\\t 　]*[0-9０-９一二三四五六七八九十百千万零〇两]+[\\t 　]*[章节卷回部篇集].*|(?:chapter|chap\\.?)\\s*[0-9０-９]+(?:[\\t 　]*[-—:：、.．][\\t 　]*.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\\t 　]*[、.．:：\\-—][\\t 　]*(?:\\S.*)?|(?:[0-9０-９]{1,5}|[一二三四五六七八九十百千万零〇两]{1,8})[\\t 　]*$|[0-9０-９]{1,5}[\\t 　]+\\S.*)$', 'gimu');
-  const matches = Array.from(cleaned.matchAll(heading));
-  if (!matches.length) return [{ title: '第1章', sourceContent: cleaned }];
-  const chapters: Array<{ title: string; sourceContent: string }> = [];
-  const preface = cleaned.slice(0, matches[0].index).trim();
-  if (preface) chapters.push({ title: '序章', sourceContent: preface });
-  matches.forEach((match, index) => {
-    const start = match.index ?? 0;
-    const end = matches[index + 1]?.index ?? cleaned.length;
-    const sourceContent = cleaned.slice(start, end).trim();
-    const firstBreak = sourceContent.indexOf('\n');
-    const title = (firstBreak >= 0 ? sourceContent.slice(0, firstBreak) : sourceContent).trim().slice(0, 100) || `第${chapters.length + 1}章`;
-    const body = (firstBreak >= 0 ? sourceContent.slice(firstBreak + 1) : '').trim();
-    chapters.push({ title, sourceContent: body || sourceContent });
-  });
-  return chapters.filter(chapter => chapter.sourceContent.trim());
-};
-
-const readLocalTxtFile = async (file: File): Promise<string> => {
-  const bytes = await file.arrayBuffer();
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    try { return new TextDecoder('gb18030').decode(bytes); }
-    catch { return new TextDecoder().decode(bytes); }
-  }
-};
-
-const normalizeDismantleChapter = (chapter: Partial<DismantleChapter>, index: number): DismantleChapter => ({
-  id: typeof chapter.id === 'string' ? chapter.id : localResourceId('dismantle-chapter'),
-  number: Number(chapter.number) || index + 1,
-  title: typeof chapter.title === 'string' && chapter.title.trim() ? chapter.title.trim() : `第${index + 1}章`,
-  sourceContent: typeof chapter.sourceContent === 'string' ? chapter.sourceContent : '',
-  wordCount: countNovelCharacters(typeof chapter.sourceContent === 'string' ? chapter.sourceContent : ''),
-  summary: typeof chapter.summary === 'string' ? chapter.summary : '',
-  detailedOutline: typeof chapter.detailedOutline === 'string' ? chapter.detailedOutline : '',
-  plotBeats: asTextList(chapter.plotBeats, 10),
-  characterDynamics: asTextList(chapter.characterDynamics, 10),
-  setupPayoff: asTextList(chapter.setupPayoff, 10),
-  pacing: typeof chapter.pacing === 'string' ? chapter.pacing : '',
-  rewriteContent: typeof chapter.rewriteContent === 'string' ? chapter.rewriteContent : '',
-  status: chapter.status === 'analyzing' || chapter.status === 'analyzed' || chapter.status === 'rewritten' ? chapter.status : 'pending',
-  sourcePath: typeof chapter.sourcePath === 'string' ? chapter.sourcePath : undefined,
-  outlinePath: typeof chapter.outlinePath === 'string' ? chapter.outlinePath : undefined,
-  rewritePath: typeof chapter.rewritePath === 'string' ? chapter.rewritePath : undefined,
-  updatedAt: typeof chapter.updatedAt === 'string' ? chapter.updatedAt : new Date().toISOString(),
-});
-
-const normalizeDismantleBook = (book: Partial<DismantleBook>): DismantleBook => {
-  const now = new Date().toISOString();
-  return {
-    id: typeof book.id === 'string' ? book.id : localResourceId('dismantle'),
-    title: typeof book.title === 'string' && book.title.trim() ? book.title.trim() : '未命名拆书',
-    sourceFileName: typeof book.sourceFileName === 'string' ? book.sourceFileName : '',
-    chapters: Array.isArray(book.chapters) ? book.chapters.map((chapter, index) => normalizeDismantleChapter(chapter, index)) : [],
-    boundProjectId: typeof book.boundProjectId === 'number' ? book.boundProjectId : undefined,
-    sourceLibraryBookId: typeof book.sourceLibraryBookId === 'string' ? book.sourceLibraryBookId : undefined,
-    createdAt: typeof book.createdAt === 'string' ? book.createdAt : now,
-    updatedAt: typeof book.updatedAt === 'string' ? book.updatedAt : now,
-  };
-};
-
-const normalizeLibraryBookChapter = (chapter: Partial<LibraryBookChapter>, index: number): LibraryBookChapter => ({
-  id: typeof chapter.id === 'string' ? chapter.id : localResourceId('book-chapter'),
-  number: Number(chapter.number) || index + 1,
-  title: typeof chapter.title === 'string' && chapter.title.trim() ? chapter.title.trim() : `第${index + 1}章`,
-  url: typeof chapter.url === 'string' ? chapter.url : '',
-  content: typeof chapter.content === 'string' ? chapter.content : '',
-  wordCount: countNovelCharacters(typeof chapter.content === 'string' ? chapter.content : ''),
-  downloaded: chapter.downloaded === true && Boolean(chapter.content?.trim()),
-  unavailableReason: typeof chapter.unavailableReason === 'string' ? chapter.unavailableReason : undefined,
-  outline: typeof chapter.outline === 'string' ? chapter.outline : undefined,
-});
-
-const normalizeLibraryBook = (book: Partial<LibraryBook>): LibraryBook => {
-  const now = new Date().toISOString();
-  return {
-    id: typeof book.id === 'string' ? book.id : localResourceId('book'),
-    title: typeof book.title === 'string' && book.title.trim() ? book.title.trim() : '未命名书籍',
-    author: typeof book.author === 'string' ? book.author : '未知作者',
-    source: typeof book.source === 'string' ? book.source : '番茄小说',
-    sourceId: typeof book.sourceId === 'string' ? book.sourceId : undefined,
-    sourceBookId: typeof book.sourceBookId === 'string' ? book.sourceBookId : undefined,
-    url: typeof book.url === 'string' ? book.url : '',
-    intro: typeof book.intro === 'string' ? book.intro : '',
-    cover: typeof book.cover === 'string' ? book.cover : undefined,
-    category: typeof book.category === 'string' ? book.category : undefined,
-    wordCount: Number(book.wordCount) || undefined,
-    chapters: Array.isArray(book.chapters) ? book.chapters.map((chapter, index) => normalizeLibraryBookChapter(chapter, index)) : [],
-    downloadedAt: typeof book.downloadedAt === 'string' ? book.downloadedAt : undefined,
-    createdAt: typeof book.createdAt === 'string' ? book.createdAt : now,
-    updatedAt: typeof book.updatedAt === 'string' ? book.updatedAt : now,
-    localPath: typeof book.localPath === 'string' ? book.localPath : undefined,
-    fontCss: typeof book.fontCss === 'string' ? book.fontCss : undefined,
-  };
-};
-
-const normalizeRankingBook = (book: Partial<RankingBook>, index: number): RankingBook => ({
-  id: typeof book.id === 'string' ? book.id : localResourceId('ranking-book'),
-  title: typeof book.title === 'string' ? book.title : '未命名书籍',
-  author: typeof book.author === 'string' ? book.author : '未知作者',
-  intro: typeof book.intro === 'string' ? book.intro : '',
-  cover: typeof book.cover === 'string' ? book.cover.replace(/^http:/iu, 'https:') : undefined,
-  category: typeof book.category === 'string' ? book.category : undefined,
-  rank: Number(book.rank) || index + 1,
-  rankType: book.rankType === 'new' || book.rankType === 'hot' || book.rankType === 'completed' || book.rankType === 'collect' ? book.rankType : 'read',
-  gender: book.gender === 'male' || book.gender === 'female' ? book.gender : 'all',
-  platform: book.platform === 'qidian' || book.platform === 'faloo' ? book.platform : 'fanqie',
-  sourceBookId: typeof book.sourceBookId === 'string' ? book.sourceBookId : undefined,
-  url: typeof book.url === 'string' ? book.url : '',
-  wordCount: Number(book.wordCount) || undefined,
-  readCount: Number(book.readCount) || undefined,
-  fetchedAt: typeof book.fetchedAt === 'string' ? book.fetchedAt : new Date().toISOString(),
-  sourceName: typeof book.sourceName === 'string' ? book.sourceName : undefined,
-});
-
-const trustedRankingCache = (book: RankingBook) => book.platform !== 'fanqie' || book.sourceName === '番茄小说网';
-
-const normalizeWritingStyle = (style: Partial<WritingStyle>): WritingStyle => {
-  const now = new Date().toISOString();
-  return {
-    id: typeof style.id === 'string' ? style.id : localResourceId('style'),
-    name: typeof style.name === 'string' && style.name.trim() ? style.name.trim() : '未命名文风',
-    description: typeof style.description === 'string' ? style.description : '',
-    tags: asTextList(style.tags, 12),
-    content: typeof style.content === 'string' ? style.content : '',
-    sourceBookId: typeof style.sourceBookId === 'string' ? style.sourceBookId : undefined,
-    createdAt: typeof style.createdAt === 'string' ? style.createdAt : now,
-    updatedAt: typeof style.updatedAt === 'string' ? style.updatedAt : now,
-    sourcePath: typeof style.sourcePath === 'string' ? style.sourcePath : undefined,
-  };
-};
-
 const chapterOrder = (memory: ChapterMemory) => memory.sourceChapterNumber ?? memory.chapterId;
-const recentMemoryIds = (memories: ChapterMemory[], limit = 1) => [...memories]
-  .sort((left, right) => chapterOrder(left) - chapterOrder(right))
-  .slice(-limit)
-  .map(memory => memory.id);
-
 const memoryListMarkdown = (items: string[]) => items.length ? items.map(item => `- ${item}`).join('\n') : '- 暂无';
 
 const readableChapterPlan = (value?: string): string => {
@@ -1149,36 +305,6 @@ const readableChapterPlan = (value?: string): string => {
   } catch { /* Plain Markdown plans are already suitable for display. */ }
   return text;
 };
-
-const snapshotMarkdown = (memory: ChapterMemory) => `# ${memory.chapterTitle} 记忆快照
-
-## 章节摘要
-${memory.summary || '暂无摘要'}
-
-## 关键词
-${memory.keywords.length ? memory.keywords.map(item => `- ${item}`).join('\n') : '- 暂无'}
-
-## 人物状态变化
-${memoryListMarkdown(memory.characterStateChanges)}
-
-## 角色认知变化
-${memoryListMarkdown(memory.knowledgeChanges)}
-
-## 伏笔变化
-${memoryListMarkdown(memory.foreshadowingChanges)}
-
-## 时间线事件
-${memoryListMarkdown(memory.timelineEvents)}
-
-## 设定事实
-${memoryListMarkdown(memory.canonFacts)}
-
-## 冲突
-${memoryListMarkdown(memory.conflicts)}
-
-## 章末钩子
-${memory.endingHook || '暂无'}
-`;
 
 const buildMemoryDocuments = (memories: ChapterMemory[], existingDocuments: MemoryDocument[] = [], force = false): MemoryDocument[] => {
   const ordered = [...memories].sort((left, right) => chapterOrder(left) - chapterOrder(right));
@@ -1438,8 +564,6 @@ const formatNovelChapterContent = (content: string) => content
   .trim();
 
 type TabType = 'projects' | 'books' | 'dismantles' | 'rankings' | 'skills' | 'styles';
-type TagTab = '主分类' | '主题' | '角色' | '情节';
-type Channel = '男频' | '女频';
 
 interface GenreTag {
   name: string;
@@ -1936,14 +1060,12 @@ function App() {
   const [activeLibraryChapterId, setActiveLibraryChapterId] = useState<string | null>(null);
   const [libraryChapterDownloadRunningId, setLibraryChapterDownloadRunningId] = useState<string | null>(null);
   const [libraryOutlineRunningId, setLibraryOutlineRunningId] = useState<string | null>(null);
-  const [activeRankingBookId, setActiveRankingBookId] = useState<string | null>(null);
   const [rankingPlatform, setRankingPlatform] = useState<RankingPlatform>('fanqie');
   const [rankingType, setRankingType] = useState<RankingType>('read');
   const [fanqieSection, setFanqieSection] = useState<FanqieSection>('male-read');
   const [fanqieCategories, setFanqieCategories] = useState<Record<FanqieSection, RankingCategoryOption[]>>({ 'male-read': [], 'male-new': [], 'female-read': [], 'female-new': [] });
   const [fanqieCategoryId, setFanqieCategoryId] = useState('all');
   const [fanqieCategoriesLoading, setFanqieCategoriesLoading] = useState(false);
-  const [rankingGender, setRankingGender] = useState<'male' | 'female' | 'all'>('all');
   const [rankingLoading, setRankingLoading] = useState(false);
   const [rankingQuery, setRankingQuery] = useState('');
   const [rankingFontCss, setRankingFontCss] = useState('');
@@ -1965,7 +1087,6 @@ function App() {
   const [skills, setSkills] = useState<Skill[]>(() => builtinSkills);
   const [skillCategoryFilter, setSkillCategoryFilter] = useState('');
   const [skillSearch, setSkillSearch] = useState('');
-  const [loading, setLoading] = useState(false);
   const [deviceStorageReady, setDeviceStorageReady] = useState(false);
   const [resourceStorageReady, setResourceStorageReady] = useState(false);
   
@@ -1985,11 +1106,29 @@ function App() {
   const [notice, setNotice] = useState<{ title: string; content: string } | null>(null);
   
   // 编辑器状态
-  const [editingProject, setEditingProject] = useState<Project | null>(null);
+  // 项目列表是唯一权威状态，编辑器只保存当前项目 ID，避免长期复制整本小说
+  const [editingProjectId, setEditingProjectId] = useState<number | null>(null);
+  const editingProject = editingProjectId === null ? null : projects.find(project => project.id === editingProjectId) || null;
   const editingProjectRef = useRef<Project | null>(null);
   const projectsRef = useRef<Project[]>(projects);
   useEffect(() => { editingProjectRef.current = editingProject; }, [editingProject]);
   useEffect(() => { projectsRef.current = projects; }, [projects]);
+  const setEditingProject = (value: Project | null | ((project: Project | null) => Project | null)) => {
+    const current = editingProjectRef.current;
+    const next = typeof value === 'function' ? value(current) : value;
+    if (!next) {
+      editingProjectRef.current = null;
+      setEditingProjectId(null);
+      return;
+    }
+    editingProjectRef.current = next;
+    setEditingProjectId(next.id);
+    setProjects(projects => {
+      const existing = projects.find(project => project.id === next.id);
+      if (existing === next) return projects;
+      return existing ? projects.map(project => project.id === next.id ? next : project) : [...projects, next];
+    });
+  };
   const [editorSidebarTab, setEditorSidebarTab] = useState<'chapters' | 'search' | 'outline' | 'knowledge-graph' | 'cards' | 'style' | 'knowledge' | 'ai-detect'>('chapters');
   const [aiDetecting, setAIDetecting] = useState(false);
   const [activeChapter, setActiveChapter] = useState<Chapter | null>(null);
@@ -2006,7 +1145,6 @@ function App() {
   const [expandedGraphDocumentIds, setExpandedGraphDocumentIds] = useState<string[]>([]);
   const [selectedCardIds, setSelectedCardIds] = useState<number[]>([]);
   const [selectedOutlineCardIds, setSelectedOutlineCardIds] = useState<number[]>([]);
-  const [selectedMemoryIds, setSelectedMemoryIds] = useState<number[]>([]);
   const [selectedOutlineIds, setSelectedOutlineIds] = useState<number[]>([]);
   const [selectedAgentSkillNames, setSelectedAgentSkillNames] = useState<string[]>([]);
   const [showAgentSkillPicker, setShowAgentSkillPicker] = useState(false);
@@ -2014,11 +1152,6 @@ function App() {
   const [showChapterCardPicker, setShowChapterCardPicker] = useState(false);
   const [cardTypeFilter, setCardTypeFilter] = useState<CardType | '全部'>('全部');
   const [cardDraft, setCardDraft] = useState<{ type: CardType; title: string; content: string }>({ type: '角色卡', title: '', content: '' });
-  const getChapterOutline = (project: Project | null, chapter: Chapter | null) => {
-    if (!project || !chapter) return undefined;
-    return project.outlines.find(outline => outline.kind === '章纲' && String(outline.chapterId ?? '') === String(chapter.id))
-      || project.outlines.find(outline => outline.kind === '章纲' && outline.title === `章纲｜${chapter.title}`);
-  };
   const [cardGenerating, setCardGenerating] = useState(false);
   // One state object so a first-run install cannot generate two different
   // profile IDs for the list and for the active pointer.
@@ -2038,7 +1171,7 @@ function App() {
     if (activeTab !== 'rankings' || rankingPlatform !== 'fanqie' || Object.values(fanqieCategories).some(items => items.length)) return;
     if (!('__TAURI_INTERNALS__' in window)) return;
     setFanqieCategoriesLoading(true);
-    void invoke<{ sections?: Array<{ key: FanqieSection; categories?: RankingCategoryOption[] }> }>('call_agent_rpc', { method: 'ranking.categories', params: { ...agentNetworkParams(agentConfig) } })
+    void agentRpc<{ sections?: Array<{ key: FanqieSection; categories?: RankingCategoryOption[] }> }>('ranking.categories', { ...agentNetworkParams(agentConfig) })
       .then(result => {
         const next = { 'male-read': [], 'male-new': [], 'female-read': [], 'female-new': [] } as Record<FanqieSection, RankingCategoryOption[]>;
         (result.sections || []).forEach(section => { if (section.key in next) next[section.key as FanqieSection] = Array.isArray(section.categories) ? section.categories : []; });
@@ -2079,8 +1212,12 @@ function App() {
   const [cardStreamContent, setCardStreamContent] = useState('');
   const outlineRunRef = useRef('');
   const cardRunRef = useRef('');
+  const outlineStreamRawRef = useRef('');
+  const cardStreamRawRef = useRef('');
+  const secondaryStreamFrameRef = useRef<number | null>(null);
   const agentTypewriterRef = useRef<number | null>(null);
   const agentStreamRawContentRef = useRef('');
+  const agentStreamFrameRef = useRef<number | null>(null);
   const [agentError, setAgentError] = useState('');
   const [agentProgress, setAgentProgress] = useState<AgentProgressItem[]>([]);
   const [agentProgressPercent, setAgentProgressPercent] = useState(0);
@@ -2115,7 +1252,7 @@ function App() {
   const runtimeUsageSessionRef = useRef<RuntimeUsageSummary | null>(null);
   const syncRuntimeUsage = async () => {
     try {
-      const latest = await invoke<RuntimeUsageSummary>('call_agent_rpc', { method: 'usage.summary', params: {} });
+      const latest = await agentRpc<RuntimeUsageSummary>('usage.summary', {});
       const prior = runtimeUsageSessionRef.current;
       runtimeUsageSessionRef.current = latest;
       if (!prior) return;
@@ -2160,15 +1297,11 @@ function App() {
     setGatewayUsageLoading(true);
     setGatewayUsageError('');
     try {
-      await invoke<string>('start_agent_runtime');
-      const result = await invoke<GatewayUsageSnapshot>('call_agent_rpc', {
-        method: 'gateway.usage',
-        params: {
+      const result = await agentRpc<GatewayUsageSnapshot>('gateway.usage', {
           apiKey: key,
           apiKeys: settingsDraft.apiKeys,
           ...agentNetworkParams(settingsDraft),
-        },
-      });
+        });
       setGatewayUsage(result);
     } catch (error) {
       setGatewayUsageError(String(error));
@@ -2188,7 +1321,7 @@ function App() {
   const [bannedWords, setBannedWords] = useState<string[]>(() => {
     try {
       const parsed = JSON.parse(localStorage.getItem('writer-banned-words') || '[]');
-      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string' && item.trim()).map(item => item.trim()) : [];
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map(item => item.trim()) : [];
     } catch { return []; }
   });
   const [bannedWordsDraft, setBannedWordsDraft] = useState('');
@@ -2203,13 +1336,23 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
   const goalNoticeChapterRef = useRef<number | null>(null);
+  const persistCurrentChapterRef = useRef<() => Promise<void>>(async () => {});
   const [settingsDraft, setSettingsDraft] = useState(agentConfig);
-  // Must stay below the `settingsDraft` declaration: the dependency array is
-  // evaluated during render, so reading it earlier hits the temporal dead zone
-  // and throws before React can mount anything.
+  const refreshGatewayUsageRef = useRef(refreshGatewayUsage);
+  refreshGatewayUsageRef.current = refreshGatewayUsage;
+  const gatewayUsageRequestRef = useRef('');
+  const gatewayUsageRequestKey = showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft)
+    ? `${settingsDraft.apiMode}:${settingsDraft.baseURL}:${settingsDraft.apiKey}:${settingsDraft.apiKeys.join(',')}`
+    : '';
   useEffect(() => {
-    if (showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft) && !gatewayUsageLoading) void refreshGatewayUsage();
-  }, [showSettingsModal, settingsSection, settingsDraft.baseURL]);
+    if (!gatewayUsageRequestKey) {
+      gatewayUsageRequestRef.current = '';
+      return;
+    }
+    if (gatewayUsageRequestRef.current === gatewayUsageRequestKey) return;
+    gatewayUsageRequestRef.current = gatewayUsageRequestKey;
+    void refreshGatewayUsageRef.current();
+  }, [gatewayUsageRequestKey]);
   const [availableModels, setAvailableModels] = useState<string[]>(() => {
     try {
       const saved = localStorage.getItem('agent-models');
@@ -2260,120 +1403,157 @@ function App() {
   });
   const [skillGenerating, setSkillGenerating] = useState(false);
 
-  useEffect(() => {
-    if (!('__TAURI_INTERNALS__' in window)) return;
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void listen<AgentProgressEvent>('agent-progress', event => {
-      const payload = event.payload;
-      if (!payload) return;
-      const data = payload.data ?? {};
-      if (payload.runId === projectAgentRunRef.current) {
-        if (payload.type === 'chunk') return;
-        const message = String(data.message || data.context?.action || data.error || '项目 Agent 正在处理');
-        if (payload.type === 'error') {
-          setProjectAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, message, status: 'error' as const }].slice(-20));
-          return;
-        }
-        if (payload.type === 'complete') {
-          setProjectAgentProgress(100);
-          setProjectAgentActivity(current => current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item));
-          return;
-        }
-        const progress = Math.max(1, Math.min(99, Number(data.progress) || 1));
-        setProjectAgentProgress(current => Math.max(current, progress));
-        setProjectAgentActivity(current => {
-          const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
-          const id = `${String(data.step || data.context?.source || 'step')}:${message}`;
-          return [...previous.filter(item => item.id !== id), { id, message, status: 'active' as const }].slice(-20);
-        });
-        return;
-      }
-      if (payload.runId === outlineRunRef.current) {
-        if (payload.type === 'chunk' && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
-        if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
-          const step = String(data.step || (payload.type === 'complete' ? 'complete' : payload.type === 'error' ? 'error' : 'progress'));
-          const message = String(data.message || data.context?.action || data.error || '正在处理大纲任务');
-          const source = data.context?.source;
-          setOutlineAgentActivity(current => {
-            const id = `${step}:${message}`;
-            const status = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
-            const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
-            const existing = previous.findIndex(item => item.id === id);
-            if (existing >= 0) return previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item).slice(-12);
-            return [...previous, { id, step, message, status, source }].slice(-12);
-          });
-          return;
-        }
-      }
-      if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
-      if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
-      if (payload.runId !== activeAgentRunRef.current) return;
-      if (payload.type === 'context' && data.context) {
-        const trace = {
-          id: `${String(data.step || 'context')}:${String(data.context.source || data.context.action)}`,
-          step: String(data.step || 'context'),
-          action: data.context?.action || data.message || '更新上下文',
-          source: data.context?.source,
-          status: data.context?.status,
-          bytes: data.context?.bytes,
-          items: data.context?.items,
-          timestamp: Date.now(),
-        };
-        setContextTrace(current => {
-          const existing = current.findIndex(item => item.id === trace.id);
-          if (existing < 0) return [...current, trace].slice(-40);
-          return current.map((item, index) => index === existing ? { ...item, ...trace } : item);
-        });
-        return;
-      }
-      if (payload.type === 'chunk' && data.text) {
-        agentStreamRawContentRef.current += String(data.text);
-        setAgentDisplayContent(chapterDraftFromStream(agentStreamRawContentRef.current));
-        const characters = countNovelCharacters(data.text);
+  const scheduleSecondaryStreamFlush = () => {
+    if (secondaryStreamFrameRef.current !== null) return;
+    secondaryStreamFrameRef.current = window.requestAnimationFrame(() => {
+      secondaryStreamFrameRef.current = null;
+      setOutlineStreamContent(outlineStreamRawRef.current);
+      setCardStreamContent(cardStreamRawRef.current);
+    });
+  };
+
+  const handleAgentProgress = (payload: AgentProgressEvent) => {
+    if (!payload) return;
+    const data = payload.data ?? {};
+    if (payload.runId === projectAgentRunRef.current) {
+    if (payload.type === 'chunk') return;
+    const message = String(data.message || data.context?.action || data.error || '项目 Agent 正在处理');
+    if (payload.type === 'error') {
+      setProjectAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, message, status: 'error' as const }].slice(-20));
+      return;
+    }
+    if (payload.type === 'complete') {
+      setProjectAgentProgress(100);
+      setProjectAgentActivity(current => current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item));
+      return;
+    }
+    const progress = Math.max(1, Math.min(99, Number(data.progress) || 1));
+    setProjectAgentProgress(current => Math.max(current, progress));
+    setProjectAgentActivity(current => {
+      const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
+      const id = `${String(data.step || data.context?.source || 'step')}:${message}`;
+      return [...previous.filter(item => item.id !== id), { id, message, status: 'active' as const }].slice(-20);
+    });
+    return;
+  }
+  if (payload.runId === outlineRunRef.current) {
+    if (payload.type === 'chunk' && data.text) {
+      outlineStreamRawRef.current += String(data.text);
+      scheduleSecondaryStreamFlush();
+      return;
+    }
+    if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
+      const step = String(data.step || (payload.type === 'complete' ? 'complete' : payload.type === 'error' ? 'error' : 'progress'));
+      const message = String(data.message || data.context?.action || data.error || '正在处理大纲任务');
+      const source = data.context?.source;
+      setOutlineAgentActivity(current => {
+        const id = `${step}:${message}`;
+        const status: 'active' | 'complete' | 'error' = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
+        const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
+        const existing = previous.findIndex(item => item.id === id);
+        if (existing >= 0) return previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item).slice(-12);
+        return [...previous, { id, step, message, status, source }].slice(-12);
+      });
+      return;
+    }
+  }
+  if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) {
+    outlineStreamRawRef.current += String(data.text);
+    scheduleSecondaryStreamFlush();
+    return;
+  }
+  if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) {
+    cardStreamRawRef.current += String(data.text);
+    scheduleSecondaryStreamFlush();
+    return;
+  }
+  if (payload.runId !== activeAgentRunRef.current) return;
+  if (payload.type === 'context' && data.context) {
+    const trace = {
+      id: `${String(data.step || 'context')}:${String(data.context.source || data.context.action)}`,
+      step: String(data.step || 'context'),
+      action: data.context?.action || data.message || '更新上下文',
+      source: data.context?.source,
+      status: data.context?.status,
+      bytes: data.context?.bytes,
+      items: data.context?.items,
+      timestamp: Date.now(),
+    };
+    setContextTrace(current => {
+      const existing = current.findIndex(item => item.id === trace.id);
+      if (existing < 0) return [...current, trace].slice(-40);
+      return current.map((item, index) => index === existing ? { ...item, ...trace } : item);
+    });
+    return;
+  }
+  if (payload.type === 'chunk' && data.text) {
+    agentStreamRawContentRef.current += String(data.text);
+    // SSE 可能按 token 高频触发；每帧最多提交一次 React 状态，降低临时字符串和提交次数
+    if (agentStreamFrameRef.current === null) {
+      agentStreamFrameRef.current = window.requestAnimationFrame(() => {
+        agentStreamFrameRef.current = null;
+        const rawContent = agentStreamRawContentRef.current;
+        setAgentDisplayContent(chapterDraftFromStream(rawContent));
+        const characters = countNovelCharacters(rawContent);
         setAgentProgressMessage(characters ? `正文已返回 ${characters.toLocaleString()} 字，正在整理草稿` : '正在接收模型输出');
         setAgentProgress(items => items.map(item => item.id === 'draft'
           ? { ...item, status: 'active', progress: Math.max(item.progress, 70), message: '正在接收并整理章节草稿' }
           : item));
         setAgentProgressPercent(current => Math.max(current, 70));
-        return;
-      }
-      if (payload.type === 'complete') {
-        setAgentProgressMessage(data.message || '章节草稿和一致性审查已完成');
-        setAgentProgressPercent(100);
-        setAgentProgress(items => items.map(item => ({ ...item, status: 'complete', progress: Math.max(item.progress, 100) })));
-        return;
-      }
-      if (payload.type === 'error') {
-        const message = data.error || '智能体运行失败';
-        setAgentProgressMessage(message);
-        setAgentProgress(items => {
-          const activeIndex = Math.max(0, items.findIndex(item => item.status === 'active'));
-          return items.map((item, index) => index === activeIndex ? { ...item, status: 'error', message } : item);
-        });
-        return;
-      }
-      if (!isAgentWorkflowStep(data.step)) return;
-      const stepIndex = agentWorkflowSteps.findIndex(step => step.id === data.step);
-      const progress = Math.max(0, Math.min(100, Number(data.progress) || 0));
-      setAgentStage(data.step);
-      setAgentProgressMessage(data.message || agentStageLabel[data.step]);
-      setAgentProgressPercent(current => Math.max(current, progress));
-      setAgentProgress(items => {
-        const source = items.length ? items : createAgentProgressItems();
-        return source.map((item, index) => {
-          if (index < stepIndex) return { ...item, status: 'complete', progress: Math.max(item.progress, 100) };
-          if (item.id === data.step) return { ...item, status: 'active', progress: Math.max(item.progress, progress), message: data.message || item.description };
-          return item;
-        });
       });
-    }).then(handler => {
+    }
+    return;
+  }
+  if (payload.type === 'complete') {
+    setAgentProgressMessage(data.message || '章节草稿和一致性审查已完成');
+    setAgentProgressPercent(100);
+    setAgentProgress(items => items.map(item => ({ ...item, status: 'complete', progress: Math.max(item.progress, 100) })));
+    return;
+  }
+  if (payload.type === 'error') {
+    const message = data.error || '智能体运行失败';
+    setAgentProgressMessage(message);
+    setAgentProgress(items => {
+      const activeIndex = Math.max(0, items.findIndex(item => item.status === 'active'));
+      return items.map((item, index) => index === activeIndex ? { ...item, status: 'error', message } : item);
+    });
+    return;
+  }
+  if (!isAgentWorkflowStep(data.step)) return;
+  const stepIndex = agentWorkflowSteps.findIndex(step => step.id === data.step);
+  const progress = Math.max(0, Math.min(100, Number(data.progress) || 0));
+  setAgentStage(data.step);
+  setAgentProgressMessage(data.message || agentStageLabel[data.step]);
+  setAgentProgressPercent(current => Math.max(current, progress));
+  setAgentProgress(items => {
+    const source = items.length ? items : createAgentProgressItems();
+    return source.map((item, index) => {
+      if (index < stepIndex) return { ...item, status: 'complete', progress: Math.max(item.progress, 100) };
+      if (item.id === data.step) return { ...item, status: 'active', progress: Math.max(item.progress, progress), message: data.message || item.description };
+      return item;
+    });
+  });
+  };
+
+  useEffect(() => {
+    if (!('__TAURI_INTERNALS__' in window)) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<AgentProgressEvent>('agent-progress', event => handleAgentProgress(event.payload)).then(handler => {
       if (disposed) handler();
       else unlisten = handler;
     });
     return () => {
       disposed = true;
       unlisten?.();
+      if (agentStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(agentStreamFrameRef.current);
+        agentStreamFrameRef.current = null;
+      }
+      if (secondaryStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(secondaryStreamFrameRef.current);
+        secondaryStreamFrameRef.current = null;
+      }
     };
   }, []);
 
@@ -2387,86 +1567,22 @@ function App() {
     return () => window.removeEventListener('cloud-sync-progress', receive);
   }, []);
 
-  // The mobile HTTP Agent sends the same stream envelope as the desktop runtime.
+  // 移动端通过 DOM 事件接收同一套进度协议，复用桌面端处理器避免行为漂移
   useEffect(() => {
     if (!isMobileRuntime()) return;
-    const receive = (event: Event) => {
-      const payload = (event as CustomEvent<AgentProgressEvent>).detail;
-      if (!payload) return;
-      const data = payload.data ?? {};
-      if (payload.runId === projectAgentRunRef.current) {
-        if (payload.type === 'chunk') return;
-        const message = String(data.message || data.context?.action || data.error || '项目 Agent 正在处理');
-        if (payload.type === 'error') {
-          setProjectAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, message, status: 'error' as const }].slice(-20));
-          return;
-        }
-        if (payload.type === 'complete') {
-          setProjectAgentProgress(100);
-          setProjectAgentActivity(current => current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item));
-          return;
-        }
-        setProjectAgentProgress(current => Math.max(current, Math.max(1, Math.min(99, Number(data.progress) || 1))));
-        setProjectAgentActivity(current => {
-          const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
-          const id = `${String(data.step || data.context?.source || 'step')}:${message}`;
-          return [...previous.filter(item => item.id !== id), { id, message, status: 'active' as const }].slice(-20);
-        });
-        return;
-      }
-      if (payload.runId === outlineRunRef.current) {
-        if (payload.type === 'chunk' && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
-        if (payload.type === 'progress' || payload.type === 'context' || payload.type === 'complete' || payload.type === 'error') {
-          const step = String(data.step || (payload.type === 'complete' ? 'complete' : payload.type === 'error' ? 'error' : 'progress'));
-          const message = String(data.message || data.context?.action || data.error || '正在处理大纲任务');
-          const source = data.context?.source;
-          setOutlineAgentActivity(current => {
-            const id = `${step}:${message}`;
-            const status = payload.type === 'error' ? 'error' : payload.type === 'complete' ? 'complete' : 'active';
-            const previous = current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item);
-            const existing = previous.findIndex(item => item.id === id);
-            return (existing >= 0 ? previous.map((item, index) => index === existing ? { ...item, status, source: source || item.source } : item) : [...previous, { id, step, message, status, source }]).slice(-12);
-          });
-          return;
-        }
-      }
-      if (payload.type === 'chunk' && payload.runId === outlineRunRef.current && data.text) { setOutlineStreamContent(current => current + String(data.text)); return; }
-      if (payload.type === 'chunk' && payload.runId === cardRunRef.current && data.text) { setCardStreamContent(current => current + String(data.text)); return; }
-      if (payload.runId !== activeAgentRunRef.current) return;
-      if (payload.type === 'context' && data.context) {
-        const trace = {
-          id: `${String(data.step || 'context')}:${String(data.context.source || data.context.action)}`,
-          step: String(data.step || 'context'),
-          action: data.context.action || data.message || '更新上下文',
-          source: data.context.source,
-          status: data.context.status,
-          bytes: data.context.bytes,
-          items: data.context.items,
-          timestamp: Date.now(),
-        };
-        setContextTrace(current => {
-          const existing = current.findIndex(item => item.id === trace.id);
-          if (existing < 0) return [...current, trace].slice(-40);
-          return current.map((item, index) => index === existing ? { ...item, ...trace } : item);
-        });
-        return;
-      }
-      if (payload.type === 'chunk' && data.text) {
-        agentStreamRawContentRef.current += String(data.text);
-        setAgentDisplayContent(chapterDraftFromStream(agentStreamRawContentRef.current));
-        setAgentProgressPercent(current => Math.max(current, 70));
-        setAgentProgressMessage(`正文已返回 ${countNovelCharacters(String(data.text)).toLocaleString()} 字，正在整理草稿`);
-        return;
-      }
-      if (payload.type === 'complete') { setAgentProgressMessage(data.message || '章节草稿和一致性审查已完成'); setAgentProgressPercent(100); return; }
-      if (payload.type === 'error') { setAgentStage('error'); setAgentProgressMessage(data.error || '智能体运行失败'); return; }
-      if (!isAgentWorkflowStep(data.step)) return;
-      setAgentStage(data.step);
-      setAgentProgressMessage(data.message || agentStageLabel[data.step]);
-      setAgentProgressPercent(current => Math.max(current, Math.max(0, Math.min(100, Number(data.progress) || 0))));
-    };
+    const receive = (event: Event) => handleAgentProgress((event as CustomEvent<AgentProgressEvent>).detail);
     window.addEventListener('agent-progress', receive);
-    return () => window.removeEventListener('agent-progress', receive);
+    return () => {
+      window.removeEventListener('agent-progress', receive);
+      if (agentStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(agentStreamFrameRef.current);
+        agentStreamFrameRef.current = null;
+      }
+      if (secondaryStreamFrameRef.current !== null) {
+        window.cancelAnimationFrame(secondaryStreamFrameRef.current);
+        secondaryStreamFrameRef.current = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -2492,10 +1608,10 @@ function App() {
       return;
     }
     Promise.all([
-      invoke<LibraryBook[] | null>('load_library_books'),
-      invoke<RankingBook[] | null>('load_ranking_books'),
-      invoke<DismantleBook[] | null>('load_dismantle_books'),
-      invoke<WritingStyle[] | null>('load_writing_styles'),
+      nativeClient.loadLibraryBooks<LibraryBook>(),
+      nativeClient.loadRankingBooks<RankingBook>(),
+      nativeClient.loadDismantleBooks<DismantleBook>(),
+      nativeClient.loadWritingStyles<WritingStyle>(),
     ]).then(([library, rankings, books, styles]) => {
       if (Array.isArray(library)) setLibraryBooks(library.map(book => normalizeLibraryBook(book)));
       if (Array.isArray(rankings)) setRankingBooks(rankings.map((book, index) => normalizeRankingBook(book, index)).filter(trustedRankingCache));
@@ -2522,7 +1638,7 @@ function App() {
       return;
     }
 
-    invoke<Project[] | null>('load_projects')
+    nativeClient.loadProjects<Project>()
       .then(savedProjects => {
         if (Array.isArray(savedProjects)) {
           setProjects(savedProjects.map(project => {
@@ -2566,7 +1682,7 @@ function App() {
     const timer = window.setTimeout(() => {
       setAutoSaveStatus('saving');
       if ('__TAURI_INTERNALS__' in window) {
-        invoke<string>('save_projects', { projects })
+        nativeClient.saveProjects(projects)
           .then(() => { localStorage.removeItem('projects'); setAutoSaveStatus('saved'); })
           .catch(error => { setAutoSaveStatus('error'); setNotice({ title: '保存本地小说失败', content: String(error) }); });
       } else {
@@ -2591,7 +1707,7 @@ function App() {
     localStorage.setItem(storageKey, sessionId);
     setProjectAgentSession(null);
     const load = '__TAURI_INTERNALS__' in window
-      ? invoke<ProjectAgentSession | null>('load_agent_chat', { projectId: String(project.id), sessionId })
+      ? nativeClient.invoke<ProjectAgentSession | null>('load_agent_chat', { projectId: String(project.id), sessionId })
       : Promise.resolve((() => { try { return JSON.parse(localStorage.getItem(`project-agent-chat:${project.id}:${sessionId}`) || 'null') as ProjectAgentSession | null; } catch { return null; } })());
     void load.then(value => {
       if (!disposed) setProjectAgentSession(normalizeProjectAgentSession(value, editingProjectRef.current?.id === project.id ? editingProjectRef.current : project, sessionId));
@@ -2607,7 +1723,7 @@ function App() {
     const timer = window.setTimeout(() => {
       const session = { ...projectAgentSession, updatedAt: new Date().toISOString() };
       if ('__TAURI_INTERNALS__' in window) {
-        void invoke<string>('save_agent_chat', { projectId: String(session.projectId), sessionId: session.sessionId, session })
+        void nativeClient.invoke<string>('save_agent_chat', { projectId: String(session.projectId), sessionId: session.sessionId, session })
           .catch(error => console.warn('保存项目 Agent 会话失败', error));
       } else {
         try { localStorage.setItem(`project-agent-chat:${session.projectId}:${session.sessionId}`, JSON.stringify(session)); }
@@ -2622,9 +1738,9 @@ function App() {
     const timer = window.setTimeout(() => {
       if ('__TAURI_INTERNALS__' in window) {
         Promise.all([
-          invoke<string>('save_library_books', { books: libraryBooks }),
-          invoke<string>('save_ranking_books', { books: rankingBooks }),
-          invoke<string>('save_dismantle_books', { books: dismantleBooks }),
+          nativeClient.saveLibraryBooks(libraryBooks),
+          nativeClient.saveRankingBooks(rankingBooks),
+          nativeClient.saveDismantleBooks(dismantleBooks),
         ]).then(() => {
           localStorage.removeItem('writer-library-books');
           localStorage.removeItem('writer-ranking-books');
@@ -2643,7 +1759,7 @@ function App() {
     if (!resourceStorageReady) return;
     const timer = window.setTimeout(() => {
       if ('__TAURI_INTERNALS__' in window) {
-        void invoke<string>('save_writing_styles', { styles: writingStyles })
+        void nativeClient.saveWritingStyles(writingStyles)
           .then(() => localStorage.removeItem('writer-writing-styles'))
           .catch(error => setNotice({ title: '保存文风失败', content: String(error) }));
       } else {
@@ -2676,7 +1792,7 @@ function App() {
       if (!modifier) return;
       if (event.key.toLowerCase() === 's') {
         event.preventDefault();
-        void persistCurrentChapter();
+        void persistCurrentChapterRef.current();
       } else if (event.key.toLowerCase() === 'f') {
         event.preventDefault();
         if (editorSidebarTab === 'search') {
@@ -2708,7 +1824,6 @@ function App() {
   }, [notice]);
 
   const loadSkills = async () => {
-    setLoading(true);
     try {
       const saved = localStorage.getItem('writer-skills');
       const stored = saved ? JSON.parse(saved) : [];
@@ -2745,7 +1860,6 @@ function App() {
       });
       setSkills([...mergedBuiltins, ...customSkills]);
     } finally {
-      setLoading(false);
     }
   };
 
@@ -2885,10 +1999,7 @@ function App() {
       : [];
     setProjectGeneratingField(field);
     try {
-      await invoke<string>('start_agent_runtime');
-      const result = await invoke<{ title?: string; synopsis?: string }>('call_agent_rpc', {
-        method: 'project.generate',
-        params: {
+      const result = await agentRpc<{ title?: string; synopsis?: string }>('project.generate', {
           field,
           source: projectGenerationSource,
           title: newProject.title.trim(),
@@ -2907,8 +2018,7 @@ function App() {
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       if (field === 'title') {
         const title = Array.from((result.title || '').replace(/[《》“”"'`]/gu, '').trim()).slice(0, 15).join('');
         if (!title) throw new Error('智能体没有返回可用书名');
@@ -3012,10 +2122,7 @@ function App() {
     if (!bookSearchQuery.trim()) return;
     setBookSearchLoading(true);
     try {
-      const result = await invoke<{ books?: Partial<LibraryBook>[]; fontCss?: string; searchedSourceCount?: number; responsiveSourceCount?: number }>('call_agent_rpc', {
-        method: 'book.search.all',
-        params: { query: bookSearchQuery.trim(), ...agentNetworkParams(agentConfig) },
-      });
+      const result = await agentRpc<{ books?: Partial<LibraryBook>[]; fontCss?: string; searchedSourceCount?: number; responsiveSourceCount?: number }>('book.search.all', { query: bookSearchQuery.trim(), ...agentNetworkParams(agentConfig) });
       setLibrarySearchResults((result.books || []).map(book => normalizeLibraryBook({ ...book, fontCss: result.fontCss || book.fontCss })));
       setNotice({ title: '书籍搜索完成', content: `已搜索 ${result.searchedSourceCount || 0} 个书源，其中 ${result.responsiveSourceCount || 0} 个响应，找到 ${(result.books || []).length} 本书。选择结果卡片即可从对应书源下载。` });
     } catch (error) {
@@ -3032,15 +2139,11 @@ function App() {
       const effectiveRankingGender = rankingPlatform === 'fanqie' ? fanqieSectionConfig.gender : 'all';
       const effectiveRankingType = rankingPlatform === 'fanqie' ? fanqieSectionConfig.list : rankingType;
       const selectedCategory = rankingPlatform === 'fanqie' ? fanqieCategories[fanqieSection].find(category => category.id === fanqieCategoryId) : undefined;
-      const result = await invoke<{ books?: Partial<RankingBook>[]; fontCss?: string; sourceName?: string }>('call_agent_rpc', {
-        method: 'ranking.fetch',
-        params: { platform: rankingPlatform, rankType: effectiveRankingType, gender: effectiveRankingGender, rankUrl: selectedCategory?.url || undefined, ...agentNetworkParams(agentConfig) },
-      });
+      const result = await agentRpc<{ books?: Partial<RankingBook>[]; fontCss?: string; sourceName?: string }>('ranking.fetch', { platform: rankingPlatform, rankType: effectiveRankingType, gender: effectiveRankingGender, rankUrl: selectedCategory?.url || undefined, ...agentNetworkParams(agentConfig) });
       const sourceName = result.sourceName || { fanqie: '番茄小说网', qidian: '起点中文网官网', faloo: '飞卢小说网官网' }[rankingPlatform];
       const fetched = (result.books || []).map((book, index) => normalizeRankingBook({ ...book, platform: rankingPlatform, rankType: effectiveRankingType, gender: effectiveRankingGender, sourceName }, index));
       setRankingBooks(fetched);
       setRankingFontCss(result.fontCss || '');
-      setActiveRankingBookId(fetched[0]?.id || null);
       const platformName = { fanqie: '番茄小说网', qidian: '起点', faloo: '飞卢中文网' }[rankingPlatform];
       const sectionLabel = rankingPlatform === 'fanqie' ? fanqieSectionConfig.label : rankingTypeLabel(rankingPlatform, rankingType);
       setNotice({ title: '榜单已更新', content: `${sourceName}返回${platformName}${sectionLabel}${selectedCategory ? `·${selectedCategory.label}` : ''} ${fetched.length} 本书。` });
@@ -3057,27 +2160,21 @@ function App() {
     try {
       let downloadable: LibraryBook | RankingBook = book;
       if ('platform' in book && book.platform !== 'fanqie') {
-        const search = await invoke<{ books?: Partial<LibraryBook>[] }>('call_agent_rpc', {
-          method: 'book.search',
-          params: { query: book.title, source: 'qianyue-kuwo', ...agentNetworkParams(agentConfig) },
-        });
+        const search = await agentRpc<{ books?: Partial<LibraryBook>[] }>('book.search', { query: book.title, source: 'qianyue-kuwo', ...agentNetworkParams(agentConfig) });
         const candidates = (search.books || []).map(candidate => normalizeLibraryBook(candidate));
         const matched = candidates.find(candidate => candidate.title.trim() === book.title.trim()) || candidates[0];
         if (!matched) throw new Error(`小说书源中没有找到《${book.title}》，可在书籍管理中切换书源搜索。`);
         downloadable = matched;
       }
-      const result = await invoke<{ chapters?: Partial<LibraryBookChapter>[]; intro?: string; cover?: string; downloadedChapterCount?: number; completedChapterCount?: number }>('call_agent_rpc', {
-        method: 'book.download',
-        params: {
+      const result = await agentRpc<{ chapters?: Partial<LibraryBookChapter>[]; intro?: string; cover?: string; downloadedChapterCount?: number; completedChapterCount?: number }>('book.download', {
           title: downloadable.title, author: downloadable.author, source: downloadable.sourceId || 'fanqie', sourceBookId: downloadable.sourceBookId || downloadable.id, url: downloadable.url,
           // 不设置人为上限，按书源完整目录下载全部章节。
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       const downloadedChapterCount = Number(result.completedChapterCount) || (result.chapters || []).filter(chapter => chapter.downloaded === true && typeof chapter.content === 'string' && chapter.content.trim()).length;
       if (!downloadedChapterCount) throw new Error('没有获取到完整正文，未保存空章节。可稍后重试，或导入本地 TXT。');
       const now = new Date().toISOString();
-      const normalized = normalizeLibraryBook({ ...downloadable, id: libraryBooks.find(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: result.chapters || [], intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
+      const normalized = normalizeLibraryBook({ ...downloadable, id: libraryBooks.find(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id))?.id || localResourceId('book'), chapters: (result.chapters || []).map((chapter, index) => normalizeLibraryBookChapter(chapter, index)), intro: result.intro || downloadable.intro, cover: result.cover || downloadable.cover, downloadedAt: now, createdAt: now, updatedAt: now });
       setLibraryBooks(current => {
         const existing = current.findIndex(item => item.sourceBookId === (downloadable.sourceBookId || downloadable.id) || item.id === normalized.id);
         if (existing >= 0) return current.map((item, index) => index === existing ? { ...item, ...normalized, id: item.id } : item);
@@ -3099,17 +2196,14 @@ function App() {
   const requestLibraryChapterDownload = async (book: LibraryBook, chapter: LibraryBookChapter): Promise<LibraryBookChapter> => {
     const sourceId = book.sourceId || (/番茄/u.test(book.source) ? 'fanqie' : '');
     if (!sourceId) throw new Error('这本书没有保存书源信息，请重新搜索并下载该书。');
-    const result = await invoke<{ chapter?: Partial<LibraryBookChapter> }>('call_agent_rpc', {
-      method: 'book.chapter.download',
-      params: {
+    const result = await agentRpc<{ chapter?: Partial<LibraryBookChapter> }>('book.chapter.download', {
         source: sourceId,
         sourceBookId: book.sourceBookId || '',
         bookUrl: book.url,
         bookTitle: book.title,
         chapter,
         ...agentNetworkParams(agentConfig),
-      },
-    });
+      });
     if (!result.chapter) throw new Error('书源没有返回本章结果。');
     return normalizeLibraryBookChapter({ ...result.chapter, id: chapter.id, number: chapter.number, title: chapter.title, url: chapter.url }, chapter.number - 1);
   };
@@ -3239,15 +2333,12 @@ function App() {
     }
     setLibraryOutlineRunningId(chapter.id);
     try {
-      const result = await invoke<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('call_agent_rpc', {
-        method: 'book.dismantle',
-        params: {
+      const result = await agentRpc<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('book.dismantle', {
           bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.content,
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       const outline = [
         result.summary?.trim() ? `## 剧情摘要\n${result.summary.trim()}` : '',
         result.detailedOutline?.trim() ? `## 章节细纲\n${result.detailedOutline.trim()}` : '',
@@ -3287,15 +2378,12 @@ function App() {
     try {
       for (const chapter of targets) {
         updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, status: 'analyzing' } : item), updatedAt: new Date().toISOString() }));
-        const result = await invoke<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('call_agent_rpc', {
-          method: 'book.dismantle',
-          params: {
+        const result = await agentRpc<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('book.dismantle', {
             bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.sourceContent,
             apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
             model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
             contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-          },
-        });
+          });
         updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? {
           ...item, summary: result.summary?.trim() || item.summary, detailedOutline: result.detailedOutline?.trim() || item.detailedOutline,
           plotBeats: asTextList(result.plotBeats, 10), characterDynamics: asTextList(result.characterDynamics, 10), setupPayoff: asTextList(result.setupPayoff, 10),
@@ -3324,16 +2412,13 @@ function App() {
     }
     setDismantleRewriteRunning(true);
     try {
-      const result = await invoke<{ content?: string }>('call_agent_rpc', {
-        method: 'book.rewrite',
-        params: {
+      const result = await agentRpc<{ content?: string }>('book.rewrite', {
           bookTitle: book.title, chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline,
           instruction: dismantleRewriteInstruction, targetWords: 2200,
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       if (!result.content?.trim()) throw new Error('智能体没有返回原创改写稿');
       updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, rewriteContent: result.content?.trim() || '', status: 'rewritten', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }));
       setNotice({ title: '原创改写稿已生成', content: '请在右侧编辑并确认，确认后可生成到绑定小说。' });
@@ -3358,15 +2443,12 @@ function App() {
     }
     setStyleDistilling(true);
     try {
-      const result = await invoke<{ name?: string; description?: string; tags?: string[]; content?: string }>('call_agent_rpc', {
-        method: 'book.style.distill',
-        params: {
+      const result = await agentRpc<{ name?: string; description?: string; tags?: string[]; content?: string }>('book.style.distill', {
           bookTitle: book.title, styleName: `${book.title}文风`, samples: chapters.map(chapter => ({ title: chapter.title, content: chapter.sourceContent })),
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       if (!result.content?.trim()) throw new Error('智能体没有返回文风 Skill');
       const now = new Date().toISOString();
       const style = normalizeWritingStyle({ id: localResourceId('style'), name: result.name || `${book.title}文风`, description: result.description || '', tags: result.tags || [], content: result.content, sourceBookId: book.id, createdAt: now, updatedAt: now });
@@ -3413,19 +2495,16 @@ function App() {
     }
     try {
       const style = target.styleProfileId ? writingStyles.find(item => item.id === target.styleProfileId) : undefined;
-      const result = await invoke<{ title?: string; content?: string }>('call_agent_rpc', {
-        method: 'book.adapt',
-        params: {
+      const result = await agentRpc<{ title?: string; content?: string }>('book.adapt', {
           projectTitle: target.title, projectSynopsis: target.synopsis, projectOutlines: target.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n'),
           chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline, rewriteContent: chapter.rewriteContent, styleProfile: style?.content,
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       if (!result.content?.trim()) throw new Error('智能体没有返回章节正文');
       const now = new Date().toISOString();
-      const newChapter: Chapter = { id: Date.now(), title: result.title?.trim() || `第${target.chapters.length + 1}章`, content: result.content.trim(), wordCount: countNovelCharacters(result.content), createdAt: now, updatedAt: now };
+      const newChapter: Chapter = { id: Date.now(), title: result.title?.trim() || `第${target.chapters.length + 1}章`, content: result.content?.trim() || '', wordCount: countNovelCharacters(result.content), createdAt: now, updatedAt: now };
       const updated = { ...target, chapters: [...target.chapters, newChapter], wordCount: target.wordCount + newChapter.wordCount, updatedAt: now };
       setProjects(current => current.map(project => project.id === updated.id ? updated : project));
       setNotice({ title: '原创章节已生成', content: `已写入《${target.title}》的第 ${updated.chapters.length} 章，可进入小说继续编辑。` });
@@ -3493,7 +2572,7 @@ function App() {
 
   const handleOpenProjectLocation = async (project: Project) => {
     try {
-      await invoke<string>('save_projects', { projects });
+      await nativeClient.saveProjects(projects);
       const path = await invoke<string>('open_project_location', { projectId: project.id });
       setNotice({ title: '已打开小说目录', content: path });
     } catch (error) {
@@ -3504,7 +2583,7 @@ function App() {
   const handleOpenChapterLocation = async (chapter: Chapter) => {
     if (!editingProject) return;
     try {
-      await invoke<string>('save_projects', { projects });
+      await nativeClient.saveProjects(projects);
       await invoke<string>('open_chapter_location', { projectId: editingProject.id, chapterTitle: chapter.title });
     } catch (error) {
       setNotice({ title: '打开章节位置失败', content: String(error) });
@@ -3514,7 +2593,7 @@ function App() {
   const handleOpenOutlineLocation = async () => {
     if (!editingProject) return;
     try {
-      await invoke<string>('save_projects', { projects });
+      await nativeClient.saveProjects(projects);
       await invoke<string>('open_outline_location', { projectId: editingProject.id, outlineTitle: activeOutline?.title ?? '大纲' });
     } catch (error) {
       setNotice({ title: '打开大纲位置失败', content: String(error) });
@@ -3524,7 +2603,7 @@ function App() {
   const handleOpenCardLocation = async (card: KnowledgeCard) => {
     if (!editingProject) return;
     try {
-      await invoke<string>('save_projects', { projects });
+      await nativeClient.saveProjects(projects);
       await invoke<string>('open_card_location', { projectId: editingProject.id, cardType: card.type, cardTitle: card.title });
     } catch (error) {
       setNotice({ title: '打开卡片位置失败', content: String(error) });
@@ -3534,7 +2613,7 @@ function App() {
   const handleOpenGraphNodeLocation = async (node: KnowledgeGraphNode) => {
     if (!editingProject) return;
     try {
-      await invoke<string>('save_projects', { projects });
+      await nativeClient.saveProjects(projects);
       await invoke<string>('open_graph_node_location', { projectId: editingProject.id, nodeId: node.id });
     } catch (error) {
       setNotice({ title: '打开图谱档案位置失败', content: String(error) });
@@ -3620,10 +2699,7 @@ function App() {
     }
     setSkillGenerating(true);
     try {
-      await invoke<string>('start_agent_runtime');
-      const result = await invoke<{ name?: string; category?: string; description?: string; content?: string; tags?: string[] }>('call_agent_rpc', {
-        method: 'skill.write',
-        params: {
+      const result = await agentRpc<{ name?: string; category?: string; description?: string; content?: string; tags?: string[] }>('skill.write', {
           name: newSkill.name.trim(),
           category: newSkill.category,
           description: newSkill.description.trim(),
@@ -3637,8 +2713,7 @@ function App() {
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       setNewSkill(current => ({
         ...current,
         name: result.name?.trim() || current.name,
@@ -3710,7 +2785,6 @@ function App() {
         setActiveOutlineId(updatedProject.outlines[0]?.id ?? null);
         setSelectedCardIds([]);
         setActiveChapterMemoryId(updatedProject.memories[0]?.id ?? null);
-        setSelectedMemoryIds(recentMemoryIds(updatedProject.memories));
       } else {
         const normalizedProject = {
           ...project,
@@ -3728,7 +2802,6 @@ function App() {
         setActiveOutlineId(normalizedProject.outlines[0]?.id ?? null);
         setSelectedCardIds([]);
         setActiveChapterMemoryId(normalizedProject.memories[0]?.id ?? null);
-        setSelectedMemoryIds(recentMemoryIds(normalizedProject.memories));
       }
     }
   };
@@ -3741,7 +2814,6 @@ function App() {
     setActiveCardId(null);
     setSelectedCardIds([]);
     setActiveChapterMemoryId(null);
-    setSelectedMemoryIds([]);
   };
 
   const handleAddChapter = () => {
@@ -3758,7 +2830,6 @@ function App() {
     setEditingProject(updated);
     setProjects(projects.map(p => p.id === updated.id ? updated : p));
     setActiveChapter(newChapter);
-    setSelectedMemoryIds(recentMemoryIds(updated.memories, 1));
   };
 
   const handleUpdateChapterContent = (content: string) => {
@@ -3981,10 +3052,7 @@ function App() {
       setAIToolMode('continue');
       setAIToolRunning(true);
       try {
-        await invoke<string>('start_agent_runtime');
-        const result = await invoke<{ content?: string }>('call_agent_rpc', {
-          method: 'text.transform',
-          params: {
+        const result = await agentRpc<{ content?: string }>('text.transform', {
             mode,
             instruction: aiToolInstruction.trim(),
             content: activeChapter.content,
@@ -3995,8 +3063,7 @@ function App() {
             apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys,
             baseURL: agentConfig.baseURL.trim() || defaultBaseURL, model: agentConfig.model.trim() || fallbackModels[0],
             apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-          },
-        });
+          });
         const content = result.content?.trim() || '';
         if (!content) throw new Error('模型没有返回续写内容');
         setAIToolResult({ mode, content, projectId: editingProject.id, chapterId: activeChapter.id, scope: 'chapter', maxWords });
@@ -4021,17 +3088,13 @@ function App() {
     setAIToolRunning(true);
     setAIToolResult(null);
     try {
-      await invoke<string>('start_agent_runtime');
-      const result = await invoke<{ content?: string }>('call_agent_rpc', {
-        method: 'text.transform',
-        params: {
+      const result = await agentRpc<{ content?: string }>('text.transform', {
           mode, instruction: aiToolInstruction.trim(), content: source,
           projectTitle: editingProject.title, chapterTitle: activeChapter.title,
           apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim() || defaultBaseURL, model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       const content = result.content?.trim() || '';
       if (!content) throw new Error(`模型没有返回${mode === 'de-ai' ? '去 AI 味' : '润色'}内容`);
       setAIToolResult({
@@ -4103,7 +3166,7 @@ function App() {
 
     try {
       if ('__TAURI_INTERNALS__' in window) {
-        await invoke<string>('save_projects', { projects: nextProjects });
+        await nativeClient.saveProjects(nextProjects);
       } else {
         localStorage.setItem('projects', JSON.stringify(nextProjects));
       }
@@ -4224,7 +3287,7 @@ function App() {
     // 章节正文以 Markdown 文件为事实来源；刷新前重新载入一次，避免只扫描启动时的元数据快照。
     if ('__TAURI_INTERNALS__' in window) {
       try {
-        const loadedProjects = await invoke<Project[] | null>('load_projects');
+        const loadedProjects = await nativeClient.loadProjects<Project>();
         const loadedProject = loadedProjects?.find(project => project.id === editingProject.id);
         if (loadedProject) searchProject = { ...editingProject, chapters: loadedProject.chapters };
       } catch (error) {
@@ -4270,7 +3333,7 @@ function App() {
         const label = selectedCardIds.includes(card.id) ? '本章引用' : '正文提及';
         graphEdges.push({ id, source: chapterNodeId, target: `card:${card.id}`, label, weight: defaultKnowledgeGraphWeight(label), sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
-      [project.protagonist1, project.protagonist2].filter((name): name is string => Boolean(name?.trim()) && chapter.content.includes(name.trim())).forEach(name => {
+      [project.protagonist1, project.protagonist2].flatMap(name => typeof name === 'string' && name.trim() ? [name.trim()] : []).filter(name => chapter.content.includes(name)).forEach(name => {
         const target = `entity:${name.trim()}`;
         graphEdges.push({ id: `${chapterNodeId}->${target}`, source: chapterNodeId, target, label: '章节主角', weight: 0.92, sourceChapterId: chapter.id, updatedAt: new Date().toISOString() });
       });
@@ -4398,7 +3461,7 @@ function App() {
       setEditingProject(project);
       setActiveChapter(chapter);
       if ('__TAURI_INTERNALS__' in window) {
-        await invoke<string>('save_projects', { projects: snapshot });
+        await nativeClient.saveProjects(snapshot);
       } else {
         localStorage.setItem('projects', JSON.stringify(snapshot));
       }
@@ -4431,10 +3494,7 @@ function App() {
     setNotice({ title: '章节已保存', content: '章节已写入本地，正在后台更新本章记忆。' });
     void (async () => {
       try {
-        await invoke<string>('start_agent_runtime');
-        const result = await invoke<AgentMemoryResult>('call_agent_rpc', {
-          method: 'memory.write',
-          params: {
+        const result = await agentRpc<AgentMemoryResult>('memory.write', {
             projectTitle: localProject.title,
             chapterTitle: chapter.title,
             content: chapter.content,
@@ -4448,8 +3508,7 @@ function App() {
             contextWindow: agentConfig.contextWindow,
             knowledgeGraph: { nodes: localProject.graphNodes, edges: localProject.graphEdges },
             ...agentNetworkParams(agentConfig),
-          },
-        });
+          });
         const summary = result.summary?.trim() || localStructuredMemory.summary;
         const aiKeywords = Array.isArray(result.keywords) && result.keywords.length ? asTextList(result.keywords, 8) : keywords;
         const aiStructuredFieldCount = [
@@ -4502,7 +3561,7 @@ function App() {
           setActiveChapter(current => current?.id === latestChapter.id ? latestChapter : current);
           const nextProjects = currentProjects.map(project => project.id === merged.id ? merged : project);
           if ('__TAURI_INTERNALS__' in window) {
-            void invoke<string>('save_projects', { projects: nextProjects });
+            void nativeClient.saveProjects(nextProjects);
           } else {
             localStorage.setItem('projects', JSON.stringify(nextProjects));
           }
@@ -4520,11 +3579,11 @@ function App() {
     })();
   };
 
+  persistCurrentChapterRef.current = persistCurrentChapter;
+
   const updateEditorProject = (updater: (project: Project) => Project) => {
     if (!editingProject) return;
-    const updated = updater(editingProject);
-    setEditingProject(updated);
-    setProjects(current => current.map(project => project.id === updated.id ? updated : project));
+    setEditingProject(updater(editingProject));
   };
 
   const startNewProjectAgentSession = () => {
@@ -4558,9 +3617,7 @@ function App() {
     try {
       await invoke<string>('start_agent_runtime');
       const activeStyle = project.styleProfileId ? writingStyles.find(style => style.id === project.styleProfileId) : undefined;
-      const result = await invoke<ProjectAgentResponse>('call_agent_rpc', {
-        method: 'project.agent.chat',
-        params: {
+      const result = await agentRpc<ProjectAgentResponse>('project.agent.chat', {
           runId,
           sessionId: session.sessionId,
           mode: session.mode,
@@ -4569,7 +3626,7 @@ function App() {
           activeChapterId: activeChapter?.id,
           history: session.messages.slice(-12).map(message => ({ role: message.role, content: message.content })),
           writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
-          skills: skills.map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          skills: skills.map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           apiKey: agentConfig.apiKey.trim(),
           apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
@@ -4578,8 +3635,7 @@ function App() {
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       const latestProject = editingProjectRef.current;
       if (!latestProject || latestProject.id !== project.id) throw new Error('当前小说已切换，已丢弃旧项目 Agent 回复');
       const proposed = Array.isArray(result.changes)
@@ -4622,7 +3678,7 @@ function App() {
     try {
       const result = applyProjectAgentChangeBatch(currentProject, pending);
       const nextProjects = projectsRef.current.map(project => project.id === result.project.id ? result.project : project);
-      if ('__TAURI_INTERNALS__' in window) await invoke<string>('save_projects', { projects: nextProjects });
+      if ('__TAURI_INTERNALS__' in window) await nativeClient.saveProjects(nextProjects);
       else localStorage.setItem('projects', JSON.stringify(nextProjects));
       setProjects(nextProjects);
       setEditingProject(result.project);
@@ -4825,7 +3881,7 @@ function App() {
     }
     setAgentError('');
     setOutlineGenerating(true);
-    const runId = `outline-${Date.now()}`; outlineRunRef.current = runId; setOutlineStreamContent('');
+    const runId = `outline-${Date.now()}`; outlineRunRef.current = runId; outlineStreamRawRef.current = ''; setOutlineStreamContent('');
     setOutlineAgentActivity([{ id: 'starting', step: 'starting', message: '正在启动大纲智能体', status: 'active' }]);
     setOutlineChatMessages(current => [...current, { role: 'user', content: outlineAgentInstruction.trim(), createdAt: new Date().toISOString() }]);
     try {
@@ -4848,9 +3904,7 @@ function App() {
           outlines: project.outlines.map(item => item.id === targetOutline.id ? { ...item, chapterId: targetChapter.id, updatedAt: new Date().toISOString() } : item),
         }));
       }
-      const result = await invoke<{ content?: string; title?: string }>('call_agent_rpc', {
-        method: 'outline.write',
-        params: {
+      const result = await agentRpc<{ content?: string; title?: string }>('outline.write', {
           runId,
           sessionId: outlineSessionId,
           previousSessionId: outlinePreviousSessionId,
@@ -4886,7 +3940,7 @@ function App() {
             .map(item => ({ id: item.id, title: item.title, content: item.content })),
           authorPreferences: editingProject.authorPreferences || [],
           writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
-          skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+          skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: selectedAgentSkillNames,
           apiKey: agentConfig.apiKey.trim(),
           apiKeys: agentConfig.apiKeys,
@@ -4896,8 +3950,7 @@ function App() {
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       const generatedContent = result.content || targetOutline.content;
       updateEditorProject(project => ({
         ...project,
@@ -4909,7 +3962,7 @@ function App() {
       setNotice({ title: '大纲已生成', content: `${targetOutline.title} 已依据${sourceChapter ? `第 ${chapterNumberFromText(sourceChapter.title) || editingProject.chapters.findIndex(chapter => chapter.id === sourceChapter.id) + 1} 章正文` : '作品资料'}生成。` });
     } catch (error) {
       setAgentError(String(error));
-      setOutlineAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, step: 'error', message: String(error), status: 'error' }].slice(-12));
+      setOutlineAgentActivity(current => [...current.map(item => item.status === 'active' ? { ...item, status: 'complete' as const } : item), { id: `error-${Date.now()}`, step: 'error', message: String(error), status: 'error' as const }].slice(-12));
       setNotice({ title: '大纲生成失败', content: String(error) });
     } finally {
       setOutlineGenerating(false);
@@ -4933,13 +3986,10 @@ function App() {
       return;
     }
     setCardGenerating(true);
-    const runId = `card-${Date.now()}`; cardRunRef.current = runId; setCardStreamContent('');
+    const runId = `card-${Date.now()}`; cardRunRef.current = runId; cardStreamRawRef.current = ''; setCardStreamContent('');
     setCardChatMessages(current => [...current, { role: 'user', content: cardAgentInstruction.trim(), createdAt: new Date().toISOString() }]);
     try {
-      await invoke<string>('start_agent_runtime');
-      const result = await invoke<{ title?: string; content?: string }>('call_agent_rpc', {
-        method: 'card.write',
-        params: {
+      const result = await agentRpc<{ title?: string; content?: string }>('card.write', {
           runId,
           sessionId: cardSessionId,
           previousSessionId: cardPreviousSessionId,
@@ -4961,13 +4011,12 @@ function App() {
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       if (!result.content?.trim()) throw new Error('智能体没有返回卡片内容');
       setCardDraft(current => ({
         ...current,
         title: result.title?.trim() || current.title || `${current.type}设定`,
-        content: result.content.trim(),
+        content: result.content?.trim() || '',
       }));
       setCardChatMessages(current => [...current, { role: 'assistant', content: result.content?.trim() || '', createdAt: new Date().toISOString() }]);
       setNotice({ title: '卡片草稿已生成', content: '内容已填入左侧编辑器，请检查后点击“保存卡片”。' });
@@ -5083,9 +4132,7 @@ function App() {
         : item));
       setAgentProgressPercent(current => Math.max(current, 2));
       setAgentProgressMessage('运行环境已就绪，正在发送创作任务');
-      const result = await invoke<AgentDraftResult>('call_agent_rpc', {
-        method: 'chapter.write',
-        params: {
+      const result = await agentRpc<AgentDraftResult>('chapter.write', {
           runId,
           sessionId: chapterSessionId,
           previousSessionId: chapterPreviousSessionId,
@@ -5099,7 +4146,7 @@ function App() {
           cards: editingProject.cards.filter(card => selectedCardIds.includes(card.id)),
           knowledgeGraph: { nodes: editingProject.graphNodes, edges: editingProject.graphEdges },
           skills: [...agentSkills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])]
-            .map(skill => ({ name: skill.name, displayName: skill.displayName, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
+            .map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: prioritizedSkillNames,
           // 章节承接只传入紧邻上一章正文；更早章节只通过用户勾选的结构化记忆进入。
           previousChapters: continuityChapter ? [{ id: continuityChapter.id, title: continuityChapter.title, content: continuityChapter.content }] : [],
@@ -5125,8 +4172,7 @@ function App() {
           reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow,
           ...agentNetworkParams(agentConfig),
-        },
-      });
+        });
       // The completed RPC result is the source of truth. It must replace the
       // streaming buffer because JSON envelopes can be split across SSE frames.
       const draftContent = chapterDraftFromStream(result.draftContent || '');
@@ -5283,14 +4329,14 @@ function App() {
     try {
       const snapshot = editingProject?.id === selected.id ? editingProject : selected;
       const currentProjects = projects.map(project => project.id === snapshot.id ? snapshot : project);
-      await invoke<string>('save_projects', { projects: currentProjects });
+      await nativeClient.saveProjects(currentProjects);
       const result = await invoke<{ repositoryUrl: string; branch: string; commit: string; changed: boolean }>('backup_project_to_github', {
         repositoryUrl,
         project: snapshot,
       });
       const linkedProject = { ...snapshot, githubRepositoryUrl: result.repositoryUrl };
       const linkedProjects = currentProjects.map(project => project.id === linkedProject.id ? linkedProject : project);
-      await invoke<string>('save_projects', { projects: linkedProjects });
+      await nativeClient.saveProjects(linkedProjects);
       setProjects(linkedProjects);
       if (editingProject?.id === linkedProject.id) setEditingProject(linkedProject);
       setGithubRepositoryUrl(result.repositoryUrl);
@@ -5322,7 +4368,7 @@ function App() {
         return;
       }
       const nextProjects = [...projects, restored];
-      await invoke<string>('save_projects', { projects: nextProjects });
+      await nativeClient.saveProjects(nextProjects);
       setProjects(nextProjects);
       setGithubProjectId(restored.id);
       setGithubRepositoryUrl(result.repositoryUrl);
@@ -5358,7 +4404,7 @@ function App() {
         restored = { ...conflict.project, id: nextId, title, githubRepositoryUrl: undefined, createdAt: new Date().toISOString() };
         nextProjects = [...projects, restored];
       }
-      await invoke<string>('save_projects', { projects: nextProjects });
+      await nativeClient.saveProjects(nextProjects);
       setProjects(nextProjects);
       if (mode === 'update' && editingProject?.id === conflict.localProject.id) {
         setEditingProject(restored);
@@ -5385,11 +4431,11 @@ function App() {
     try {
       const snapshot = editingProject ? projects.map(project => project.id === editingProject.id ? editingProject : project) : projects;
       await Promise.all([
-        invoke<string>('save_projects', { projects: snapshot }),
-        invoke<string>('save_library_books', { books: libraryBooks }),
-        invoke<string>('save_ranking_books', { books: rankingBooks }),
-        invoke<string>('save_dismantle_books', { books: dismantleBooks }),
-        invoke<string>('save_writing_styles', { styles: writingStyles }),
+        nativeClient.saveProjects(snapshot),
+        nativeClient.saveLibraryBooks(libraryBooks),
+        nativeClient.saveRankingBooks(rankingBooks),
+        nativeClient.saveDismantleBooks(dismantleBooks),
+        nativeClient.saveWritingStyles(writingStyles),
       ]);
       const backupManifest = {
         schemaVersion: 2,
@@ -5529,11 +4575,11 @@ function App() {
         }
       }
       const restoreTasks: Array<{ label: string; run: () => Promise<string> }> = [];
-      if (Array.isArray(restoredProjects)) restoreTasks.push({ label: '小说、章节、大纲与记忆', run: () => invoke<string>('save_projects', { projects: restoredProjects }) });
-      if (Array.isArray(restoredLibrary)) restoreTasks.push({ label: '书籍管理', run: () => invoke<string>('save_library_books', { books: restoredLibrary }) });
-      if (Array.isArray(restoredRankings)) restoreTasks.push({ label: '扫榜数据', run: () => invoke<string>('save_ranking_books', { books: restoredRankings }) });
-      if (Array.isArray(restoredDismantle)) restoreTasks.push({ label: '拆书数据', run: () => invoke<string>('save_dismantle_books', { books: restoredDismantle }) });
-      if (Array.isArray(restoredStyles)) restoreTasks.push({ label: '文风数据', run: () => invoke<string>('save_writing_styles', { styles: restoredStyles }) });
+      if (Array.isArray(restoredProjects)) restoreTasks.push({ label: '小说、章节、大纲与记忆', run: () => nativeClient.saveProjects(restoredProjects) });
+      if (Array.isArray(restoredLibrary)) restoreTasks.push({ label: '书籍管理', run: () => nativeClient.saveLibraryBooks(restoredLibrary) });
+      if (Array.isArray(restoredRankings)) restoreTasks.push({ label: '扫榜数据', run: () => nativeClient.saveRankingBooks(restoredRankings) });
+      if (Array.isArray(restoredDismantle)) restoreTasks.push({ label: '拆书数据', run: () => nativeClient.saveDismantleBooks(restoredDismantle) });
+      if (Array.isArray(restoredStyles)) restoreTasks.push({ label: '文风数据', run: () => nativeClient.saveWritingStyles(restoredStyles) });
       if (!restoreTasks.length) throw new Error('备份包中没有可恢复的小说、书籍、拆书、榜单或文风数据。');
       let restoredCount = 0;
       setCloudSyncMessage(`备份包已解析，正在并行恢复 ${restoreTasks.length} 类本机数据...`);
@@ -5596,7 +4642,7 @@ function App() {
       setCloudSyncMessage('本机数据写入完成，正在重新载入小说项目...');
       const restored = Array.isArray(restoredProjects)
         ? restoredProjects as Project[]
-        : await invoke<Project[] | null>('load_projects');
+        : await nativeClient.loadProjects<Project>();
       if (restored) {
         setProjects(restored);
         if (editingProject) setEditingProject(restored.find(project => project.id === editingProject.id) || null);
@@ -5624,11 +4670,7 @@ function App() {
     }
     setModelsLoading(true);
     try {
-      await invoke<string>('start_agent_runtime');
-      const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await invoke<{ models?: string[] }>('call_agent_rpc', {
-        method: 'models.list',
-        params: { baseURL: requestBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) },
-      }) })));
+      const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await agentRpc<{ models?: string[] }>('models.list', { baseURL: requestBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) }) })));
       const successful = responses.filter((response): response is PromiseFulfilledResult<{ apiKey: string; result: { models?: string[] } }> => response.status === 'fulfilled');
       const modelKeyMap = successful.reduce<Record<string, string[]>>((map, response) => {
         (Array.isArray(response.value.result.models) ? response.value.result.models : []).forEach(model => {
@@ -5671,19 +4713,15 @@ function App() {
     try {
       const selectedModel = settingsDraft.model.trim() || fallbackModels[0];
       const orderedKeys = orderApiKeysForModel(settingsDraft, selectedModel);
-      await invoke<string>('start_agent_runtime');
-      await invoke('call_agent_rpc', {
-        method: 'models.test',
-        params: {
-          apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
-          apiKeys: orderedKeys,
-          baseURL: requestBaseURL,
-          model: selectedModel,
-          apiMode: settingsDraft.apiMode,
-          reasoningMode: settingsDraft.reasoningMode,
-          contextWindow: settingsDraft.contextWindow,
-          ...agentNetworkParams(settingsDraft),
-        },
+      await agentRpc<{ tested: boolean; model: string }>('models.test', {
+        apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
+        apiKeys: orderedKeys,
+        baseURL: requestBaseURL,
+        model: selectedModel,
+        apiMode: settingsDraft.apiMode,
+        reasoningMode: settingsDraft.reasoningMode,
+        contextWindow: settingsDraft.contextWindow,
+        ...agentNetworkParams(settingsDraft),
       });
       setModelListMessage(`模型 ${selectedModel} 测试成功（${apiModeLabel(settingsDraft.apiMode)}）${settingsDraft.proxyEnabled ? `，已通过代理 ${settingsDraft.proxyURL}` : ''}。`);
     } catch (error) {
@@ -5711,10 +4749,7 @@ function App() {
     try {
       const selectedModel = settingsDraft.model.trim();
       const orderedKeys = orderApiKeysForModel(settingsDraft, selectedModel);
-      await invoke<string>('start_agent_runtime');
-      setSettingsDiagnostics(await invoke<DiagnosticReport>('call_agent_rpc', {
-        method: 'settings.diagnose',
-        params: {
+      setSettingsDiagnostics(await agentRpc<DiagnosticReport>('settings.diagnose', {
           apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
           apiKeys: orderedKeys,
           baseURL: requestBaseURL,
@@ -5723,8 +4758,7 @@ function App() {
           reasoningMode: settingsDraft.reasoningMode,
           contextWindow: settingsDraft.contextWindow,
           ...agentNetworkParams(settingsDraft),
-        },
-      }));
+        }));
     } catch (error) {
       setSettingsDiagnostics({
         mode, modelsEndpoint: '', chatEndpoint: '',
@@ -5966,7 +5000,7 @@ function App() {
     setProjects(snapshot);
     try {
       if ('__TAURI_INTERNALS__' in window) {
-        await invoke<string>('save_projects', { projects: snapshot });
+        await nativeClient.saveProjects(snapshot);
       } else {
         localStorage.setItem('projects', JSON.stringify(snapshot));
       }
@@ -5992,7 +5026,7 @@ function App() {
     setProjects(snapshot);
     try {
       if ('__TAURI_INTERNALS__' in window) {
-        await invoke<string>('save_projects', { projects: snapshot });
+        await nativeClient.saveProjects(snapshot);
       } else {
         localStorage.setItem('projects', JSON.stringify(snapshot));
       }
@@ -6056,7 +5090,7 @@ function App() {
     ]
     : []);
   const graphDocumentGroups = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeGroup))) : [];
-  const activeGraphDocumentGroup = graphDocumentGroups.includes(graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
+  const activeGraphDocumentGroup = graphDocumentGroups.some(group => group === graphDocumentGroup) ? graphDocumentGroup : (graphDocumentGroups[0] || '');
   const graphDocumentTypeOptions = editingProject ? Array.from(new Set(editingProject.graphNodes.map(graphNodeTypeLabel))).sort((left, right) => left.localeCompare(right, 'zh-CN')) : [];
   const graphDocumentNodes = editingProject ? editingProject.graphNodes.filter(node => {
     const matchesGroup = !activeGraphDocumentGroup || graphNodeGroup(node) === activeGraphDocumentGroup;
@@ -6236,7 +5270,7 @@ function App() {
     const value = Number(log.created_at || 0);
     return value > 10_000_000_000 ? value : value * 1000;
   };
-  const gatewayLogs = (gatewayUsage?.accounts || []).flatMap(account => account.logs.map(log => ({ ...log, __keyHint: account.keyHint, __keyIndex: account.keyIndex }))).filter(log => {
+  const gatewayLogs: Array<Record<string, unknown> & { __keyHint: string; __keyIndex: number }> = (gatewayUsage?.accounts || []).flatMap(account => account.logs.map(log => ({ ...log, __keyHint: account.keyHint, __keyIndex: account.keyIndex }))).filter(log => {
     const timestamp = gatewayLogTime(log);
     if (!timestamp) return true;
     const date = new Date(timestamp);
@@ -6813,7 +5847,7 @@ function App() {
               {outlineMode ? (
                 <div className="agent-panel-scroll outline-agent-panel">
                   <section className="agent-task-section">
-                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlinePreviousSessionId(outlineSessionId); setOutlineSessionId(newAgentSessionId('outline')); setOutlineChatMessages([]); setOutlineStreamContent(''); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <div className="agent-instruction-heading"><label>大纲创作指令</label><button type="button" className="link-button" onClick={() => { setOutlinePreviousSessionId(outlineSessionId); setOutlineSessionId(newAgentSessionId('outline')); setOutlineChatMessages([]); outlineStreamRawRef.current = ''; setOutlineStreamContent(''); }}>新建会话</button><button type="button" className={`agent-skill-button ${showAgentSkillPicker ? 'active' : ''}`} onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={outlineAgentInstruction} onChange={event => setOutlineAgentInstruction(event.target.value)} placeholder="描述要补全的结构、节奏、冲突和章节安排" />
                     {outlineIntentPreview && <div className={`outline-intent-preview ${outlineIntentPreview.sourceChapter || outlineIntentPreview.isFirstChapter ? '' : 'warning'}`}>
                       <strong>意图识别</strong>
@@ -6835,7 +5869,7 @@ function App() {
               ) : cardMode ? (
                 <div className="agent-panel-scroll card-agent-panel">
                   <section className="agent-task-section">
-                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="link-button" onClick={() => { setCardPreviousSessionId(cardSessionId); setCardSessionId(newAgentSessionId('card')); setCardChatMessages([]); setCardStreamContent(''); }}>新建会话</button><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
+                    <div className="agent-instruction-heading"><label>卡片创建指令</label><button type="button" className="link-button" onClick={() => { setCardPreviousSessionId(cardSessionId); setCardSessionId(newAgentSessionId('card')); setCardChatMessages([]); cardStreamRawRef.current = ''; setCardStreamContent(''); }}>新建会话</button><button type="button" className="agent-skill-button" onClick={() => setShowAgentSkillPicker(current => !current)}>技能{selectedAgentSkillNames.length ? ` ${selectedAgentSkillNames.length}` : ''}</button></div>
                     <textarea value={cardAgentInstruction} onChange={event => setCardAgentInstruction(event.target.value)} placeholder="描述要补充的身份、能力、关系、限制或状态变化" />
                     {showAgentSkillPicker && <section className="agent-skill-picker" aria-label="选择卡片技能"><div className="agent-card-picker-title"><span>本次优先技能</span><button type="button" className="link-button" onClick={() => setSelectedAgentSkillNames([])}>自动选择</button></div><div className="agent-skill-options">{skills.map(skill => <label key={skill.id} className="agent-skill-option"><input type="checkbox" checked={selectedAgentSkillNames.includes(skill.name)} onChange={() => setSelectedAgentSkillNames(current => current.includes(skill.name) ? current.filter(name => name !== skill.name) : [...current, skill.name].slice(0, 6))} /><span><strong>{skill.displayName || skill.name}</strong><small>{skill.description || skill.category}</small></span></label>)}</div></section>}
                     <div className="card-agent-context"><span>当前卡片</span><strong>{activeCard?.title || cardDraft.title || '新建卡片'}</strong><small>{cardDraft.type} · {countNovelCharacters(cardDraft.content)} 字</small></div>

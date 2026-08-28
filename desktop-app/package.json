@@ -4,8 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "predev": "npm --prefix .. run build:shared",
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "npm --prefix .. run build:shared && tsc -b && vite build",
     "prepare:agent-runtime": "node ./scripts/prepare-agent-runtime.mjs",
     "agent:gateway": "npm --prefix ../sidecars/agent-runtime run gateway",
     "mobile:init": "node ./scripts/mobile-targets.mjs",
@@ -18,6 +19,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@apisaverwriter/contracts": "file:../packages/contracts",
+    "@apisaverwriter/model-protocol": "file:../packages/model-protocol",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-http": "^2.5.9",

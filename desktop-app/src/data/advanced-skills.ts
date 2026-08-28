@@ -1,4 +1,4 @@
-import type { Skill } from '../App';
+import type { Skill } from '../domain/skill';
 
 /** QMAI-inspired writing checks. Kept as editable Markdown so users can fork them. */
 export const advancedBuiltinSkills: Skill[] = [
