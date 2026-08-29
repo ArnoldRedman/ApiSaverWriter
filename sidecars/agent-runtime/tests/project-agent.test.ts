@@ -169,6 +169,32 @@ describe("project agent", () => {
     expect(openTurn.at(-1)?.content).toContain("码头仓库");
   });
 
+  it("多轮检索后请求体不会无上限增长", async () => {
+    // 回归：messages 只增不减，真实使用中请求体从几 KB 撑到 62 KB，做到一半突然被中转站拒绝
+    const bulky = { ...project, chapters: project.chapters.map(chapter => ({ ...chapter, content: "旧仓库的档案细节。".repeat(2000) })) };
+    const chat = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
+      const bytes = messages.reduce((sum, message) => sum + Buffer.byteLength(message.content, "utf8"), 0);
+      // 40 KB 上限叠上最后一轮的截断余量，留一些余地
+      expect(bytes).toBeLessThan(48_000);
+      return Promise.resolve({ content: JSON.stringify({ action: "open", kind: "章节", id: "1" }), model: "test" });
+    });
+
+    await runProjectAgent({
+      mode: "discuss",
+      instruction: "把旧仓库相关的章节全看一遍",
+      project: bulky,
+      maxSteps: 8,
+    }, { chat } as unknown as ApiSaverClient, delegates());
+
+    expect(chat).toHaveBeenCalledTimes(8);
+    // 被省略早期轮次时要如实告知模型，而不是默默丢掉
+    const lastTurn = chat.mock.calls.at(-1)?.[0] as Array<{ content: string }>;
+    expect(lastTurn.some(message => message.content.includes("已省略较早的"))).toBe(true);
+    // system 与首条请求（含项目资料）是任务前提，任何情况下都不能被丢
+    expect(lastTurn[0]?.content).toContain("小说项目助手");
+    expect(lastTurn[1]?.content).toContain("本轮请求");
+  });
+
   it("stops the loop at maxSteps and still returns a result", async () => {
     const chat = vi.fn().mockResolvedValue({ content: JSON.stringify({ action: "search", query: "林舟" }), model: "test" });
     const client = { chat } as unknown as ApiSaverClient;

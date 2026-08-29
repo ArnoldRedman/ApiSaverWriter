@@ -1274,6 +1274,19 @@ function App() {
   const [projectAgentProgress, setProjectAgentProgress] = useState(0);
   const [projectAgentActivity, setProjectAgentActivity] = useState<Array<{ id: string; message: string; status: 'active' | 'complete' | 'error' }>>([]);
   const projectAgentRunRef = useRef('');
+  // 对话区自动跟随到底；作者主动往上翻看旧消息时不抢滚动条，回到底部后恢复
+  const projectAgentPinnedRef = useRef(true);
+  const projectAgentMessageCount = projectAgentSession?.messages.length ?? 0;
+  const projectAgentChangeCount = projectAgentSession?.changes.length ?? 0;
+  useEffect(() => {
+    const container = projectAgentMessagesRef.current;
+    if (!container || !projectAgentPinnedRef.current) return;
+    // 进度条与变更卡片会连续改变高度，用动画帧提交避开布局未完成时的误算
+    const frame = window.requestAnimationFrame(() => {
+      container.scrollTop = container.scrollHeight;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [showProjectAgent, projectAgentMessageCount, projectAgentChangeCount, projectAgentRunning, projectAgentProgress, projectAgentActivity]);
   const [chapterSessionId, setChapterSessionId] = useState(() => `chapter-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const [outlineSessionId, setOutlineSessionId] = useState(() => `outline-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
   const [cardSessionId, setCardSessionId] = useState(() => `card-session-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
@@ -1430,6 +1443,7 @@ function App() {
   const [draggingChapterId, setDraggingChapterId] = useState<number | null>(null);
   const [localBackups, setLocalBackups] = useState<{ directory: string; files: Array<{ name: string; size: number; modifiedAt: number }> }>({ directory: '', files: [] });
   const [showLocalBackupPicker, setShowLocalBackupPicker] = useState(false);
+  const projectAgentMessagesRef = useRef<HTMLDivElement | null>(null);
   const chaptersListRef = useRef<HTMLDivElement | null>(null);
   const chapterEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -3925,6 +3939,8 @@ function App() {
     const userMessage: ProjectAgentMessage = { id: `message-${Date.now()}-user`, role: 'user', content: instruction, createdAt: new Date().toISOString() };
     const runId = `project-agent-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     projectAgentRunRef.current = runId;
+    // 发送时无条件回到底部：作者刚输入完，一定是在看最新一轮
+    projectAgentPinnedRef.current = true;
     setProjectAgentInput('');
     setProjectAgentRunning(true);
     setProjectAgentProgress(1);
@@ -5705,7 +5721,15 @@ function App() {
               <div className="project-agent-header-actions"><button className="icon-button" title="新建会话" disabled={projectAgentRunning} onClick={startNewProjectAgentSession}>＋</button><button className="icon-button" title="关闭" onClick={() => setShowProjectAgent(false)}>×</button></div>
             </header>
             <div className="project-agent-mode" role="tablist" aria-label="项目 Agent 模式"><button className={projectAgentSession?.mode === 'discuss' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'discuss' } : current)}>讨论</button><button className={projectAgentSession?.mode === 'execute' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current)}>执行</button></div>
-            <div className="project-agent-messages">
+            <div
+              className="project-agent-messages"
+              ref={projectAgentMessagesRef}
+              onScroll={event => {
+                const { scrollTop, scrollHeight, clientHeight } = event.currentTarget;
+                // 48px 容差：浏览器的小数缩放下 scrollTop 不一定能精确等于底部
+                projectAgentPinnedRef.current = scrollHeight - scrollTop - clientHeight < 48;
+              }}
+            >
               {!projectAgentSession ? <div className="project-agent-empty"><strong>正在读取会话</strong></div> : projectAgentSession.messages.length === 0 ? <div className="project-agent-empty"><strong>讨论全书，或让 Agent 整理项目</strong><span>执行模式下，所有写入都会先生成待确认变更。</span></div> : projectAgentSession.messages.map(message => <article key={message.id} className={`project-agent-message ${message.role} ${message.error ? 'error' : ''}`}><small>{message.role === 'user' ? '你' : '项目 Agent'}</small><p>{message.content}</p>{message.toolEvents?.length ? <div className="project-agent-tools">{message.toolEvents.map((event, index) => <span className={event.status} key={`${message.id}-${event.tool}-${index}`}><b>{event.tool}</b>{event.message}</span>)}</div> : null}</article>)}
               {projectAgentRunning && <section className="project-agent-running" aria-live="polite"><div><strong>正在处理项目</strong><span>{projectAgentProgress}%</span></div><i><b style={{ width: `${projectAgentProgress}%` }} /></i>{projectAgentActivity.map(item => <span className={item.status} key={item.id}>{item.message}</span>)}</section>}
               {projectAgentPendingChanges.length > 0 && <section className="project-agent-changes"><header><div><strong>待确认变更</strong><small>{projectAgentPendingChanges.length} 项，应用前不会写入</small></div><button className="link-button" disabled={projectAgentRunning} onClick={() => dismissProjectAgentChanges()}>全部放弃</button></header>{projectAgentPendingChanges.map(change => <article key={change.id}><div><strong>{projectAgentChangeLabel(change)}</strong><small>{change.summary}</small><span>{projectAgentChangeDetail(change)}</span><details><summary>预览内容</summary><pre>{projectAgentChangePreview(change)}</pre></details><div className="project-agent-change-actions"><button className="btn-secondary" disabled={projectAgentRunning} onClick={() => dismissProjectAgentChanges([change.id])}>放弃</button><button className="btn-primary" disabled={projectAgentRunning} onClick={() => void applyPendingProjectAgentChanges([change.id])}>应用</button></div></div></article>)}<button className="btn-primary" disabled={projectAgentRunning} onClick={() => void applyPendingProjectAgentChanges()}>应用全部变更</button></section>}
