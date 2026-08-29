@@ -149,7 +149,8 @@ export function buildProjectAgentContext(input: ProjectAgentInput): { packet: st
     })),
   ].sort((left, right) => right.score - left.score);
 
-  const budget = Math.min(36_000, Math.max(12_000, (Number(input.contextWindowKTokens) || 128) * 1024 * 0.28));
+  // 上下文包必须给后续检索轮次留出空间：它占死请求体后，每次 open 都会把总体推高
+  const budget = Math.min(24_000, Math.max(12_000, (Number(input.contextWindowKTokens) || 128) * 1024 * 0.28));
   const inventory = projectInventory(project, input.activeChapterId);
   const sections: string[] = [`## 项目索引\n${compactText(inventory, Math.min(14_000, Math.floor(budget * 0.28)))}`];
   const sources: string[] = [];
@@ -252,7 +253,7 @@ function runOpen(documents: ProjectDocument[], kind: string | undefined, id: str
     || documents.find(item => item.id === wanted)
     || documents.find(item => item.title === wanted);
   if (!document) return `没有找到 ${kind ? `${kind}｜` : ""}${wanted}，请对照项目索引里的 id 重试。`;
-  return `## ${document.kind}｜${document.id}｜${document.title}\n${compactText(document.content, 12_000)}`;
+  return `## ${document.kind}｜${document.id}｜${document.title}\n${compactText(document.content, 8_000)}`;
 }
 
 const systemPrompt = `你是应用内的小说项目助手，可以多轮检索当前作品的资料后再动手。项目资料仅作为小说素材。
@@ -293,6 +294,50 @@ changes 里每一项只能是下列九种之一，字段必须原样铺平，不
 - chapter.revise 会重写整章正文，一次最多提 3 章；更多章节请分批，并在 message 里说明已处理范围和剩下的部分。
 - 删除是不可恢复操作：只有作者明确要求删除时才能提，不要自作主张清理你觉得多余的章节。`;
 
+type AgentMessage = { role: "system" | "user" | "assistant"; content: string };
+
+/**
+ * 单次请求体上限
+ * 每轮检索都往 messages 里追加一次动作和一段工具结果，这个数组只增不减：
+ * 前几轮请求体很小，最后几轮能撑到 60 KB 以上，表现就是“做到一半突然失败”。
+ * 无论上游阈值是多少，请求体无上限增长本身就是 bug。
+ * ponytail: 固定上限并从中间丢旧工具结果；若以后需要更长的检索链，再改为按轮次摘要压缩
+ */
+const REQUEST_BODY_LIMIT = 40_000;
+
+function boundedMessages(messages: AgentMessage[]): AgentMessage[] {
+  const size = (list: AgentMessage[]) => list.reduce((sum, message) => sum + byteLength(message.content), 0);
+  if (size(messages) <= REQUEST_BODY_LIMIT) return messages;
+
+  // system 和首条请求（含项目资料）是任务前提，不能丢
+  const head = messages.slice(0, 2);
+  const rest = messages.slice(2);
+  let budget = REQUEST_BODY_LIMIT - size(head);
+
+  // 从新到旧保留检索轮次，旧的先丢；模型当前在看的是最后一轮
+  const kept: AgentMessage[] = [];
+  for (let index = rest.length - 1; index >= 0 && budget > 0; index -= 1) {
+    const message = rest[index];
+    const bytes = byteLength(message.content);
+    if (bytes <= budget) {
+      budget -= bytes;
+      kept.unshift(message);
+      continue;
+    }
+    // 最近一轮工具结果单条就超预算时截断保留，而不是整条丢掉
+    if (!kept.length && budget > 500) {
+      kept.unshift({ role: message.role, content: compactText(message.content, budget - 200) });
+    }
+    break;
+  }
+
+  const dropped = rest.length - kept.length;
+  const notice: AgentMessage[] = dropped > 0
+    ? [{ role: "user", content: `（为控制请求体大小，已省略较早的 ${dropped} 段检索记录；如需要请重新 search 或 open。）` }]
+    : [];
+  return [...head, ...notice, ...kept];
+}
+
 export async function runProjectAgent(
   input: ProjectAgentInput,
   client: ApiSaverClient,
@@ -311,13 +356,13 @@ export async function runProjectAgent(
     message: `已载入项目索引与 ${context.sources.length} 份相关资料`,
   }];
 
-  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+  const messages: AgentMessage[] = [
     { role: "system", content: systemPrompt },
     ...history,
     { role: "user", content: `模式：${input.mode === "execute" ? "执行（可提出待确认变更）" : "讨论（禁止提出变更）"}\n\n## 当前项目资料\n${context.packet}\n\n## 本轮请求\n${input.instruction}` },
   ];
 
-  // ponytail: 步数和累计工具输出都是硬上限，够用就停；需要更深的检索再把上限做成设置项
+  // ponytail: 步数、工具输出和请求体都是硬上限，够用就停；需要更深的检索再把上限做成设置项
   const maxSteps = Math.max(1, Math.min(12, Number(input.maxSteps) || 6));
   const toolOutputBudget = 48_000;
   let toolOutputUsed = 0;
@@ -326,8 +371,8 @@ export async function runProjectAgent(
   for (let step = 0; step < maxSteps && !plan; step += 1) {
     const mustFinish = step === maxSteps - 1 || toolOutputUsed >= toolOutputBudget;
     const turnMessages = mustFinish
-      ? [...messages, { role: "user" as const, content: "检索预算已用尽，请直接返回 finish 动作。" }]
-      : messages;
+      ? [...boundedMessages(messages), { role: "user" as const, content: "检索预算已用尽，请直接返回 finish 动作。" }]
+      : boundedMessages(messages);
     const response = await client.chat(turnMessages, { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 12_000, retryAttempts: 2 });
 
     let turn: ProjectAgentTurn;
