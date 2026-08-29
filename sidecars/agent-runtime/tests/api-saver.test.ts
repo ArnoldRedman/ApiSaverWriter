@@ -1,11 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { countMessageTokens } from "../src/context/token-budget.js";
-import { ApiSaverClient, buildModelConfig, createChatModel, resetModelKeyRoutingCache, seedModelKeyRoutingCache } from "../src/models/api-saver.js";
+import { ApiSaverClient, buildModelConfig, createChatModel } from "../src/models/api-saver.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
-  resetModelKeyRoutingCache();
 });
 
 describe("API Saver model configuration", () => {
@@ -55,36 +54,108 @@ describe("API Saver model configuration", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
-  it("rotates through configured supplier keys on retries", async () => {
+  // 回归：Key 曾经按重试次数轮换，一次网络抖动就会把请求换到另一个 Key，无权限时报 403
+  it("重试始终使用同一个 API Key", async () => {
     vi.useFakeTimers();
-    seedModelKeyRoutingCache("primary-key", ["gpt-test"], "https://example.test/v1");
-    seedModelKeyRoutingCache("backup-key", ["gpt-test"], "https://example.test/v1");
     const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
       .mockResolvedValueOnce(new Response("bad gateway", { status: 502 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         model: "gpt-test",
         choices: [{ message: { content: "OK" } }],
       }), { status: 200, headers: { "Content-Type": "application/json" } }));
 
-    const request = new ApiSaverClient({ apiKey: "primary-key", apiKeys: ["primary-key", "backup-key"], baseURL: "https://example.test/v1", defaultModel: "gpt-test" })
+    const request = new ApiSaverClient({ apiKey: "only-key", baseURL: "https://example.test/v1", defaultModel: "gpt-test" })
       .chat([{ role: "user", content: "测试" }]);
     await vi.runAllTimersAsync();
     await expect(request).resolves.toEqual({ content: "OK", model: "gpt-test" });
-    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: "Bearer primary-key" });
-    expect(fetchMock.mock.calls[1][1]?.headers).toMatchObject({ Authorization: "Bearer backup-key" });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    for (const call of fetchMock.mock.calls) {
+      expect(call[1]?.headers).toMatchObject({ Authorization: "Bearer only-key" });
+    }
   });
 
-  it("merges model lists returned by multiple configured keys", async () => {
+  it("403 直接报错，不隐藏在重试后面", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gpt-a" }, { id: "gpt-shared" }] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gpt-shared" }, { id: "gpt-b" }] }), { status: 200 }));
+      .mockResolvedValue(new Response(JSON.stringify({ error: { message: "no permission for model" } }), { status: 403 }));
 
-    const models = await new ApiSaverClient({ apiKey: "primary-key", apiKeys: ["backup-key"], baseURL: "https://invalid.example/v1" }).listModels();
+    await expect(new ApiSaverClient({ apiKey: "only-key", baseURL: "https://example.test/v1", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }]))
+      .rejects.toThrow("no permission for model");
+    // 鉴权失败不可重试，也没有其他 Key 可换
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 
-    expect(models).toEqual(["gpt-a", "gpt-shared", "gpt-b"]);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+  // 以下四条针对一个真实排查事故：空响应体的 403 被误报成“API Key 校验失败”，
+  // 把排查方向带偏了两轮。错误文案必须区分“上游真的说了什么”和“我们在猜”。
+  it("空响应体的 403 不断言 Key 无效，并报出请求体大小与网关嫌疑", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 403 }));
+
+    await expect(new ApiSaverClient({ apiKey: "only-key", baseURL: "https://example.test/v1", defaultModel: "gpt-test", apiMode: "anthropic" })
+      .chat([{ role: "user", content: "测试" }]))
+      .rejects.toThrow(/上游没有返回任何说明.*KB.*WAF/su);
+  });
+
+  it("401\u002f403 报错包含模型名和实际 endpoint", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("", { status: 401 }));
+
+    await expect(new ApiSaverClient({ apiKey: "only-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }]))
+      .rejects.toThrow("模型 gpt-test · https://relay.test/v1/chat/completions");
+  });
+
+  it("HTML 错误页不被丢弃，而是标明来自网关", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      "<html><head><title>403 Forbidden</title></head><body>nginx</body></html>",
+      { status: 403 },
+    ));
+
+    await expect(new ApiSaverClient({ apiKey: "only-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }]))
+      .rejects.toThrow(/网页错误页面（403 Forbidden）/u);
+  });
+
+  it("上下文超限归为超限，不再提示检查 Key", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { type: "request_too_large", message: "Request exceeds the maximum size" } }), { status: 413 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "prompt is too long: 213462 tokens > 200000 maximum" } }), { status: 400 }))
+      // 部分网关对过大请求体只回一个空响应体的 400
+      .mockResolvedValueOnce(new Response("", { status: 400 }));
+    const client = new ApiSaverClient({ apiKey: "only-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await expect(client.chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
+        .rejects.toThrow(/请求超出模型上下文或网关的大小限制/u);
+    }
+  });
+
+  it("频控不会被误判为上下文超限", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(JSON.stringify({ error: { message: "Rate limit reached: too many tokens" } }), { status: 429 }));
+
+    await expect(new ApiSaverClient({ apiKey: "only-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
+      .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
+      .rejects.toThrow(/请求过于频繁/u);
+  });
+
+  it("模型列表只用当前配置的那一个 Key", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gpt-a" }, { id: "gpt-b" }] }), { status: 200 }));
+
+    const models = await new ApiSaverClient({ apiKey: "only-key", baseURL: "https://invalid.example/v1" }).listModels();
+
+    expect(models).toEqual(["gpt-a", "gpt-b"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe("https://invalid.example/v1/models");
-    expect(fetchMock.mock.calls[1][0]).toBe("https://invalid.example/v1/models");
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({ Authorization: "Bearer only-key" });
+  });
+
+  it("模型列表失败时报出上游原因", async () => {
+    vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: { message: "invalid api key" } }), { status: 401 }));
+
+    await expect(new ApiSaverClient({ apiKey: "bad-key", baseURL: "https://invalid.example/v1" }).listModels())
+      .rejects.toThrow("invalid api key");
   });
 
   it("uses a custom OpenAI-compatible base URL for models and chat", async () => {
@@ -111,31 +182,6 @@ describe("API Saver model configuration", () => {
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { messages: Array<{ role: "user"; content: string }> };
     expect(countMessageTokens(body.messages, "gpt-4o")).toBeLessThanOrEqual(16 * 1024 - 16_000);
     expect(body.messages[0].content.length).toBeLessThan(600);
-  });
-  it("uses the API key that advertised the selected model", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "claude-fable-5" }] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gemini-3.7-flash" }] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ model: "gemini-3.7-flash", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
-    const client = new ApiSaverClient({ apiKey: "claude-key", apiKeys: ["gemini-key"], defaultModel: "gemini-3.7-flash" });
-
-    await client.listModels();
-    await expect(client.chat([{ role: "user", content: "测试" }])).resolves.toMatchObject({ content: "OK" });
-
-    expect(fetchMock.mock.calls[2][1]?.headers).toMatchObject({ Authorization: "Bearer gemini-key" });
-  });
-
-  it("discovers the matching key before the first model request after a restart", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "claude-fable-5" }] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: "gemini-3.7-flash" }] }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ model: "gemini-3.7-flash", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
-
-    await expect(new ApiSaverClient({
-      apiKey: "claude-key", apiKeys: ["gemini-key"], defaultModel: "gemini-3.7-flash", apiMode: "openai",
-    }).chat([{ role: "user", content: "测试" }])).resolves.toMatchObject({ content: "OK" });
-
-    expect(fetchMock.mock.calls[2][1]?.headers).toMatchObject({ Authorization: "Bearer gemini-key" });
   });
 
   it("always uses chat completions even when an obsolete Responses mode is stored", async () => {

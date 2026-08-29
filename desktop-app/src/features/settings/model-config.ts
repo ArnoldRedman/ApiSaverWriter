@@ -6,9 +6,8 @@ export interface AgentConfig {
   enabled: boolean;
   apiMode: ApiMode;
   baseURL: string;
+  /** 每个配置只有一个 Key；需要多个供应商就新建多个配置，在列表里切换 */
   apiKey: string;
-  apiKeys: string[];
-  modelKeyMap: Record<string, string[]>;
   model: string;
   enabledModels: string[];
   contextWindow: number;
@@ -67,17 +66,11 @@ export const reasoningModes: Array<{ value: ReasoningMode; hint: string }> = [
 export const fallbackModels = ['gpt-5.6-luna', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.4'];
 export const normalizeAgentConfig = (value: unknown): AgentConfig => {
   const parsed = value && typeof value === 'object' ? value as Partial<AgentConfig> & Record<string, unknown> : {};
-  const apiKeys = Array.from(new Set([
-    typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
-    ...(Array.isArray(parsed.apiKeys) ? parsed.apiKeys : []),
-  ].filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())));
-  const savedModelKeyMap = parsed.modelKeyMap && typeof parsed.modelKeyMap === 'object' ? parsed.modelKeyMap as Record<string, unknown> : {};
-  const modelKeyMap = Object.fromEntries(Object.entries(savedModelKeyMap).flatMap(([model, values]) => {
-    const mappedKeys = Array.isArray(values)
-      ? values.filter((key): key is string => typeof key === 'string' && apiKeys.includes(key))
-      : [];
-    return mappedKeys.length ? [[model, Array.from(new Set(mappedKeys))]] : [];
-  }));
+  // 旧版本存过 apiKeys 数组；只保留第一个，多 Key 轮换曾导致重试换 Key 报 403
+  const legacyKeys = Array.isArray((parsed as Record<string, unknown>).apiKeys)
+    ? ((parsed as Record<string, unknown>).apiKeys as unknown[]).filter((key): key is string => typeof key === 'string' && Boolean(key.trim())).map(key => key.trim())
+    : [];
+  const apiKey = typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : legacyKeys[0] || '';
   const apiMode: ApiMode = parsed.apiMode === 'anthropic' ? 'anthropic' : 'openai';
   const model = typeof parsed.model === 'string' && parsed.model.trim() ? parsed.model.trim() : fallbackModels[0];
   const enabledModels = Array.from(new Set([
@@ -92,9 +85,7 @@ export const normalizeAgentConfig = (value: unknown): AgentConfig => {
     enabled: parsed.enabled !== false,
     apiMode,
     baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURLFor(apiMode), apiMode) || defaultBaseURLFor(apiMode),
-    apiKey: typeof parsed.apiKey === 'string' && parsed.apiKey.trim() ? parsed.apiKey.trim() : apiKeys[0] || '',
-    apiKeys,
-    modelKeyMap,
+    apiKey,
     model,
     enabledModels,
     contextWindow: clampContextWindow(storedWindow > maxContextWindowKTokens * 2 ? storedWindow / 1024 : storedWindow),
@@ -171,12 +162,3 @@ export const agentNetworkParams = (config: AgentConfig) => ({
   proxyURL: config.proxyURL.trim(),
   proxyBypassLocal: config.proxyBypassLocal,
 });
-export const orderApiKeysForModel = (config: Pick<AgentConfig, 'apiKey' | 'apiKeys' | 'modelKeyMap'>, model: string) => {
-  const all = Array.from(new Set([config.apiKey, ...(config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-  const preferred = (config.modelKeyMap?.[model] || []).filter(key => all.includes(key));
-  return Array.from(new Set([...preferred, ...all]));
-};
-export const applyModelKeyRouting = <T extends AgentConfig>(config: T, model: string): T => {
-  const keys = orderApiKeysForModel(config, model);
-  return { ...config, model, apiKey: keys[0] || '', apiKeys: keys };
-};

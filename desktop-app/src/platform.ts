@@ -16,9 +16,6 @@ const mobileRuntime = () => '__TAURI_INTERNALS__' in window && /Android|iPhone|i
 const directBaiduRuntime = () => '__TAURI_INTERNALS__' in window;
 
 let httpFetchPromise: Promise<typeof globalThis.fetch> | null = null;
-// `/v1/models` is scoped to one API Key. Keep the association on mobile too,
-// otherwise a merged model list can route Gemini through a Claude-only key.
-const mobileModelsByApiKey = new Map<string, Set<string>>();
 const httpFetch = async (): Promise<typeof globalThis.fetch> => {
   if (!httpFetchPromise) {
     httpFetchPromise = import('@tauri-apps/plugin-http')
@@ -29,7 +26,6 @@ const httpFetch = async (): Promise<typeof globalThis.fetch> => {
 };
 
 const stringValue = (value: unknown, fallback = '') => typeof value === 'string' ? value : fallback;
-const arrayStrings = (value: unknown) => Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 const memoryList = (value: unknown, limit = 40): string[] => {
   if (typeof value === 'string') return value.split(/\r?\n|[；;、]/u).map(item => item.trim()).filter(Boolean).slice(0, limit);
   if (!Array.isArray(value)) return [];
@@ -378,12 +374,9 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   // option upstream. The prompt still asks for JSON, so parsing remains safe.
   const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
   const base = baseURL(params.baseURL, apiMode);
-  const configuredKeys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-  const knownModelKeys = configuredKeys.filter(key => mobileModelsByApiKey.get(`${base}\n${key}`)?.has(model));
-  const allKeysKnown = configuredKeys.length > 0 && configuredKeys.every(key => mobileModelsByApiKey.has(`${base}\n${key}`));
-  if (!knownModelKeys.length && allKeysKnown) throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请重新拉取模型并选择该模型对应的 API Key。`);
-  const keys = knownModelKeys.length ? knownModelKeys : configuredKeys;
-  if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+  // 每个配置只有一个 Key；权限以实际调用结果为准，不再靠模型目录猜
+  const apiKey = stringValue(params.apiKey).trim();
+  if (!apiKey) throw new Error('请先在设置中填写 API Key。');
   const endpoint = chatEndpoint(base, apiMode);
   const reasoningMode = stringValue(params.reasoningMode, 'auto');
   const thinkingBudget = apiMode === 'anthropic' ? anthropicThinkingBudget[reasoningMode] : undefined;
@@ -399,7 +392,7 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
     const countEndpoint = `${base}/v1/messages/count_tokens`;
     try {
       const { system, turns } = toAnthropicMessages(contextMessages);
-      const countResponse = await fetcher(countEndpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(keys[0], apiMode) }, body: JSON.stringify({ model, system: system || undefined, messages: turns }) });
+      const countResponse = await fetcher(countEndpoint, { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders(apiKey, apiMode) }, body: JSON.stringify({ model, system: system || undefined, messages: turns }) });
       if (countResponse.ok) {
         const actual = Number(((await countResponse.json()) as Record<string, unknown>).input_tokens) || 0;
         const budget = contextTokens - maxTokens;
@@ -427,22 +420,23 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
       ...(jsonMode && supportsJsonMode ? { response_format: { type: 'json_object' } } : {}),
       ...(openAIReasoningEffort[reasoningMode] ? { reasoning_effort: openAIReasoningEffort[reasoningMode] } : {}),
     };
-  let response: Response | null = null;
-  let lastError = '';
-  for (const key of keys) {
-    const candidate = await fetcher(endpoint, { method: 'POST', headers: { ...headers, ...authHeaders(key, apiMode) }, body: JSON.stringify(body) });
-    if (candidate.ok) {
-      response = candidate;
-      break;
+  const requestBody = JSON.stringify(body);
+  const response = await fetcher(endpoint, { method: 'POST', headers: { ...headers, ...authHeaders(apiKey, apiMode) }, body: requestBody });
+  if (!response.ok) {
+    const raw = await response.text();
+    // 与桌面端保持一致：空响应体的 4xx 多来自网关或 WAF，不断言 Key 无效
+    const detail = raw.trim().replace(/\s+/gu, ' ').slice(0, 400);
+    const sizeHint = `，本次请求体 ${(requestBody.length / 1024).toFixed(1)} KB`;
+    const modeName = apiMode === 'anthropic' ? 'Anthropic Messages' : 'OpenAI 兼容';
+    if (isQuotaExceeded(detail)) throw new Error('API 中转服务额度已用尽。章节正文已保存，本章记忆将在额度恢复后再更新。');
+    if (response.status === 413 || (response.status === 400 && !detail) || /prompt is too long|request_too_large|exceeds the context window|maximum context length/iu.test(detail)) {
+      throw new Error(`请求超出模型上下文或网关的大小限制（${response.status}），模型 ${model} · ${endpoint}${sizeHint}。请降低思考强度、缩小上下文窗口，或减少本次带入的章节与资料。${detail}`.trim());
     }
-    const detail = (await candidate.text()).replace(/\s+/gu, ' ').slice(0, 220);
-    lastError = isQuotaExceeded(detail)
-      ? 'API 中转服务额度已用尽。章节正文已保存，本章记忆将在额度恢复后再更新。'
-      : `模型接口返回 ${candidate.status}（${apiMode === 'anthropic' ? 'Anthropic Messages' : 'OpenAI 兼容'} · ${endpoint}）：${detail}`;
-    // A key may be out of quota or lack this model while another configured
-    // key remains usable. Continue through the configured key pool.
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`模型接口拒绝了请求（${response.status}），模型 ${model} · ${endpoint}（${modeName}）。${detail || `上游没有返回任何说明${sizeHint}。常见原因是反向代理、CDN 或 WAF 拦截，也可能是该 Key 无权访问此模型或此地址`}`);
+    }
+    throw new Error(`模型接口返回 ${response.status}（${modeName} · ${endpoint}）：${detail || '上游没有返回任何说明'}`);
   }
-  if (!response) throw new Error(lastError || '所有 API Key 请求均失败。');
   if (apiMode === 'anthropic') return mobileAnthropicResult(response, endpoint, onChunk);
   if (!onChunk || !response.body) {
     const data = await response.json() as Record<string, unknown>;
@@ -647,8 +641,9 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     return { sources: [{ id: 'fanqie', name: '番茄小说' }, ...mobileQianyueSources.map(source => ({ id: source.id, name: source.name }))], defaultSourceId: mobileQianyueSources[0]?.id || 'fanqie' } as T;
   }
   if (method === 'gateway.usage') {
-    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-    if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+    const apiKey = stringValue(params.apiKey).trim();
+    if (!apiKey) throw new Error('请先在设置中填写 API Key。');
+    const keys = [apiKey];
     const root = baseURL(params.baseURL).replace(/\/v1\/?$/u, '');
     const getJSON = async (path: string, key?: string): Promise<Record<string, unknown>> => {
       const response = await fetcher(`${root}${path}`, { headers: { Accept: 'application/json', ...(key ? { Authorization: `Bearer ${key}` } : {}) } });
@@ -687,24 +682,16 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     } as T;
   }
   if (method === 'models.list') {
-    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-    if (!keys.length) throw new Error('请先在设置中填写 API Key。');
+    const apiKey = stringValue(params.apiKey).trim();
+    if (!apiKey) throw new Error('请先在设置中填写 API Key。');
     const mode = normalizeWireMode(params.apiMode);
     const base = baseURL(params.baseURL, mode);
     const endpoint = modelsEndpoint(base, mode);
-    const responses = await Promise.allSettled(keys.map(async key => {
-      const response = await fetcher(endpoint, { headers: { ...authHeaders(key, mode), Accept: 'application/json' } });
-      if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）：${(await response.text()).replace(/\s+/gu, ' ').slice(0, 160)}`);
-      const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
-      const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
-      mobileModelsByApiKey.set(`${base}\n${key}`, new Set(models));
-      return models;
-    }));
-    const models = Array.from(new Set(responses.flatMap(result => result.status === 'fulfilled' ? result.value : [])));
-    if (!models.length) {
-      const reasons = responses.flatMap(result => result.status === 'rejected' ? [String(result.reason)] : []);
-      throw new Error(reasons.length ? `所有 API Key 拉取模型失败：${reasons.join('；')}` : `${endpoint} 没有返回可用模型`);
-    }
+    const response = await fetcher(endpoint, { headers: { ...authHeaders(apiKey, mode), Accept: 'application/json' } });
+    if (!response.ok) throw new Error(`模型列表请求失败（${response.status}）：${(await response.text()).replace(/\s+/gu, ' ').slice(0, 160)}`);
+    const data = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
+    const models = (data.data || data.models || []).map(item => typeof item === 'string' ? item : item.id || '').filter(Boolean);
+    if (!models.length) throw new Error(`${endpoint} 没有返回可用模型`);
     return { models } as T;
   }
   if (method === 'settings.diagnose') {
@@ -720,11 +707,11 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
     const models = modelsEndpoint(base, mode);
     const modeName = mode === 'anthropic' ? 'Anthropic Messages' : 'OpenAI 兼容';
     checks.push({ id: 'address', label: '接口地址', status: 'pass', detail: `${modeName} · ${chat}` });
-    const keys = Array.from(new Set([stringValue(params.apiKey), ...arrayStrings(params.apiKeys)].map(key => key.trim()).filter(Boolean)));
-    checks.push(keys.length
-      ? { id: 'keys', label: 'API 密钥', status: 'pass', detail: `已配置 ${keys.length} 个 Key，认证方式 ${mode === 'anthropic' ? 'x-api-key' : 'Authorization: Bearer'}` }
-      : { id: 'keys', label: 'API 密钥', status: 'fail', detail: '没有配置任何 API Key' });
-    if (!keys.length) return { mode, modelsEndpoint: models, chatEndpoint: chat, checks } as T;
+    const apiKey = stringValue(params.apiKey).trim();
+    checks.push(apiKey
+      ? { id: 'keys', label: 'API 密钥', status: 'pass', detail: `认证方式 ${mode === 'anthropic' ? 'x-api-key' : 'Authorization: Bearer'}` }
+      : { id: 'keys', label: 'API 密钥', status: 'fail', detail: '没有配置 API Key' });
+    if (!apiKey) return { mode, modelsEndpoint: models, chatEndpoint: chat, checks } as T;
     let available: string[] = [];
     try {
       const listed = await mobileAgentRpc<{ models?: string[] }>('models.list', params);
@@ -739,7 +726,8 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
         ? { id: 'model', label: '当前模型', status: 'warn', detail: `无法核对 ${target}：模型列表不可用` }
         : available.includes(target)
           ? { id: 'model', label: '当前模型', status: 'pass', detail: `${target} 在接口返回的模型列表中` }
-          : { id: 'model', label: '当前模型', status: 'fail', detail: `接口没有提供 ${target}。可用模型示例：${available.slice(0, 6).join('、')}${available.length > 6 ? ' 等' : ''}` });
+          // 不少中转站的模型目录与实际可调用范围不一致，所以只提醒而不当成失败
+          : { id: 'model', label: '当前模型', status: 'warn', detail: `模型目录里没有 ${target}，但部分中转站目录不全；以下方“实际调用”结果为准。可用模型示例：${available.slice(0, 6).join('、')}${available.length > 6 ? ' 等' : ''}` });
     }
     try {
       await mobileChat(params, [{ role: 'user', content: '请只回复 OK' }]);

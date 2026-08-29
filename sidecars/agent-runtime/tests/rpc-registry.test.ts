@@ -23,7 +23,7 @@ describe("RPC registry", () => {
     const registry = new RpcRegistry(legacy);
     const badMode = await registry.dispatch({ id: 1, method: "chapter.write", params: { apiMode: "grpc" } });
     expect(badMode.error?.code).toBe(-32602);
-    const badKeys = await registry.dispatch({ id: 2, method: "chapter.write", params: { apiKeys: "not-an-array" } });
+    const badKeys = await registry.dispatch({ id: 2, method: "chapter.write", params: { apiKey: 42 } });
     expect(badKeys.error?.code).toBe(-32602);
     expect(legacy).not.toHaveBeenCalled();
   });

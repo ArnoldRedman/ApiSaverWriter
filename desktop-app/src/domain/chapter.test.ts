@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { removeChapterFromProject } from './chapter.ts';
-import type { Project } from './project.ts';
+import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit } from './chapter.ts';
+import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions } from './export.ts';
+import type { Chapter, Project } from './project.ts';
 
 const now = '2026-01-01T00:00:00.000Z';
 
@@ -9,6 +10,7 @@ const project = {
   id: 1,
   title: '城南夜雨',
   genre: '悬疑',
+  synopsis: '一场雨引出的旧案。',
   status: 'writing',
   chapters: [
     { id: 10, title: '第一章', content: '入城。', wordCount: 3, createdAt: now, updatedAt: now },
@@ -52,6 +54,8 @@ const project = {
   wordCount: 6,
 } as unknown as Project;
 
+const countWords = (content: string) => content.replace(/\s/gu, '').length;
+
 test('删除章节会级联清理记忆、图谱、状态历史和检测报告', () => {
   const next = removeChapterFromProject(project, 20);
 
@@ -69,4 +73,94 @@ test('删除章节会级联清理记忆、图谱、状态历史和检测报告',
 
 test('删除不存在的章节时原样返回，不产生空写入', () => {
   assert.equal(removeChapterFromProject(project, 999), project);
+});
+
+test('删除的章节进回收站，可以恢复到原位置', () => {
+  const deleted = removeChapterFromProject(project, 10);
+  assert.deepEqual(deleted.deletedChapters?.map(entry => entry.chapter.id), [10]);
+
+  const { project: restored, chapter } = restoreDeletedChapter(deleted, 10);
+  assert.equal(chapter?.id, 10);
+  // 原下标 0，恢复后仍在最前
+  assert.deepEqual(restored.chapters.map(item => item.id), [10, 20]);
+  assert.equal(restored.deletedChapters?.length, 0);
+  assert.equal(restored.wordCount, 6);
+});
+
+test('快照上限固定，最新的在前', () => {
+  let chapter = project.chapters[0];
+  for (const reason of ['第一次', '第二次', '第三次', '第四次']) {
+    chapter = { ...pushChapterSnapshot(chapter, reason), content: `${chapter.content}+`, wordCount: chapter.wordCount + 1 };
+  }
+  assert.equal(chapter.snapshots?.length, chapterSnapshotLimit);
+  assert.deepEqual(chapter.snapshots?.map(snapshot => snapshot.reason), ['第四次', '第三次', '第二次']);
+});
+
+test('空正文不产生快照', () => {
+  const empty: Chapter = { id: 1, title: '新章节', content: '   ', wordCount: 0, createdAt: now, updatedAt: now };
+  assert.equal(pushChapterSnapshot(empty, 'AI 润色').snapshots, undefined);
+});
+
+test('回滚会把当前正文存为新快照，因此可以再回滚', () => {
+  const original = project.chapters[0];
+  const overwritten = { ...pushChapterSnapshot(original, 'AI 润色'), content: 'AI 改写后的内容。', wordCount: 8 };
+  const savedAt = overwritten.snapshots![0].savedAt;
+
+  const rolledBack = restoreChapterSnapshot(overwritten, savedAt, countWords);
+  assert.equal(rolledBack.content, original.content);
+  assert.equal(rolledBack.wordCount, countWords(original.content));
+  // 被取用的那条移出栈，AI 版本入栈，回滚可逆
+  assert.deepEqual(rolledBack.snapshots?.map(snapshot => snapshot.content), ['AI 改写后的内容。']);
+});
+
+test('回滚不存在的快照时原样返回', () => {
+  assert.equal(restoreChapterSnapshot(project.chapters[0], '不存在', countWords), project.chapters[0]);
+});
+
+test('章节上移下移与越界保护', () => {
+  assert.deepEqual(moveChapterInProject(project, 20, -1).chapters.map(chapter => chapter.id), [20, 10]);
+  assert.equal(moveChapterInProject(project, 10, -1), project);
+  assert.equal(moveChapterInProject(project, 20, 1), project);
+});
+
+test('拖拽排序把章节移动到目标下标', () => {
+  assert.deepEqual(reorderChapterInProject(project, 20, 0).chapters.map(chapter => chapter.id), [20, 10]);
+  assert.equal(reorderChapterInProject(project, 20, 1), project);
+});
+
+test('可以在中间插入新章节', () => {
+  const { project: next, chapter } = insertChapterAfter(project, 10, '插入章');
+  assert.deepEqual(next.chapters.map(item => item.title), ['第一章', '插入章', '第二章']);
+  assert.equal(chapter.content, '');
+
+  const { project: first } = insertChapterAfter(project, null, '楔子');
+  assert.equal(first.chapters[0].title, '楔子');
+});
+
+test('全书导出包含每一章正文，并按当前顺序排列', () => {
+  const text = buildProjectExport(project, defaultExportOptions);
+  assert.match(text, /城南夜雨/u);
+  assert.match(text, /一场雨引出的旧案。/u);
+  assert.ok(text.indexOf('入城。') < text.indexOf('夜雨。'));
+  // 默认不带大纲和卡片
+  assert.doesNotMatch(text, /全书主线。/u);
+  assert.doesNotMatch(text, /谨慎。/u);
+});
+
+test('导出可以附带大纲与卡片，Markdown 用标题层级', () => {
+  const text = buildProjectExport(project, { format: 'md', includeOutlines: true, includeCards: true });
+  assert.match(text, /^# 城南夜雨/u);
+  assert.match(text, /### 总纲｜总纲/u);
+  assert.match(text, /### 角色卡｜林舟/u);
+});
+
+test('单章导出只含该章，文件名去掉非法字符', () => {
+  const text = buildChapterExport(project, 20, 'txt');
+  assert.match(text, /夜雨。/u);
+  assert.doesNotMatch(text, /入城。/u);
+  assert.equal(buildChapterExport(project, 999, 'txt'), '');
+
+  const risky = { ...project, title: '城南/夜雨:一' } as Project;
+  assert.equal(exportFileName(risky, defaultExportOptions), '城南_夜雨_一.txt');
+  assert.equal(exportFileName(project, { ...defaultExportOptions, format: 'md' }), '城南夜雨.md');
 });
