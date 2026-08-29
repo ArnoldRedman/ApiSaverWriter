@@ -18,7 +18,6 @@ export const createModelClient = (params: Record<string, unknown>, defaults: { m
   }
   return new ApiSaverClient({
     apiKey,
-    apiKeys: stringList(params.apiKeys, 12),
     baseURL: String(params.baseURL || "https://api.apisaver.com/v1"),
     defaultModel: model,
     apiMode: normalizeWireMode(params.apiMode),

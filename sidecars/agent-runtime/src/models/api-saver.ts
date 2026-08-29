@@ -97,21 +97,82 @@ function supportsOpenAIReasoning(model: string): boolean {
   return /^(?:gpt-|o\d|chatgpt-)/iu.test(model.trim());
 }
 
-/** Relays report the actionable part of a failure inside a JSON envelope.
- * Surfacing it verbatim is the difference between "请求失败（400）" and
- * "model not found", which is what the user actually needs to fix. */
-function upstreamErrorText(detail: string): string {
+const MAX_ERROR_BODY_CHARS = 800;
+
+type ErrorBodyKind = "json" | "html" | "text" | "empty";
+
+interface ErrorBody {
+  kind: ErrorBodyKind;
+  /** 可直接展示给作者的说明；JSON 取 message 字段，其余为截断后的原文 */
+  text: string;
+  bytes: number;
+}
+
+const truncateBody = (value: string, limit: number) =>
+  value.length <= limit ? value : `${value.slice(0, limit)}…（其余 ${value.length - limit} 字符已省略）`;
+
+/**
+ * 归一化上游错误响应体
+ * 中转站、CDN 和 WAF 的失败响应不一定是 JSON：只解析 JSON 会把 HTML 错误页和空
+ * 响应体一起丢掉，最后只剩一个光秃秃的状态码，反而把排查方向带偏
+ */
+function describeErrorBody(detail: string): ErrorBody {
+  const bytes = Buffer.byteLength(detail, "utf8");
   const trimmed = detail.trim();
-  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return "";
-  try {
-    const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-    const error = parsed.error && typeof parsed.error === "object" ? parsed.error as Record<string, unknown> : parsed;
-    const message = [error.message, error.detail, parsed.message, error.type]
-      .find(value => typeof value === "string" && value.trim());
-    return typeof message === "string" ? message.trim().replace(/\s+/g, " ").slice(0, 240) : "";
-  } catch {
-    return "";
+  if (!trimmed) return { kind: "empty", text: "", bytes };
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+      const error = parsed.error && typeof parsed.error === "object" ? parsed.error as Record<string, unknown> : parsed;
+      const message = [error.message, error.detail, parsed.message, error.type]
+        .find(value => typeof value === "string" && value.trim());
+      // JSON 结构正常但没有可读字段时，原样回传压缩后的 JSON，不要退化成空
+      const text = typeof message === "string" ? message.trim() : trimmed;
+      return { kind: "json", text: truncateBody(text.replace(/\s+/gu, " "), MAX_ERROR_BODY_CHARS), bytes };
+    } catch {
+      // JSON 解析失败就当纯文本处理，不丢弃内容
+    }
   }
+  if (/^<(?:!doctype|html|head|body)/iu.test(trimmed)) {
+    const title = /<title[^>]*>([^<]{1,200})<\/title>/iu.exec(trimmed)?.[1]?.trim();
+    return {
+      kind: "html",
+      text: title
+        ? `上游返回了网页错误页面（${title}），通常来自反向代理、CDN 或 WAF，而不是模型接口`
+        : "上游返回了网页错误页面，通常来自反向代理、CDN 或 WAF，而不是模型接口",
+      bytes,
+    };
+  }
+  return { kind: "text", text: truncateBody(trimmed.replace(/\s+/gu, " "), MAX_ERROR_BODY_CHARS), bytes };
+}
+
+/**
+ * 上下文或请求体超限
+ * 这类失败必须与鉴权失败分开：提示“检查 Key”对超限毫无帮助。
+ * 部分网关对超大请求体只回一个空响应体的 413/400，所以空 body 的这两个状态码也按超限处理。
+ */
+const CONTEXT_OVERFLOW_PATTERNS = [
+  /prompt is too long/iu,                                     // Anthropic token 超限
+  /request_too_large/iu,                                      // Anthropic 请求体超限（413）
+  /exceeds the context window/iu,                             // OpenAI
+  /exceeds (?:the )?(?:model'?s )?maximum context length/iu,  // OpenAI 兼容中转
+  /input token count.*exceeds the maximum/iu,                 // Gemini
+  /maximum prompt length is \d+/iu,                           // xAI
+  /reduce the length of the messages/iu,                      // Groq
+  /context[_ ]length[_ ]exceeded/iu,
+  /too many tokens/iu,
+  /token limit exceeded/iu,
+  /payload too large|request entity too large|body exceeded/iu, // Nginx / 网关
+  /上下文长度|超出.{0,6}上下文|输入过长|请求体过大/u,
+];
+// 频控文案里的 “too many tokens” 不是超限，先排除
+const NON_OVERFLOW_PATTERN = /rate.?limit|too many requests|请求过于频繁/iu;
+
+function isContextOverflow(status: number, body: ErrorBody): boolean {
+  if (NON_OVERFLOW_PATTERN.test(body.text)) return false;
+  if (status === 413) return true;
+  if (status === 400 && body.kind === "empty") return true;
+  return CONTEXT_OVERFLOW_PATTERNS.some(pattern => pattern.test(body.text));
 }
 
 function protocolHint(status: number, mode: ApiWireMode): string {
@@ -120,31 +181,65 @@ function protocolHint(status: number, mode: ApiWireMode): string {
       ? "。当前为 Anthropic Messages 模式，请确认接口地址支持 /v1/messages；若这是 OpenAI 兼容中转站，请把 API 格式切换回 OpenAI"
       : "。当前为 OpenAI 兼容模式，请确认接口地址支持 /v1/chat/completions；若这是 Anthropic 官方或 Claude 专用地址，请把 API 格式切换为 Anthropic Messages";
   }
+  // 只陈述实际发送方式，不替上游断言 Key 无效
   if (status === 401 || status === 403) {
     return mode === "anthropic"
-      ? "。Anthropic Messages 模式使用 x-api-key 认证，请确认该 Key 支持此地址"
-      : "。OpenAI 兼容模式使用 Authorization: Bearer 认证，请确认该 Key 支持此地址";
+      ? "。当前以 Anthropic Messages 模式发送，使用 x-api-key 认证"
+      : "。当前以 OpenAI 兼容模式发送，使用 Authorization: Bearer 认证";
   }
   return "";
 }
 
-function apiErrorMessage(status: number, detail: string, statusText: string, attempts: number, routeHint = "", requestHint = "", mode: ApiWireMode = "openai"): string {
+interface ApiErrorContext {
+  status: number;
+  detail: string;
+  statusText: string;
+  attempts?: number;
+  routeHint?: string;
+  requestHint?: string;
+  mode?: ApiWireMode;
+  /** 请求体字节数，用于判断是否触发了网关的大小限制 */
+  requestBytes?: number;
+}
+
+/**
+ * 上游已经明确给出 HTTP 状态的失败
+ * 不能用错误文案前缀区分“致命”和“网络抖动”：文案一改就会错分类，把已读过
+ * 响应体的请求拉回重试，反而报成 “Body is unusable”。用类型携带这个事实。
+ */
+class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
+function apiErrorMessage(context: ApiErrorContext): string {
+  const { status, detail, statusText, attempts = 1, routeHint = "", requestHint = "", mode = "openai", requestBytes } = context;
   const retrySuffix = attempts > 1 ? `，已自动重试 ${attempts - 1} 次` : "";
-  const upstream = upstreamErrorText(detail);
+  const body = describeErrorBody(detail);
+  const sizeHint = requestBytes ? `，本次请求体 ${(requestBytes / 1024).toFixed(1)} KB` : "";
+  const upstream = body.text ? `上游说明：${body.text}` : "";
+
   if (isQuotaExceeded(detail)) {
     return `API 中转服务额度已用尽${routeHint}。章节正文已保存，本章记忆将在额度恢复后再更新。`;
   }
-  if ([502, 503, 504, 524].includes(status)) {
-    const compact = upstream || (detail.trim().startsWith("<") ? "" : detail.trim().replace(/\s+/g, " ").slice(0, 180));
-    return `API 中转服务当前返回 ${status}（可能来自代理或 API 上游网关）${requestHint}${routeHint}${retrySuffix}${compact ? `：${compact}` : ""}`;
+  if (isContextOverflow(status, body)) {
+    return `请求超出模型上下文或网关的大小限制（${status}）${requestHint}${routeHint}${sizeHint}。请降低思考强度、缩小上下文窗口，或减少本次带入的章节与资料。${upstream}`.trim();
   }
-  if (status === 429) return `API 中转服务请求过于频繁${routeHint}${retrySuffix}，请稍后再试。${upstream ? `上游说明：${upstream}` : ""}`.trim();
-  if (status === 401 || status === 403) return `API Key 或模型权限校验失败（${status}）${routeHint}${protocolHint(status, mode)}${upstream ? `。上游说明：${upstream}` : "，请在设置中检查配置。"}`;
-
-  const compact = upstream || (detail.trim().startsWith("<")
-    ? "服务返回了网页错误页面"
-    : detail.trim().replace(/\s+/g, " ").slice(0, 240));
-  return `API Saver 请求失败（${status}）${routeHint}${requestHint}${protocolHint(status, mode)}：${compact || statusText || "未知错误"}`;
+  if ([502, 503, 504, 524].includes(status)) {
+    return `API 中转服务当前返回 ${status}（可能来自代理或 API 上游网关）${requestHint}${routeHint}${retrySuffix}${body.text ? `：${body.text}` : ""}`;
+  }
+  if (status === 429) return `API 中转服务请求过于频繁${routeHint}${retrySuffix}，请稍后再试。${upstream}`.trim();
+  if (status === 401 || status === 403) {
+    // 只有上游真的给出说明时才指向 Key；空响应体的 403 多来自网关或 WAF，
+    // 断言“Key 无效”会把排查方向带偏
+    const cause = body.kind === "empty"
+      ? `上游没有返回任何说明${sizeHint}。常见原因是反向代理、CDN 或 WAF 拦截（例如请求体过大或命中规则），也可能是该 Key 无权访问此模型或此地址`
+      : upstream;
+    return `模型接口拒绝了请求（${status}）${requestHint}${routeHint}${protocolHint(status, mode)}。${cause}`;
+  }
+  return `API Saver 请求失败（${status}）${routeHint}${requestHint}${protocolHint(status, mode)}${sizeHint}：${body.text || statusText || "未知错误"}`;
 }
 
 export function buildModelConfig(input: ApiSaverModelInput): ApiSaverModelConfig {
@@ -184,7 +279,6 @@ export function createChatModel(config: ApiSaverModelConfig): BaseChatModel {
 // Simple client for direct API calls
 export interface ApiSaverClientConfig {
   apiKey: string;
-  apiKeys?: string[];
   baseURL?: string;
   defaultModel?: string;
   apiMode?: ApiWireMode | "responses";
@@ -317,7 +411,12 @@ function extractText(value: unknown): string {
   return "";
 }
 
-function emptyCompletionError(data: Record<string, unknown>, maxTokens: number): Error {
+/**
+ * 响应本身合法但没有可用正文
+ * 这类失败是确定性的，重试只会重复消耗额度；用 ApiRequestError 标记为不重试，
+ * 否则会被当成网络抖动，最后包成误导的“无法连接 API 中转服务”。
+ */
+function emptyCompletionError(data: Record<string, unknown>, maxTokens: number): ApiRequestError {
   const choice = Array.isArray(data.choices) && data.choices[0] && typeof data.choices[0] === "object"
     ? data.choices[0] as Record<string, unknown>
     : undefined;
@@ -326,54 +425,36 @@ function emptyCompletionError(data: Record<string, unknown>, maxTokens: number):
     : undefined;
   const finishReason = typeof choice?.finish_reason === "string" ? choice.finish_reason : "";
   if (finishReason === "length") {
-    return new Error(`API Saver 模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限`);
+    return new ApiRequestError(`模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限`, 200);
   }
   const reasoningLength = [message?.reasoning_content, message?.reasoning]
     .find(value => typeof value === "string");
   if (typeof reasoningLength === "string" && reasoningLength.length > 0) {
-    return new Error("API Saver 只返回了推理内容，没有正文；请关闭推理模式或提高输出上限");
+    return new ApiRequestError("模型只返回了推理内容，没有正文；请关闭推理模式或提高输出上限", 200);
   }
   const topKeys = Object.keys(data).slice(0, 12).join(",");
   const choiceKeys = choice ? Object.keys(choice).slice(0, 12).join(",") : "";
-  return new Error(`API Saver 返回内容为空（响应字段：${topKeys || "无"}；choice：${choiceKeys || "无"}）`);
+  return new ApiRequestError(`模型返回内容为空（响应字段：${topKeys || "无"}；choice：${choiceKeys || "无"}）`, 200);
 }
 
 /** Only `text` blocks are prose. `thinking` and `tool_use` blocks share the
  * array and must not leak into a chapter. */
-function emptyAnthropicError(data: Record<string, unknown>, maxTokens: number): Error {
+function emptyAnthropicError(data: Record<string, unknown>, maxTokens: number): ApiRequestError {
   const stopReason = typeof data.stop_reason === "string" ? data.stop_reason : "";
   if (stopReason === "max_tokens") {
-    return new Error(`API Saver 模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限`);
+    return new ApiRequestError(`模型输出被截断（max_tokens=${maxTokens}），请重试或提高输出上限`, 200);
   }
   const blocks = Array.isArray(data.content) ? data.content : [];
   const kinds = blocks
     .filter((block): block is Record<string, unknown> => Boolean(block && typeof block === "object"))
     .map(block => String(block.type ?? "unknown"));
   if (kinds.length && !kinds.includes("text")) {
-    return new Error(`Anthropic 接口只返回了 ${kinds.join("/")} 块，没有正文；请降低思考强度或提高输出上限`);
+    return new ApiRequestError(`Anthropic 接口只返回了 ${kinds.join("/")} 块，没有正文；请降低思考强度或提高输出上限`, 200);
   }
-  return new Error(`Anthropic 接口返回内容为空（stop_reason：${stopReason || "无"}；响应字段：${Object.keys(data).slice(0, 12).join(",") || "无"}）`);
+  return new ApiRequestError(`Anthropic 接口返回内容为空（stop_reason：${stopReason || "无"}；响应字段：${Object.keys(data).slice(0, 12).join(",") || "无"}）`, 200);
 }
 
 const proxyAgents = new Map<string, ProxyAgent>();
-// API keys can belong to different relay groups. `/v1/models` is scoped to
-// the authenticated key, so retain this association instead of flattening all
-// models into one list and accidentally sending a Gemini model through a
-// Claude-only key.
-const modelsByApiKey = new Map<string, Set<string>>();
-const modelLookupInFlight = new Map<string, Promise<Set<string> | undefined>>();
-
-export function resetModelKeyRoutingCache(): void {
-  modelsByApiKey.clear();
-  modelLookupInFlight.clear();
-}
-
-export function seedModelKeyRoutingCache(key: string, models: string[], baseURL = DEFAULT_API_BASE_URL, apiMode: ApiWireMode | "responses" = "openai"): void {
-  const endpoint = normalizeWireMode(apiMode) === "anthropic"
-    ? `${normalizeAnthropicRoot(baseURL)}/v1/models`
-    : `${normalizeOpenAIBaseURL(baseURL)}/models`;
-  modelsByApiKey.set(`${endpoint}\n${key}`, new Set(models));
-}
 
 const isPrivateOrLocalHost = (hostname: string) => {
   const host = hostname.toLowerCase();
@@ -484,76 +565,23 @@ export class ApiSaverClient {
     return { mode: this.wireMode, ...this.endpoints() };
   }
 
-  private async modelsForKey(key: string): Promise<Set<string> | undefined> {
-    const endpoint = this.endpoints().models;
-    const cacheKey = `${endpoint}\n${key}`;
-    const cached = modelsByApiKey.get(cacheKey);
-    if (cached) return cached;
-    const inflight = modelLookupInFlight.get(cacheKey);
-    if (inflight) return inflight;
-    const lookup = (async () => {
-      try {
-        const dispatcher = proxyDispatcherFor(endpoint, this.config);
-        const response = await fetchWithTimeout(endpoint, {
-          headers: { ...this.authHeaders(key), Accept: "application/json" },
-          ...(dispatcher ? { dispatcher } : {}),
-        } as RequestInit, 20_000);
-        if (!response.ok) return undefined;
-        const payload = await response.json() as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
-        const models = new Set((payload.data ?? payload.models ?? [])
-          .map(item => typeof item === "string" ? item : item.id)
-          .filter((model): model is string => Boolean(model)));
-        modelsByApiKey.set(cacheKey, models);
-        return models;
-      } catch {
-        // Do not turn a temporary models endpoint failure into a hard writing
-        // failure. The real completion request still has its normal retries.
-        return undefined;
-      } finally {
-        modelLookupInFlight.delete(cacheKey);
-      }
-    })();
-    modelLookupInFlight.set(cacheKey, lookup);
-    return lookup;
-  }
-
-  private async keysForModel(keys: string[], model: string): Promise<string[]> {
-    if (keys.length <= 1) return keys;
-    // This happens once per key per runtime and survives all later chapter,
-    // outline, card and streaming calls. It also works after an app restart,
-    // before the user has manually pressed “拉取模型”.
-    const known = await Promise.all(keys.map(async key => ({ key, models: await this.modelsForKey(key) })));
-    const matched = known.filter(item => item.models?.has(model)).map(item => item.key);
-    if (matched.length) return matched;
-    const unavailable = known.filter(item => !item.models).map(item => item.key);
-    if (!unavailable.length) {
-      throw new Error(`当前配置的 API Key 都不支持模型 ${model}。请在模型配置中重新拉取模型，并选择该模型所在分组对应的 API Key。`);
-    }
-    // A transient model-list outage must not stop a request outright. Only
-    // unverified keys remain as a last-resort fallback; known wrong keys are
-    // explicitly excluded.
-    return unavailable;
+  /** 当前配置的唯一 Key。不再做多 Key 轮换，权限以实际调用结果为准 */
+  private get requestKey(): string {
+    const key = this.config.apiKey.trim();
+    if (!key) throw new Error("缺少 API Key");
+    return key;
   }
 
   async listModels(): Promise<string[]> {
     const endpoint = this.endpoints().models;
-    const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    if (!keys.length) throw new Error("缺少 API Key");
-    const results = await Promise.allSettled(keys.map(async key => {
-      const models = await this.modelsForKey(key);
-      if (!models) throw new Error(`模型列表请求失败：${endpoint}`);
-      return [...models];
-    }));
-    const models = Array.from(new Set(results.flatMap(result => result.status === "fulfilled" ? result.value : [])));
-    if (!models.length) {
-      const errors = results.flatMap(result => result.status === "rejected" ? [String(result.reason)] : []);
-      throw new Error(errors.length ? `所有 API Key 拉取模型失败：${errors.join("；")}` : "接口没有返回可用模型");
-    }
-    return models;
+    const probe = await this.probeModels(this.requestKey, endpoint);
+    if (!probe.models) throw new Error(probe.error || `模型列表请求失败：${endpoint}`);
+    if (!probe.models.length) throw new Error("接口没有返回可用模型");
+    return probe.models;
   }
 
-  /** Raw model-list probe. `modelsForKey` deliberately swallows failures so a
-   * transient outage cannot break writing; diagnostics need the opposite. */
+  /** Raw model-list probe. Diagnostics and `listModels` both need the upstream
+   * reason for a failure, not a silent undefined. */
   private async probeModels(key: string, endpoint: string): Promise<{ models?: string[]; error?: string }> {
     try {
       const dispatcher = proxyDispatcherFor(endpoint, this.config);
@@ -563,13 +591,12 @@ export class ApiSaverClient {
       } as RequestInit, 20_000);
       const raw = await response.text();
       if (!response.ok) {
-        return { error: apiErrorMessage(response.status, raw, response.statusText, 1, proxyRouteHint(endpoint, this.config), `，${endpoint}`, this.wireMode) };
+        return { error: apiErrorMessage({ status: response.status, detail: raw, statusText: response.statusText, routeHint: proxyRouteHint(endpoint, this.config), requestHint: `，${endpoint}`, mode: this.wireMode }) };
       }
       const payload = JSON.parse(raw) as { data?: Array<{ id?: string } | string>; models?: Array<{ id?: string } | string> };
       const models = (payload.data ?? payload.models ?? [])
         .map(item => typeof item === "string" ? item : item.id)
         .filter((model): model is string => Boolean(model));
-      modelsByApiKey.set(`${endpoint}\n${key}`, new Set(models));
       return { models };
     } catch (error) {
       return { error: error instanceof Error ? error.message : String(error) };
@@ -577,8 +604,8 @@ export class ApiSaverClient {
   }
 
   /** Preflight for the settings screen: resolves the address, authenticates
-   * every key, verifies the selected model exists and runs one real
-   * completion, reporting the upstream text for whichever step fails. */
+   * the key, verifies the selected model exists and runs one real completion,
+   * reporting the upstream text for whichever step fails. */
   async diagnose(model?: string): Promise<DiagnosticReport> {
     const mode = this.wireMode;
     const checks: DiagnosticCheck[] = [];
@@ -596,10 +623,10 @@ export class ApiSaverClient {
       detail: `${mode === "anthropic" ? "Anthropic Messages" : "OpenAI 兼容"} · ${route.chat}`,
     });
 
-    const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    checks.push(keys.length
-      ? { id: "keys", label: "API 密钥", status: "pass", detail: `已配置 ${keys.length} 个 Key，认证方式 ${mode === "anthropic" ? "x-api-key" : "Authorization: Bearer"}` }
-      : { id: "keys", label: "API 密钥", status: "fail", detail: "没有配置任何 API Key" });
+    const key = this.config.apiKey.trim();
+    checks.push(key
+      ? { id: "keys", label: "API 密钥", status: "pass", detail: `认证方式 ${mode === "anthropic" ? "x-api-key" : "Authorization: Bearer"}` }
+      : { id: "keys", label: "API 密钥", status: "fail", detail: "没有配置 API Key" });
 
     if (this.config.proxyEnabled) {
       const resolved = proxyURLForRequest(route.chat, this.config);
@@ -607,17 +634,13 @@ export class ApiSaverClient {
         ? { id: "proxy", label: "网络代理", status: "pass", detail: `请求将通过 ${resolved}` }
         : { id: "proxy", label: "网络代理", status: "warn", detail: "代理已启用但对该地址未生效：代理地址无效，或命中了“本地地址不走代理”规则" });
     }
-    if (!keys.length) return { mode, modelsEndpoint: route.models, chatEndpoint: route.chat, checks };
+    if (!key) return { mode, modelsEndpoint: route.models, chatEndpoint: route.chat, checks };
 
-    const probes = await Promise.all(keys.map(async key => ({ key, ...await this.probeModels(key, route.models) })));
-    const reachable = probes.filter(probe => probe.models);
-    const available = Array.from(new Set(reachable.flatMap(probe => probe.models ?? [])));
-    checks.push(reachable.length
-      ? {
-        id: "models", label: "模型列表", status: reachable.length === keys.length ? "pass" : "warn",
-        detail: `${reachable.length}/${keys.length} 个 Key 可用，共 ${available.length} 个模型${reachable.length === keys.length ? "" : `。失败原因：${probes.filter(probe => probe.error).map(probe => `Key ${probe.key.slice(0, 4)}••• ${probe.error}`).join("；")}`}`,
-      }
-      : { id: "models", label: "模型列表", status: "fail", detail: probes.map(probe => probe.error).filter(Boolean).join("；") || `无法读取 ${route.models}` });
+    const probe = await this.probeModels(key, route.models);
+    const available = probe.models ?? [];
+    checks.push(probe.models
+      ? { id: "models", label: "模型列表", status: "pass", detail: `读到 ${available.length} 个模型` }
+      : { id: "models", label: "模型列表", status: "fail", detail: probe.error || `无法读取 ${route.models}` });
 
     const target = (model || this.config.defaultModel || "").trim();
     if (!target) {
@@ -628,7 +651,8 @@ export class ApiSaverClient {
       ? { id: "model", label: "当前模型", status: "warn", detail: `无法核对 ${target}：模型列表不可用` }
       : available.includes(target)
         ? { id: "model", label: "当前模型", status: "pass", detail: `${target} 在接口返回的模型列表中` }
-        : { id: "model", label: "当前模型", status: "fail", detail: `接口没有提供 ${target}。可用模型示例：${available.slice(0, 6).join("、")}${available.length > 6 ? " 等" : ""}` });
+        // 不少中转站的模型目录与实际可调用范围不一致，所以只提醒而不当成失败
+        : { id: "model", label: "当前模型", status: "warn", detail: `模型目录里没有 ${target}，但部分中转站目录不全；以下方“实际调用”结果为准。可用模型示例：${available.slice(0, 6).join("、")}${available.length > 6 ? " 等" : ""}` });
 
     try {
       const probe = await this.chat([{ role: "user", content: "请只回复 OK" }], { model: target, max_tokens: 256, temperature: 0, retryAttempts: 1 });
@@ -645,9 +669,7 @@ export class ApiSaverClient {
   async getGatewayUsageSnapshot(): Promise<GatewayUsageSnapshot> {
     const root = "https://api.apisaver.com";
     const endpoint = (path: string) => `${root}${path}`;
-    const keys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])]
-      .map(key => key.trim()).filter(Boolean)));
-    if (!keys.length) throw new Error("请先在设置中填写 API Key。");
+    const keys = [this.requestKey];
     const requestJSON = async (path: string, key?: string): Promise<Record<string, unknown>> => {
       const url = endpoint(path);
       const dispatcher = proxyDispatcherFor(url, this.config);
@@ -715,9 +737,8 @@ export class ApiSaverClient {
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     // Anthropic rejects a thinking budget that is not strictly below max_tokens.
     const maxTokens = Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0);
-    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const apiKeys = await this.keysForModel(configuredKeys, model);
-    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKeys[0] || this.config.apiKey);
+    const apiKey = this.requestKey;
+    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKey);
     const endpoint = this.endpoints().chat;
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     let body: string;
@@ -747,12 +768,12 @@ export class ApiSaverClient {
       });
     }
     const maxAttempts = Math.max(1, Math.min(5, options.retryAttempts ?? 3));
+    // 重试始终用同一个 Key：以前 Key 按重试次数轮换，一次网络抖动就会把请求换到另一个无权限的 Key，报成 403
+    const requestHeaders = { ...headers, ...this.authHeaders(apiKey) };
     let lastNetworkError = "";
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
-        const requestKey = apiKeys[(attempt - 1) % Math.max(1, apiKeys.length)] || this.config.apiKey;
-        const requestHeaders = { ...headers, ...this.authHeaders(requestKey) };
         const dispatcher = proxyDispatcherFor(endpoint, this.config);
         const response = await fetchWithTimeout(endpoint, {
           method: "POST",
@@ -796,10 +817,15 @@ export class ApiSaverClient {
           await sleep(800 * 2 ** (attempt - 1));
           continue;
         }
-        throw new Error(apiErrorMessage(response.status, detail, response.statusText, attempt, proxyRouteHint(endpoint, this.config), `，模型 ${model} · ${endpoint}`, mode));
+        throw new ApiRequestError(apiErrorMessage({
+          status: response.status, detail, statusText: response.statusText, attempts: attempt,
+          routeHint: proxyRouteHint(endpoint, this.config), requestHint: `，模型 ${model} · ${endpoint}`,
+          mode, requestBytes: Buffer.byteLength(body, "utf8"),
+        }), response.status);
       } catch (error) {
+        // 上游已明确拒绝的请求不重试：响应体已读完，重试只会得到无意义的二次错误
+        if (error instanceof ApiRequestError) throw error;
         const message = error instanceof Error ? error.message : String(error);
-        if (message.startsWith("API ")) throw error;
         lastNetworkError = message;
         if (attempt < maxAttempts) {
           await sleep(500 * 2 ** (attempt - 1));
@@ -821,10 +847,8 @@ export class ApiSaverClient {
     const reasoningMode = this.config.reasoningMode;
     const thinkingBudget = mode === "anthropic" && reasoningMode ? anthropicThinkingBudget[reasoningMode] : undefined;
     const maxTokens = Math.max(options.max_tokens ?? 4000, thinkingBudget ? thinkingBudget + 1024 : 0);
-    const configuredKeys = Array.from(new Set([this.config.apiKey, ...(this.config.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const apiKeys = await this.keysForModel(configuredKeys, model);
-    if (!apiKeys.length) throw new Error("缺少 API Key");
-    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKeys[0]);
+    const apiKey = this.requestKey;
+    const contextMessages = await this.fitContextMessages(messages, maxTokens, model, apiKey);
     const streamBody = mode === "anthropic"
       ? (() => {
         const { system, turns } = toAnthropicMessages(contextMessages);
@@ -839,24 +863,21 @@ export class ApiSaverClient {
         });
       })()
       : JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: maxTokens, response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined, reasoning_effort: supportsOpenAIReasoning(model) && reasoningMode ? openAIReasoningEffort[reasoningMode] : undefined, stream: true, stream_options: { include_usage: true } });
-    let response: Response | null = null;
-    let lastStreamError = "";
-    for (const key of apiKeys) {
-      const candidate = await fetchWithTimeout(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...this.authHeaders(key) },
-        body: streamBody,
-        ...(dispatcher ? { dispatcher } : {}),
-      } as RequestInit, 120_000);
-      if (candidate.ok && candidate.body) {
-        response = candidate;
-        break;
-      }
-      const detail = await candidate.text();
-      lastStreamError = apiErrorMessage(candidate.status, detail, candidate.statusText, 1, proxyRouteHint(endpoint, this.config), `，模型 ${model} · ${endpoint}`, mode);
+    const streamResponse = await fetchWithTimeout(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...this.authHeaders(apiKey) },
+      body: streamBody,
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit, 120_000);
+    const responseBody = streamResponse.ok ? streamResponse.body : null;
+    if (!responseBody) {
+      const detail = await streamResponse.text();
+      throw new ApiRequestError(apiErrorMessage({
+        status: streamResponse.status, detail, statusText: streamResponse.statusText,
+        routeHint: proxyRouteHint(endpoint, this.config), requestHint: `，模型 ${model} · ${endpoint}`,
+        mode, requestBytes: Buffer.byteLength(streamBody, "utf8"),
+      }), streamResponse.status);
     }
-    const responseBody = response?.body;
-    if (!responseBody) throw new Error(lastStreamError || "所有 API Key 的流式请求均失败");
     const reader = responseBody.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
     try {
       streamLoop: while (true) {
@@ -878,7 +899,7 @@ export class ApiSaverClient {
             const event = JSON.parse(text) as Record<string, unknown>;
             if (mode === "anthropic") {
               if (event.type === "error") {
-                throw new Error(upstreamErrorText(text) || "Anthropic 流式接口返回错误事件");
+                throw new Error(describeErrorBody(text).text || "Anthropic 流式接口返回错误事件");
               }
               const delta = event.delta as Record<string, unknown> | undefined;
               // `thinking_delta` blocks share this event type and must not be

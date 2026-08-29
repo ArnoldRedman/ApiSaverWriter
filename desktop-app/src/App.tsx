@@ -7,11 +7,13 @@ import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionChapter, AIDetectionLabel, AIDetectionSegment, AIDetectionReport, MemoryDocumentKind, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
-import { removeChapterFromProject } from './domain/chapter';
+import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit } from './domain/chapter';
+import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
 import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
-import { defaultBaseURL, defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, isDefaultApiService, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, orderApiKeysForModel, applyModelKeyRouting, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
+import { defaultBaseURL, defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, isDefaultApiService, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
+import { readerFonts, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
@@ -564,6 +566,39 @@ const formatNovelChapterContent = (content: string) => content
   .replace(/\n{3,}/gu, '\n\n')
   .trim();
 
+/** 本地日期键，日更统计用 */
+const todayKey = () => {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+};
+
+const dayKeyOffset = (days: number) => {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+};
+
+/** 连续更新天数：从今天（或昨天）往前数，遇到空白天停下 */
+const writingStreak = (dailyWords: Record<string, number> = {}): number => {
+  if (!(dailyWords[todayKey()] || dailyWords[dayKeyOffset(1)])) return 0;
+  let streak = 0;
+  for (let offset = dailyWords[todayKey()] ? 0 : 1; offset < 3650; offset += 1) {
+    if (!dailyWords[dayKeyOffset(offset)]) break;
+    streak += 1;
+  }
+  return streak;
+};
+
+/** 网页调试环境的导出回退，Tauri 下走原生命令 */
+const downloadInBrowser = (fileName: string, content: string) => {
+  const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = fileName;
+  anchor.click();
+  URL.revokeObjectURL(url);
+};
+
 type TabType = 'projects' | 'books' | 'dismantles' | 'rankings' | 'skills' | 'styles';
 
 interface GenreTag {
@@ -930,8 +965,9 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
     if (change.type === 'chapter.update') {
       const target = next.chapters.find(item => item.id === change.targetId);
       if (!target) throw new Error(`找不到章节 ID ${change.targetId}`);
+      // Agent 修订也会覆盖正文，先存快照才能回滚
       const updated: Chapter = {
-        ...target,
+        ...pushChapterSnapshot(target, 'Agent 修订'),
         title: change.title?.trim() || target.title,
         content: change.content,
         wordCount: countNovelCharacters(change.content),
@@ -1265,7 +1301,12 @@ function App() {
     try { return JSON.parse(localStorage.getItem('writer-runtime-usage') || '') as RuntimeUsageSummary; } catch { return { inputTokens: 0, outputTokens: 0, totalTokens: 0, cachedInputTokens: 0, cacheWriteTokens: 0, reasoningTokens: 0, requests: 0, startedAt: new Date().toISOString() }; }
   });
   const [usageDays, setUsageDays] = useState<UsageDay[]>(() => { try { const value = JSON.parse(localStorage.getItem('writer-runtime-usage-days') || '[]'); return Array.isArray(value) ? value : []; } catch { return []; } });
-  const [settingsSection, setSettingsSection] = useState<'model' | 'network' | 'usage' | 'sync' | 'tutorial'>('model');
+  const [settingsSection, setSettingsSection] = useState<'model' | 'appearance' | 'network' | 'usage' | 'sync' | 'tutorial'>('model');
+  const [appearance, setAppearance] = useState<Appearance>(loadAppearance);
+  useEffect(() => {
+    applyAppearance(appearance);
+    localStorage.setItem(appearanceStorageKey, JSON.stringify(appearance));
+  }, [appearance]);
   const [cloudRemotePath, setCloudRemotePath] = useState(() => {
     const saved = localStorage.getItem('cloud-remote-path');
     return !saved || saved === 'ApiSaverWriter/projects' ? 'ApiSaverWriter/backup' : saved;
@@ -1343,7 +1384,6 @@ function App() {
     try {
       const result = await agentRpc<GatewayUsageSnapshot>('gateway.usage', {
           apiKey: key,
-          apiKeys: settingsDraft.apiKeys,
           ...agentNetworkParams(settingsDraft),
         });
       setGatewayUsage(result);
@@ -1377,6 +1417,19 @@ function App() {
   const [aiToolResult, setAIToolResult] = useState<AIToolResult | null>(null);
   const [selectionSnapshot, setSelectionSnapshot] = useState<{ start: number; end: number; source: string } | null>(null);
   const [chapterJumpQuery, setChapterJumpQuery] = useState('');
+  // 导出、历史版本、回收站、写作统计、阅读模式与快捷键面板
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportScope, setExportScope] = useState<'book' | 'chapter'>('book');
+  const [exportOptions, setExportOptions] = useState<ExportOptions>(defaultExportOptions);
+  const [exportRunning, setExportRunning] = useState(false);
+  const [showChapterHistory, setShowChapterHistory] = useState(false);
+  const [showRecycleBin, setShowRecycleBin] = useState(false);
+  const [showWritingStats, setShowWritingStats] = useState(false);
+  const [showShortcuts, setShowShortcuts] = useState(false);
+  const [readingMode, setReadingMode] = useState(false);
+  const [draggingChapterId, setDraggingChapterId] = useState<number | null>(null);
+  const [localBackups, setLocalBackups] = useState<{ directory: string; files: Array<{ name: string; size: number; modifiedAt: number }> }>({ directory: '', files: [] });
+  const [showLocalBackupPicker, setShowLocalBackupPicker] = useState(false);
   const chaptersListRef = useRef<HTMLDivElement | null>(null);
   const chapterEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
@@ -1388,7 +1441,7 @@ function App() {
   refreshGatewayUsageRef.current = refreshGatewayUsage;
   const gatewayUsageRequestRef = useRef('');
   const gatewayUsageRequestKey = showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft)
-    ? `${settingsDraft.apiMode}:${settingsDraft.baseURL}:${settingsDraft.apiKey}:${settingsDraft.apiKeys.join(',')}`
+    ? `${settingsDraft.apiMode}:${settingsDraft.baseURL}:${settingsDraft.apiKey}`
     : '';
   useEffect(() => {
     if (!gatewayUsageRequestKey) {
@@ -1419,7 +1472,6 @@ function App() {
     }
   });
   const [customModelName, setCustomModelName] = useState('');
-  const [customApiKey, setCustomApiKey] = useState('');
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsTesting, setModelsTesting] = useState(false);
   const [modelListMessage, setModelListMessage] = useState('');
@@ -1833,13 +1885,29 @@ function App() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      // Esc 退出阅读模式，不需要修饰键
+      if (event.key === 'Escape' && readingMode) {
+        setReadingMode(false);
+        return;
+      }
       if (!editingProject) return;
       const modifier = event.metaKey || event.ctrlKey;
+      // Alt + 上/下切章，不占用浏览器修饰键组合
+      if (event.altKey && !modifier && (event.key === 'ArrowUp' || event.key === 'ArrowDown')) {
+        const index = editingProject.chapters.findIndex(chapter => chapter.id === activeChapter?.id);
+        const next = editingProject.chapters[index + (event.key === 'ArrowDown' ? 1 : -1)];
+        if (next) {
+          event.preventDefault();
+          setActiveChapter(next);
+        }
+        return;
+      }
       if (!modifier) return;
-      if (event.key.toLowerCase() === 's') {
+      const key = event.key.toLowerCase();
+      if (key === 's') {
         event.preventDefault();
         void persistCurrentChapterRef.current();
-      } else if (event.key.toLowerCase() === 'f') {
+      } else if (key === 'f') {
         event.preventDefault();
         if (editorSidebarTab === 'search') {
           setSearchScope('book');
@@ -1849,11 +1917,26 @@ function App() {
           setSearchScope('chapter');
         }
         window.setTimeout(() => searchInputRef.current?.focus(), 0);
+      } else if (key === 'e') {
+        event.preventDefault();
+        setShowExportModal(true);
+      } else if (key === 'h') {
+        event.preventDefault();
+        setShowChapterHistory(true);
+      } else if (key === 'j') {
+        event.preventDefault();
+        setShowWritingStats(true);
+      } else if (key === 'p') {
+        event.preventDefault();
+        setReadingMode(current => !current);
+      } else if (event.key === '/') {
+        event.preventDefault();
+        setShowShortcuts(current => !current);
       }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [editingProject, activeChapter, chapterSaving, editorSidebarTab]);
+  }, [editingProject, activeChapter, chapterSaving, editorSidebarTab, readingMode]);
 
   useEffect(() => {
     void loadSkills();
@@ -2057,7 +2140,6 @@ function App() {
           outlines,
           chapters,
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
@@ -2381,7 +2463,7 @@ function App() {
     try {
       const result = await agentRpc<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('book.dismantle', {
           bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.content,
-          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2426,7 +2508,7 @@ function App() {
         updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, status: 'analyzing' } : item), updatedAt: new Date().toISOString() }));
         const result = await agentRpc<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('book.dismantle', {
             bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.sourceContent,
-            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+            apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
             model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
             contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
           });
@@ -2461,7 +2543,7 @@ function App() {
       const result = await agentRpc<{ content?: string }>('book.rewrite', {
           bookTitle: book.title, chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline,
           instruction: dismantleRewriteInstruction, targetWords: 2200,
-          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2491,7 +2573,7 @@ function App() {
     try {
       const result = await agentRpc<{ name?: string; description?: string; tags?: string[]; content?: string }>('book.style.distill', {
           bookTitle: book.title, styleName: `${book.title}文风`, samples: chapters.map(chapter => ({ title: chapter.title, content: chapter.sourceContent })),
-          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2544,7 +2626,7 @@ function App() {
       const result = await agentRpc<{ title?: string; content?: string }>('book.adapt', {
           projectTitle: target.title, projectSynopsis: target.synopsis, projectOutlines: target.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n'),
           chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline, rewriteContent: chapter.rewriteContent, styleProfile: style?.content,
-          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys, baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2752,7 +2834,6 @@ function App() {
           content: newSkill.content.trim(),
           tags: newSkill.tags.split(',').map(tag => tag.trim()).filter(Boolean),
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
@@ -2931,7 +3012,7 @@ function App() {
     try {
       if ('__TAURI_INTERNALS__' in window) await nativeClient.saveProjects(nextProjects);
       else localStorage.setItem('projects', JSON.stringify(nextProjects));
-      setNotice({ title: '章节已删除', content: `《${target.title}》及其章节记忆、图谱关系已清理；绑定的章纲已解除关联但保留。` });
+      setNotice({ title: '章节已删除', content: `《${target.title}》已进回收站，可在章节列表上方恢复；章节记忆、图谱关系已清理，绑定的章纲解除关联但保留。` });
     } catch (error) {
       setNotice({ title: '章节已删除但保存失败', content: String(error) });
     }
@@ -2943,7 +3024,12 @@ function App() {
     const updatedChapter = { ...activeChapter, content, wordCount, updatedAt: new Date().toISOString() };
     const updatedChapters = editingProject.chapters.map(c => c.id === activeChapter.id ? updatedChapter : c);
     const totalWords = updatedChapters.reduce((sum, c) => sum + c.wordCount, 0);
-    const updated = { ...editingProject, chapters: updatedChapters, wordCount: totalWords, updatedAt: new Date().toISOString() };
+    // 日更统计只累加正增量，删字不从当日成绩里扣回去
+    const delta = wordCount - activeChapter.wordCount;
+    const dailyWords = delta > 0
+      ? { ...editingProject.dailyWords, [todayKey()]: (editingProject.dailyWords?.[todayKey()] || 0) + delta }
+      : editingProject.dailyWords;
+    const updated = { ...editingProject, chapters: updatedChapters, wordCount: totalWords, dailyWords, updatedAt: new Date().toISOString() };
     setEditingProject(updated);
     setActiveChapter(updatedChapter);
     setProjects(current => current.map(p => p.id === updated.id ? updated : p));
@@ -2952,6 +3038,130 @@ function App() {
     if (wordCount >= target && goalNoticeChapterRef.current !== activeChapter.id) {
       goalNoticeChapterRef.current = activeChapter.id;
       setNotice({ title: '已达到本章目标字数', content: `本章已写 ${wordCount} 字，建议保存并创建下一章。` });
+    }
+  };
+
+  // 保存项目到本地，所有需要立即落盘的操作共用这一条路径
+  const persistProjects = async (nextProjects: Project[]) => {
+    if ('__TAURI_INTERNALS__' in window) await nativeClient.saveProjects(nextProjects);
+    else localStorage.setItem('projects', JSON.stringify(nextProjects));
+  };
+
+  const applyProjectChange = async (updated: Project, message?: { title: string; content: string }) => {
+    // setEditingProject 同时同步 editingProjectRef 和 projects，不能只写 projects
+    setEditingProject(updated);
+    const nextProjects = projectsRef.current.map(item => item.id === updated.id ? updated : item);
+    try {
+      await persistProjects(nextProjects);
+      if (message) setNotice(message);
+    } catch (error) {
+      setNotice({ title: '修改已应用但保存失败', content: String(error) });
+    }
+  };
+
+  // 回滚到某个历史版本；当前正文会先入栈，回滚可以再回滚
+  const rollbackChapterSnapshot = async (savedAt: string) => {
+    if (!editingProject || !activeChapter) return;
+    const restored = restoreChapterSnapshot(activeChapter, savedAt, countNovelCharacters);
+    if (restored === activeChapter) return;
+    setActiveChapter(restored);
+    setShowChapterHistory(false);
+    await applyProjectChange(replaceChapterInProject(editingProject, restored), {
+      title: '已恢复历史版本',
+      content: `正文已换回 ${new Date(savedAt).toLocaleString('zh-CN', { hour12: false })} 的版本，当前版本已存为新快照。`,
+    });
+  };
+
+  const restoreChapterFromBin = async (chapterId: number) => {
+    if (!editingProject) return;
+    const { project, chapter } = restoreDeletedChapter(editingProject, chapterId);
+    if (!chapter) return;
+    setActiveChapter(chapter);
+    await applyProjectChange(project, { title: '章节已恢复', content: `《${chapter.title}》已插回目录；章节记忆与图谱关系需要重新生成。` });
+  };
+
+  const purgeChapterFromBin = async (chapterId: number) => {
+    if (!editingProject) return;
+    await applyProjectChange({
+      ...editingProject,
+      deletedChapters: (editingProject.deletedChapters || []).filter(item => item.chapter.id !== chapterId),
+      updatedAt: new Date().toISOString(),
+    });
+  };
+
+  const moveActiveChapter = async (chapterId: number, delta: number) => {
+    if (!editingProject) return;
+    const updated = moveChapterInProject(editingProject, chapterId, delta);
+    if (updated === editingProject) return;
+    await applyProjectChange(updated);
+  };
+
+  const dropChapterOn = async (targetChapterId: number) => {
+    const sourceId = draggingChapterId;
+    setDraggingChapterId(null);
+    if (!editingProject || sourceId === null || sourceId === targetChapterId) return;
+    const toIndex = editingProject.chapters.findIndex(chapter => chapter.id === targetChapterId);
+    const updated = reorderChapterInProject(editingProject, sourceId, toIndex);
+    if (updated === editingProject) return;
+    await applyProjectChange(updated);
+  };
+
+  const insertChapterBelow = async (afterChapterId: number | null) => {
+    if (!editingProject) return;
+    const { project, chapter } = insertChapterAfter(editingProject, afterChapterId, '新章节');
+    setActiveChapter(chapter);
+    await applyProjectChange(project);
+  };
+
+  // 全书替换：改角色名不必逐章手工替换，每章覆盖前均存快照
+  const replaceAllInBook = async () => {
+    if (!editingProject || !searchQuery) return;
+    let changedChapters = 0;
+    let changedCount = 0;
+    const chapters = editingProject.chapters.map(chapter => {
+      const count = countOccurrences(chapter.content, searchQuery);
+      if (!count) return chapter;
+      changedChapters += 1;
+      changedCount += count;
+      const content = chapter.content.split(searchQuery).join(replaceQuery);
+      return { ...pushChapterSnapshot(chapter, '全书替换'), content, wordCount: countNovelCharacters(content), updatedAt: new Date().toISOString() };
+    });
+    if (!changedCount) {
+      setNotice({ title: '没有可替换内容', content: `全书没有“${searchQuery}”。` });
+      return;
+    }
+    const updated = { ...editingProject, chapters, wordCount: chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0), updatedAt: new Date().toISOString() };
+    const nextActive = activeChapter ? chapters.find(chapter => chapter.id === activeChapter.id) : null;
+    if (nextActive) setActiveChapter(nextActive);
+    await applyProjectChange(updated, {
+      title: '全书替换完成',
+      content: `已在 ${changedChapters} 个章节里替换 ${changedCount} 处；每章保留了替换前的历史版本，可在“历史”里回滚。`,
+    });
+  };
+
+  const exportCurrentTarget = async () => {
+    if (!editingProject || exportRunning) return;
+    if (exportScope === 'chapter' && !activeChapter) return;
+    setExportRunning(true);
+    try {
+      // 当前章可能还在编辑缓冲里，先把它合入导出快照
+      const snapshot = activeChapter ? replaceChapterInProject(editingProject, activeChapter) : editingProject;
+      const content = exportScope === 'chapter' && activeChapter
+        ? buildChapterExport(snapshot, activeChapter.id, exportOptions.format)
+        : buildProjectExport(snapshot, exportOptions);
+      const fileName = exportFileName(snapshot, exportOptions, exportScope === 'chapter' ? activeChapter?.title : undefined);
+      if ('__TAURI_INTERNALS__' in window) {
+        const path = await invoke<string>('export_text_file', { fileName, content });
+        setNotice({ title: '导出完成', content: path });
+      } else {
+        downloadInBrowser(fileName, content);
+        setNotice({ title: '导出完成', content: `${fileName} 已下载。` });
+      }
+      setShowExportModal(false);
+    } catch (error) {
+      setNotice({ title: '导出失败', content: String(error) });
+    } finally {
+      setExportRunning(false);
     }
   };
 
@@ -3165,7 +3375,7 @@ function App() {
             maxWords,
             projectTitle: editingProject.title,
             chapterTitle: activeChapter.title,
-            apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys,
+            apiKey: agentConfig.apiKey.trim(),
             baseURL: agentConfig.baseURL.trim() || defaultBaseURL, model: agentConfig.model.trim() || fallbackModels[0],
             apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
           });
@@ -3196,7 +3406,7 @@ function App() {
       const result = await agentRpc<{ content?: string }>('text.transform', {
           mode, instruction: aiToolInstruction.trim(), content: source,
           projectTitle: editingProject.title, chapterTitle: activeChapter.title,
-          apiKey: agentConfig.apiKey.trim(), apiKeys: agentConfig.apiKeys,
+          apiKey: agentConfig.apiKey.trim(),
           baseURL: agentConfig.baseURL.trim() || defaultBaseURL, model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -3249,7 +3459,9 @@ function App() {
     }
 
     const now = new Date().toISOString();
-    const updatedChapter: Chapter = { ...targetChapter, content: nextContent, wordCount: countNovelCharacters(nextContent), updatedAt: now };
+    // 润色 / 去 AI 味 / 续写都会重写正文，覆盖前先压入一条历史版本
+    const toolReason = aiToolResult.mode === 'continue' ? 'AI 续写' : aiToolResult.mode === 'de-ai' ? '去 AI 味' : 'AI 润色';
+    const updatedChapter: Chapter = { ...pushChapterSnapshot(targetChapter, toolReason), content: nextContent, wordCount: countNovelCharacters(nextContent), updatedAt: now };
     const updatedChapters = targetProject.chapters.map(chapter => chapter.id === updatedChapter.id ? updatedChapter : chapter);
     const updatedProject: Project = {
       ...targetProject,
@@ -3605,8 +3817,7 @@ function App() {
             content: chapter.content,
             cards: localProject.cards.filter(card => selectedCardIds.includes(card.id) || (card.title.trim() && chapter.content.includes(card.title))).slice(0, 10),
             apiKey: agentConfig.apiKey.trim(),
-            apiKeys: agentConfig.apiKeys,
-            baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+              baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
             model: agentConfig.model.trim() || fallbackModels[0],
             apiMode: agentConfig.apiMode,
             reasoningMode: agentConfig.reasoningMode,
@@ -3733,7 +3944,6 @@ function App() {
           writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
           skills: skills.map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
@@ -4049,7 +4259,6 @@ function App() {
           skills: [...skills, ...(activeStyle ? [{ name: `style-${activeStyle.id}`, displayName: activeStyle.name, category: 'write', description: activeStyle.description, tags: [...activeStyle.tags, '文风'], content: activeStyle.content }] : [])].map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           preferredSkillNames: selectedAgentSkillNames,
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || 'gpt-4o-mini',
           apiMode: agentConfig.apiMode,
@@ -4110,7 +4319,6 @@ function App() {
           outlines: editingProject.outlines.slice(-4).map(outline => ({ kind: outline.kind, content: outline.content })),
           cards: editingProject.cards.filter(card => card.id !== activeCardId).slice(-8),
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
@@ -4271,7 +4479,6 @@ function App() {
           })),
           memoryDocuments: [],
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || 'gpt-4o-mini',
           apiMode: agentConfig.apiMode,
@@ -4315,7 +4522,8 @@ function App() {
     if (editingProject && activeChapter) {
       const now = new Date().toISOString();
       const updatedChapter: Chapter = {
-        ...activeChapter,
+        // 采用草稿会覆盖现有正文，先存快照
+        ...pushChapterSnapshot(activeChapter, 'Agent 草稿'),
         content: agentDraft.draftContent,
         wordCount: countNovelCharacters(agentDraft.draftContent),
         updatedAt: now,
@@ -4346,7 +4554,6 @@ function App() {
     setSettingsDraft(agentConfig);
     setSettingsModels(availableModels);
     setCustomModelName('');
-    setCustomApiKey('');
     setModelListMessage('');
     setSettingsServiceExpanded(true);
     const selectedProject = editingProject || projects.find(project => project.id === githubProjectId) || projects[0];
@@ -4441,7 +4648,6 @@ function App() {
         project: snapshot,
         agentParams: {
           apiKey: agentConfig.apiKey.trim(),
-          apiKeys: agentConfig.apiKeys,
           baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
@@ -4539,60 +4745,66 @@ function App() {
     }
   };
 
+  /** 收集备份需要的全部本机状态；云端备份与本地导出共用这一份，两边备份包内容完全一致 */
+  const buildBackupClientState = async (): Promise<Record<string, string | null>> => {
+    const snapshot = editingProject ? projects.map(project => project.id === editingProject.id ? editingProject : project) : projects;
+    await Promise.all([
+      nativeClient.saveProjects(snapshot),
+      nativeClient.saveLibraryBooks(libraryBooks),
+      nativeClient.saveRankingBooks(rankingBooks),
+      nativeClient.saveDismantleBooks(dismantleBooks),
+      nativeClient.saveWritingStyles(writingStyles),
+    ]);
+    const backupManifest = {
+      schemaVersion: 2,
+      createdAt: new Date().toISOString(),
+      counts: {
+        projects: snapshot.length,
+        libraryBooks: libraryBooks.length,
+        rankingBooks: rankingBooks.length,
+        dismantleBooks: dismantleBooks.length,
+        writingStyles: writingStyles.length,
+        skills: skills.length,
+        models: availableModels.length,
+      },
+      apiConfigured: Boolean(agentConfig.apiKey.trim()),
+    };
+    const clientState = Object.fromEntries([
+      'agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
+      'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
+      ...snapshot.map(project => `project-agent-current-session:${project.id}`),
+    ].map(key => [key, localStorage.getItem(key)]));
+    clientState['agent-config'] = JSON.stringify(agentConfig);
+    clientState['agent-profiles'] = JSON.stringify(agentProfiles);
+    clientState['agent-active-profile'] = activeProfileId;
+    clientState['agent-models'] = JSON.stringify(availableModels);
+    clientState['writer-skills'] = JSON.stringify(skills);
+    clientState.projects = JSON.stringify(snapshot);
+    clientState['writer-library-books'] = JSON.stringify(libraryBooks);
+    clientState['writer-ranking-books'] = JSON.stringify(rankingBooks);
+    clientState['writer-dismantle-books'] = JSON.stringify(dismantleBooks);
+    clientState['writer-writing-styles'] = JSON.stringify(writingStyles);
+    clientState['backup-manifest'] = JSON.stringify(backupManifest);
+    // 项目 Agent 会话存在 app-data 目录里，备份包只认 clientState，需要单独导出
+    try {
+      clientState['agent-chats'] = JSON.stringify(await invoke<Record<string, unknown>>('export_agent_chats'));
+    } catch (error) {
+      console.warn('导出项目 Agent 会话失败，本次备份不含聊天记录', error);
+    }
+    return clientState;
+  };
+
   const backupToCloud = async () => {
     const remotePath = cloudRemotePath.trim();
     if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
     setCloudSyncRunning(true);
     setCloudSyncMessage('正在保存并核对全部本机数据...');
     try {
-      const snapshot = editingProject ? projects.map(project => project.id === editingProject.id ? editingProject : project) : projects;
-      await Promise.all([
-        nativeClient.saveProjects(snapshot),
-        nativeClient.saveLibraryBooks(libraryBooks),
-        nativeClient.saveRankingBooks(rankingBooks),
-        nativeClient.saveDismantleBooks(dismantleBooks),
-        nativeClient.saveWritingStyles(writingStyles),
-      ]);
-      const backupManifest = {
-        schemaVersion: 2,
-        createdAt: new Date().toISOString(),
-        counts: {
-          projects: snapshot.length,
-          libraryBooks: libraryBooks.length,
-          rankingBooks: rankingBooks.length,
-          dismantleBooks: dismantleBooks.length,
-          writingStyles: writingStyles.length,
-          skills: skills.length,
-          models: availableModels.length,
-        },
-        apiConfigured: Boolean(agentConfig.apiKey.trim() || agentConfig.apiKeys.some(key => key.trim())),
-      };
-      const clientState = Object.fromEntries([
-        'agent-config', 'agent-profiles', 'agent-active-profile', 'agent-models', 'agent-fetched-models', 'writer-skills', 'writer-runtime-usage',
-        'writer-runtime-usage-days', 'writer-banned-words', 'cloud-remote-path',
-        ...snapshot.map(project => `project-agent-current-session:${project.id}`),
-      ].map(key => [key, localStorage.getItem(key)]));
-      clientState['agent-config'] = JSON.stringify(agentConfig);
-      clientState['agent-profiles'] = JSON.stringify(agentProfiles);
-      clientState['agent-active-profile'] = activeProfileId;
-      clientState['agent-models'] = JSON.stringify(availableModels);
-      clientState['writer-skills'] = JSON.stringify(skills);
-      clientState.projects = JSON.stringify(snapshot);
-      clientState['writer-library-books'] = JSON.stringify(libraryBooks);
-      clientState['writer-ranking-books'] = JSON.stringify(rankingBooks);
-      clientState['writer-dismantle-books'] = JSON.stringify(dismantleBooks);
-      clientState['writer-writing-styles'] = JSON.stringify(writingStyles);
+      const clientState = await buildBackupClientState();
       clientState['cloud-remote-path'] = remotePath;
-      clientState['backup-manifest'] = JSON.stringify(backupManifest);
-      // 项目 Agent 会话存在 app-data 目录里，备份包只认 clientState，需要单独导出
-      try {
-        clientState['agent-chats'] = JSON.stringify(await invoke<Record<string, unknown>>('export_agent_chats'));
-      } catch (error) {
-        console.warn('导出项目 Agent 会话失败，本次备份不含聊天记录', error);
-      }
       await invoke<{ message?: string; remotePath?: string }>('backup_projects_to_baidu', { remotePath, clientState });
       localStorage.setItem('cloud-remote-path', remotePath);
-      setCloudSyncMessage(`完整备份完成：小说 ${snapshot.length}、书籍 ${libraryBooks.length}、拆书 ${dismantleBooks.length}、榜单 ${rankingBooks.length}、文风 ${writingStyles.length}。`);
+      setCloudSyncMessage(`完整备份完成：小说 ${projects.length}、书籍 ${libraryBooks.length}、拆书 ${dismantleBooks.length}、榜单 ${rankingBooks.length}、文风 ${writingStyles.length}。`);
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -4625,19 +4837,12 @@ function App() {
     }
   };
 
-  const restoreFromCloud = async (selectedBackup?: CloudBackupFile) => {
-    const remotePath = cloudRemotePath.trim();
-    if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
-    if (!selectedBackup) { setCloudSyncMessage('请先选择要恢复的云端备份文件。'); return; }
-    setShowCloudBackupPicker(false);
+  /** 备份包恢复的公共路径：云端与本地只差一个取包动作，其余校验与写入完全相同 */
+  const restoreFromBundle = async (label: string, runRestore: () => Promise<{ clientState?: Record<string, string | null> }>, onSuccess?: () => void) => {
     setCloudSyncRunning(true);
-    setCloudSyncMessage(`正在恢复备份：${selectedBackup.name}...`);
+    setCloudSyncMessage(`正在恢复备份：${label}...`);
     try {
-      const result = await invoke<{ clientState?: Record<string, string | null> }>('restore_projects_from_baidu', {
-        remotePath,
-        backupPath: selectedBackup.path,
-        backupFsId: selectedBackup.fsId,
-      });
+      const result = await runRestore();
       const restoredState = result.clientState || {};
       if (typeof restoredState['agent-chats'] === 'string') {
         // 聊天记录恢复失败不应该阻断小说数据恢复
@@ -4763,7 +4968,7 @@ function App() {
         setProjects(restored);
         if (editingProject) setEditingProject(restored.find(project => project.id === editingProject.id) || null);
       }
-      localStorage.setItem('cloud-remote-path', remotePath);
+      onSuccess?.();
       setCloudSyncMessage(`完整恢复完成：小说 ${actualCounts.projects}、书籍 ${actualCounts.libraryBooks}、拆书 ${actualCounts.dismantleBooks}、榜单 ${actualCounts.rankingBooks}、文风 ${actualCounts.writingStyles}。正在重新载入...`);
       window.setTimeout(() => window.location.reload(), 1000);
     } catch (error) {
@@ -4773,9 +4978,55 @@ function App() {
     }
   };
 
+  const restoreFromCloud = async (selectedBackup?: CloudBackupFile) => {
+    const remotePath = cloudRemotePath.trim();
+    if (!remotePath) { setCloudSyncMessage('请填写云端备份目录。'); return; }
+    if (!selectedBackup) { setCloudSyncMessage('请先选择要恢复的云端备份文件。'); return; }
+    setShowCloudBackupPicker(false);
+    await restoreFromBundle(selectedBackup.name, () => invoke('restore_projects_from_baidu', {
+      remotePath,
+      backupPath: selectedBackup.path,
+      backupFsId: selectedBackup.fsId,
+    }), () => localStorage.setItem('cloud-remote-path', remotePath));
+  };
+
+  // 本地备份：不需要百度网盘或 GitHub，直接写到下载目录
+  const exportBackupBundle = async () => {
+    setCloudSyncRunning(true);
+    setCloudSyncMessage('正在打包完整备份...');
+    try {
+      const clientState = await buildBackupClientState();
+      const result = await invoke<{ path: string; size: number }>('export_backup_bundle', { clientState });
+      setCloudSyncMessage(`本地备份包已生成（${(result.size / 1_048_576).toFixed(1)} MB）：${result.path}`);
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const loadLocalBackups = async () => {
+    setCloudSyncRunning(true);
+    try {
+      const result = await invoke<{ directory: string; files: Array<{ name: string; size: number; modifiedAt: number }> }>('list_local_backups');
+      setLocalBackups({ directory: result.directory, files: Array.isArray(result.files) ? result.files : [] });
+      setShowLocalBackupPicker(true);
+      setCloudSyncMessage(result.files?.length ? `找到 ${result.files.length} 个本地备份包，请选择要恢复的版本。` : '导出目录里还没有 .aswbackup 备份包。');
+    } catch (error) {
+      setCloudSyncMessage(String(error));
+    } finally {
+      setCloudSyncRunning(false);
+    }
+  };
+
+  const restoreFromLocalBundle = async (fileName: string) => {
+    setShowLocalBackupPicker(false);
+    await restoreFromBundle(fileName, () => invoke('restore_backup_bundle', { fileName }));
+  };
+
   const pullModels = async () => {
-    const keys = Array.from(new Set([...(settingsDraft.apiKeys || []), settingsDraft.apiKey].map(key => key.trim()).filter(Boolean)));
-    if (!keys.length) {
+    const apiKey = settingsDraft.apiKey.trim();
+    if (!apiKey) {
       setNotice({ title: '需要 API Key', content: '请先填写 API Key，再拉取模型列表。' });
       return;
     }
@@ -4786,27 +5037,12 @@ function App() {
     }
     setModelsLoading(true);
     try {
-      const responses = await Promise.allSettled(keys.map(async (apiKey) => ({ apiKey, result: await agentRpc<{ models?: string[] }>('models.list', { baseURL: requestBaseURL, apiKey, apiKeys: [apiKey], apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) }) })));
-      const successful = responses.filter((response): response is PromiseFulfilledResult<{ apiKey: string; result: { models?: string[] } }> => response.status === 'fulfilled');
-      const modelKeyMap = successful.reduce<Record<string, string[]>>((map, response) => {
-        (Array.isArray(response.value.result.models) ? response.value.result.models : []).forEach(model => {
-          if (typeof model !== 'string' || !model.trim()) return;
-          map[model] = Array.from(new Set([...(map[model] || []), response.value.apiKey]));
-        });
-        return map;
-      }, {});
-      const models = Object.keys(modelKeyMap);
-      if (models.length === 0) {
-        // Every key answered but none advertised a model: report the upstream
-        // reason rather than a bare "没有可用模型".
-        const reasons = responses.flatMap(response => response.status === 'rejected' ? [String(response.reason)] : []);
-        throw new Error(reasons.length ? reasons.join('；') : `${requestBaseURL} 没有返回可用模型`);
-      }
+      const result = await agentRpc<{ models?: string[] }>('models.list', { baseURL: requestBaseURL, apiKey, apiMode: settingsDraft.apiMode, ...agentNetworkParams(settingsDraft) });
+      const models = (Array.isArray(result.models) ? result.models : []).filter(model => typeof model === 'string' && model.trim());
+      if (!models.length) throw new Error(`${requestBaseURL} 没有返回可用模型`);
       setFetchedModels(models);
       localStorage.setItem('agent-fetched-models', JSON.stringify(models));
-      setSettingsDraft(current => applyModelKeyRouting({ ...current, modelKeyMap: { ...current.modelKeyMap, ...modelKeyMap } }, current.model));
-      const failed = responses.length - successful.length;
-      setModelListMessage(`已从 ${successful.length}/${keys.length} 个 Key 获取 ${models.length} 个模型${failed ? `，${failed} 个 Key 请求失败` : ''}${settingsDraft.proxyEnabled ? `，请求已通过代理 ${settingsDraft.proxyURL}` : ''}，勾选模型即可启用。`);
+      setModelListMessage(`已获取 ${models.length} 个模型${settingsDraft.proxyEnabled ? `，请求已通过代理 ${settingsDraft.proxyURL}` : ''}，勾选模型即可启用。`);
     } catch (error) {
       setModelListMessage(`拉取模型失败（${apiModeLabel(settingsDraft.apiMode)} · ${requestBaseURL}）：${String(error)}`);
     } finally {
@@ -4828,10 +5064,8 @@ function App() {
     setModelListMessage('正在测试当前模型...');
     try {
       const selectedModel = settingsDraft.model.trim() || fallbackModels[0];
-      const orderedKeys = orderApiKeysForModel(settingsDraft, selectedModel);
       await agentRpc<{ tested: boolean; model: string }>('models.test', {
-        apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
-        apiKeys: orderedKeys,
+        apiKey: settingsDraft.apiKey.trim(),
         baseURL: requestBaseURL,
         model: selectedModel,
         apiMode: settingsDraft.apiMode,
@@ -4864,10 +5098,8 @@ function App() {
     setModelListMessage('');
     try {
       const selectedModel = settingsDraft.model.trim();
-      const orderedKeys = orderApiKeysForModel(settingsDraft, selectedModel);
       setSettingsDiagnostics(await agentRpc<DiagnosticReport>('settings.diagnose', {
-          apiKey: orderedKeys[0] || settingsDraft.apiKey.trim(),
-          apiKeys: orderedKeys,
+          apiKey: settingsDraft.apiKey.trim(),
           baseURL: requestBaseURL,
           model: selectedModel,
           apiMode: mode,
@@ -4915,7 +5147,7 @@ function App() {
     const normalized = model.trim();
     if (!normalized) return;
     setSettingsModels(current => current.includes(normalized) ? current : [...current, normalized]);
-    setSettingsDraft(current => applyModelKeyRouting(current, normalized));
+    setSettingsDraft(current => ({ ...current, model: normalized }));
   };
 
   const addCustomModel = () => {
@@ -4934,30 +5166,7 @@ function App() {
   };
 
   const updatePrimaryApiKey = (apiKey: string) => {
-    setSettingsDraft(current => {
-      const keys = Array.from(new Set([
-        apiKey.trim(),
-        ...(current.apiKeys || []).slice(1).map(key => key.trim()),
-      ].filter(Boolean)));
-      return { ...current, apiKey: keys[0] || '', apiKeys: keys };
-    });
-  };
-
-  const addApiKey = () => {
-    const key = customApiKey.trim();
-    if (!key) return;
-    setSettingsDraft(current => {
-      const keys = Array.from(new Set([...(current.apiKeys || []), key]));
-      return { ...current, apiKey: current.apiKey.trim() || keys[0], apiKeys: keys };
-    });
-    setCustomApiKey('');
-  };
-
-  const removeApiKey = (index: number) => {
-    setSettingsDraft(current => {
-      const keys = Array.from(new Set((current.apiKeys || []).filter((_, itemIndex) => itemIndex !== index).map(key => key.trim()).filter(Boolean)));
-      return { ...current, apiKey: keys[0] || '', apiKeys: keys };
-    });
+    setSettingsDraft(current => ({ ...current, apiKey: apiKey.trim() }));
   };
 
   /** Loads a profile into the editor and into every downstream call site. */
@@ -5038,17 +5247,16 @@ function App() {
     }
     const enabledModels = Array.from(new Set((settingsModels.length ? settingsModels : [settingsDraft.model || fallbackModels[0]]).map(model => model.trim()).filter(Boolean)));
     const selectedModel = enabledModels.includes(settingsDraft.model) ? settingsDraft.model : enabledModels[0];
-    const apiKeys = Array.from(new Set([settingsDraft.apiKey, ...(settingsDraft.apiKeys || [])].map(key => key.trim()).filter(Boolean)));
-    const saved = applyModelKeyRouting({
+    const apiKey = settingsDraft.apiKey.trim();
+    const saved: AgentConfig = {
       ...settingsDraft,
       serviceName: settingsDraft.serviceName.trim() || 'ApiSaver（省API）',
       baseURL: normalizedBaseURL,
-      apiKey: apiKeys[0] || '',
-      apiKeys,
+      apiKey,
       model: selectedModel,
       enabledModels,
       contextWindow: clampContextWindow(settingsDraft.contextWindow),
-    }, selectedModel);
+    };
     setAvailableModels(enabledModels);
     localStorage.setItem('agent-models', JSON.stringify(enabledModels));
     setAgentConfig(saved);
@@ -5059,10 +5267,10 @@ function App() {
     }));
     setAgentError('');
     setAgentStage('idle');
-    if (!apiKeys.length) {
+    if (!apiKey) {
       // Saving an address without a key is allowed, but every later call would
       // fail with an authentication error, so say so now.
-      setModelListMessage('已保存，但没有填写任何 API Key —— 现在调用模型一定会失败，请补齐后再写作。');
+      setModelListMessage('已保存，但没有填写 API Key —— 现在调用模型一定会失败，请补齐后再写作。');
       return;
     }
     setShowSettingsModal(false);
@@ -5475,6 +5683,11 @@ function App() {
               <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
               <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
               <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
+              <button className="editor-tool-button" title="历史版本与回滚（Ctrl/⌘ H）" disabled={!activeChapter} onClick={() => setShowChapterHistory(true)}>历史{activeChapter?.snapshots?.length ? ` ${activeChapter.snapshots.length}` : ''}</button>
+              <button className="editor-tool-button" title="通读当前章（Ctrl/⌘ P）" disabled={!activeChapter} onClick={() => setReadingMode(true)}>阅读</button>
+              <button className="editor-tool-button" title="写作统计（Ctrl/⌘ J）" onClick={() => setShowWritingStats(true)}>统计</button>
+              <button className="editor-tool-button" title="导出小说（Ctrl/⌘ E）" onClick={() => setShowExportModal(true)}>导出</button>
+              <button className="editor-tool-button" title="快捷键（Ctrl/⌘ /）" onClick={() => setShowShortcuts(true)}>?</button>
               <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}>{chapterSaving ? '保存中...' : '保存章节'}</button>
               <div className="editor-stats">
                 <span>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
@@ -5602,6 +5815,7 @@ function App() {
                     <span>字</span>
                   </div>
                   <button className="btn-add-chapter" onClick={handleAddChapter}>+ 新建章节</button>
+                  {(editingProject.deletedChapters?.length || 0) > 0 && <button className="chapter-recycle-entry" onClick={() => setShowRecycleBin(true)}>回收站 {editingProject.deletedChapters?.length}</button>}
                   <div className="chapter-jump-row">
                     <input
                       className="input"
@@ -5616,16 +5830,26 @@ function App() {
                     <button type="button" onClick={jumpToLatestChapter} disabled={!editingProject.chapters.length}>最新章</button>
                   </div>
                   <div className="chapters-list" ref={chaptersListRef}>
-                    {editingProject.chapters.map(chapter => (
+                    {editingProject.chapters.map((chapter, chapterIndex) => (
                       <div
                         key={chapter.id}
                         data-chapter-id={chapter.id}
-                        className={`chapter-item ${activeChapter?.id === chapter.id ? 'active' : ''}`}
+                        className={`chapter-item ${activeChapter?.id === chapter.id ? 'active' : ''} ${draggingChapterId === chapter.id ? 'dragging' : ''}`}
+                        draggable
+                        onDragStart={() => setDraggingChapterId(chapter.id)}
+                        onDragEnd={() => setDraggingChapterId(null)}
+                        onDragOver={event => { if (draggingChapterId !== null) event.preventDefault(); }}
+                        onDrop={event => { event.preventDefault(); void dropChapterOn(chapter.id); }}
                         onClick={() => selectChapter(chapter)}
                       >
                         <div className="chapter-copy">
                           <div className="chapter-title">{chapter.title}</div>
-                          <div className="chapter-meta">{chapter.wordCount} 字</div>
+                          <div className="chapter-meta">{chapter.wordCount} 字{chapter.snapshots?.length ? ` · ${chapter.snapshots.length} 个历史版本` : ''}</div>
+                        </div>
+                        <div className="chapter-order-buttons">
+                          <button title="上移" aria-label={`上移${chapter.title}`} disabled={chapterIndex === 0} onClick={event => { event.stopPropagation(); void moveActiveChapter(chapter.id, -1); }}>↑</button>
+                          <button title="下移" aria-label={`下移${chapter.title}`} disabled={chapterIndex === editingProject.chapters.length - 1} onClick={event => { event.stopPropagation(); void moveActiveChapter(chapter.id, 1); }}>↓</button>
+                          <button title="在此章后插入新章" aria-label={`在${chapter.title}后插入新章`} onClick={event => { event.stopPropagation(); void insertChapterBelow(chapter.id); }}>+</button>
                         </div>
                         <button
                           className="chapter-location-button"
@@ -5786,6 +6010,11 @@ function App() {
                   <div className="project-search-tabs" role="tablist" aria-label="检索方式">
                     <button className="active" type="button">关键词</button>
                     <span>覆盖章节标题与正文</span>
+                  </div>
+                  <div className="project-search-replace">
+                    <input className="input" value={replaceQuery} placeholder="全书替换为（留空则删除关键词）" onChange={event => setReplaceQuery(event.target.value)} />
+                    <button className="btn-secondary" disabled={!searchQuery.trim() || !bookSearchMatches.length} onClick={() => void replaceAllInBook()}>全书替换 {bookSearchMatches.length || ''}</button>
+                    <small>每章覆盖前自动存一条历史版本，可在“历史”里逐章回滚。</small>
                   </div>
                   {!searchQuery.trim() ? <div className="project-search-empty"><b>⌕</b><strong>输入关键词后按回车搜索</strong><span>可检索人物、事件、地点、线索与伏笔。</span></div>
                     : bookSearchResults.length ? <div className="project-search-results">
@@ -5983,7 +6212,7 @@ function App() {
                 <select
                   className="agent-model-select"
                   value={agentConfig.model}
-                  onChange={(event) => setAgentConfig(current => applyModelKeyRouting(current, event.target.value))}
+                  onChange={(event) => setAgentConfig(current => ({ ...current, model: event.target.value }))}
                   aria-label="选择写作模型"
                 >
                   {Array.from(new Set([agentConfig.model, ...availableModels])).filter(Boolean).map(model => <option key={model} value={model}>{model}</option>)}
@@ -6357,6 +6586,7 @@ function App() {
             <div className="settings-layout">
               <nav className="settings-sidebar" aria-label="设置分类">
                 <button className={settingsSection === 'model' ? 'active' : ''} onClick={() => setSettingsSection('model')}><strong>AI 模型配置</strong><small>服务、接口、密钥与模型参数</small></button>
+                <button className={settingsSection === 'appearance' ? 'active' : ''} onClick={() => setSettingsSection('appearance')}><strong>正文外观</strong><small>字体、字号、行距与纸张模式</small></button>
                 <button className={settingsSection === 'network' ? 'active' : ''} onClick={() => setSettingsSection('network')}><strong>网络设置</strong><small>代理连接与本地地址规则</small></button>
                 <button className={settingsSection === 'usage' ? 'active' : ''} onClick={() => setSettingsSection('usage')}><strong>API 用量</strong><small>余额、模型价格与个人日志</small></button>
                 <button className={settingsSection === 'sync' ? 'active' : ''} onClick={() => setSettingsSection('sync')}><strong>备份与同步</strong><small>百度网盘与 GitHub 仓库</small></button>
@@ -6385,7 +6615,7 @@ function App() {
                   >
                     <div className="settings-profile-item-main">
                       <strong>{profile.serviceName}{profile.id === activeProfileId && <em>使用中</em>}</strong>
-                      <small>{apiModeLabel(profile.apiMode)} · {profile.model || '未选择模型'} · {(profile.apiKeys || []).filter(Boolean).length} 个 Key</small>
+                      <small>{apiModeLabel(profile.apiMode)} · {profile.model || '未选择模型'} · {profile.apiKey.trim() ? `Key ${profile.apiKey.slice(0, 4)}••••${profile.apiKey.slice(-4)}` : '未填 Key'}</small>
                       <code>{resolvedEndpoint(profile) || profile.baseURL}</code>
                     </div>
                     <div className="settings-profile-item-actions">
@@ -6440,10 +6670,9 @@ function App() {
                     </small>
                   </div>
                   <div className="form-group">
-                    <label>API 密钥 <small>{(settingsDraft.apiKeys || []).filter(Boolean).length} 个</small></label>
-                    <input className="input" type="password" value={settingsDraft.apiKey} placeholder="请输入主 API Key" onChange={(event) => updatePrimaryApiKey(event.target.value)} />
-                    {(settingsDraft.apiKeys || []).length > 1 && <div className="settings-key-tags">{settingsDraft.apiKeys.map((key, index) => <span key={`${key}-${index}`} className={index === 0 ? 'active' : ''}>Key {index + 1} · {key.slice(0, 4)}••••{key.slice(-4)}<button aria-label={`移除 Key ${index + 1}`} onClick={() => removeApiKey(index)}>×</button></span>)}</div>}
-                    <div className="model-add-row"><input className="input" type="password" value={customApiKey} placeholder="添加备用供应商 Key" onChange={(event) => setCustomApiKey(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addApiKey(); } }} /><button className="btn-secondary" onClick={addApiKey}>添加 Key</button></div>
+                    <label>API 密钥</label>
+                    <input className="input" type="password" value={settingsDraft.apiKey} placeholder="请输入 API Key" onChange={(event) => updatePrimaryApiKey(event.target.value)} />
+                    <small className="settings-endpoint-hint">一个配置只对应一个 Key。需要多个供应商或多个分组时，在上方“+ 新增配置”建多个配置并随时切换。</small>
                   </div>
                   <div className="form-group model-management">
                     <label>模型标签 <small>可多选 · 当前模型：{settingsDraft.model || '未选择'}</small></label>
@@ -6510,6 +6739,39 @@ function App() {
                 </div>}
               </section>
               </>}
+              {settingsSection === 'appearance' && <section className="settings-appearance-panel">
+                <div className="settings-network-header"><div><strong>正文外观</strong><small>影响章节编辑器、大纲/卡片、小说预览与 Agent 对话</small></div></div>
+                <div className="appearance-font-grid">
+                  {readerFonts.map(font => <button
+                    type="button"
+                    key={font.id}
+                    className={`appearance-font-card ${appearance.fontId === font.id ? 'active' : ''}`}
+                    onClick={() => setAppearance({ ...appearance, fontId: font.id })}
+                  >
+                    <b style={{ fontFamily: font.stack || undefined }}>{font.label}</b>
+                    <span style={{ fontFamily: font.stack || undefined }}>天下风云出我辈</span>
+                    <small>{font.hint}</small>
+                  </button>)}
+                </div>
+                {appearance.fontId === 'custom' && <label className="appearance-field">字体名称
+                  <input className="input" value={appearance.customFont} placeholder="例如：方正书宋、汉仪Typo宋" onChange={event => setAppearance({ ...appearance, customFont: event.target.value })} />
+                  <small>需要本机已安装该字体；找不到时自动回退到书籍宋体。</small>
+                </label>}
+                <div className="appearance-slider-row">
+                  <label>字号 <b>{appearance.fontSize}px</b>
+                    <input type="range" min="12" max="30" step="1" value={appearance.fontSize} onChange={event => setAppearance({ ...appearance, fontSize: Number(event.target.value) })} />
+                  </label>
+                  <label>行距 <b>{appearance.lineHeight.toFixed(1)}</b>
+                    <input type="range" min="1.2" max="2.6" step="0.1" value={appearance.lineHeight} onChange={event => setAppearance({ ...appearance, lineHeight: Number(event.target.value) })} />
+                  </label>
+                </div>
+                <label className="settings-network-check"><input type="checkbox" checked={appearance.paperMode} onChange={event => setAppearance({ ...appearance, paperMode: event.target.checked })} /> 纸张模式（正文区换成米白底色、深色字，白天写作更柔和）</label>
+                <div className={`appearance-preview ${appearance.paperMode ? 'paper' : ''}`}>
+                  <strong>第 一百三十二 章　剑落长安</strong>
+                  <p>雨水沿着马面汇成细流，他抽剑的手卡了一下。三年了，这帮人终于又找上门来。“你应该知道我为何而来。”对面的人开口，声音比雨还冷。</p>
+                </div>
+                <small className="settings-network-note">只使用本机已装字体，不下载 Web Font，离线可用。设置保存在本机，不随备份同步。</small>
+              </section>}
               {settingsSection === 'network' && <section className="settings-network-card settings-network-panel">
                 <div className="settings-network-header"><div><strong>网络设置</strong><small>为模型请求配置代理连接</small></div><label className="settings-toggle" title="启用网络代理"><input type="checkbox" checked={settingsDraft.proxyEnabled} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyEnabled: event.target.checked })} /><span /></label></div>
                 <div className="settings-network-address"><input className="input" value={settingsDraft.proxyURL} disabled={!settingsDraft.proxyEnabled} placeholder="http://127.0.0.1:7897" onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyURL: event.target.value })} /><button className="btn-secondary" onClick={useSystemProxy}>读取系统代理</button></div>
@@ -6547,6 +6809,11 @@ function App() {
               {settingsSection === 'usage' && !isDefaultApiService(settingsDraft) && <section className="usage-dashboard"><p className="empty-hint">自定义接口可使用本机 Token 统计，但不提供 ApiSaver 中转站余额、价格和日志查询。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
               {settingsSection === 'sync' && <>
                 <section className="settings-sync-card">
+                  <div className="settings-network-header"><div><strong>本地备份包</strong><small>不需要百度网盘或 GitHub 账号，直接写到本机下载目录</small></div><span className="settings-sync-badge">离线</span></div>
+                  <div className="settings-sync-actions"><button className="btn-primary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void exportBackupBundle()}>{cloudSyncRunning ? '处理中...' : '导出备份包到本地'}</button><button className="btn-secondary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void loadLocalBackups()}>从本地备份包恢复</button></div>
+                  <p className="settings-network-note">备份包格式与云端完全一致，两边可以互相恢复。文件保存在下载目录的“ApiSaverWriter 导出”文件夹，可自行拷到移动硬盘或其他网盘。恢复会替换本地对应数据并重新载入，建议先导出一份当前备份。</p>
+                </section>
+                <section className="settings-sync-card">
                   <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
                   <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
                   <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void loadCloudBackups()}>选择备份恢复</button></div>
@@ -6577,6 +6844,28 @@ function App() {
         </div>
       )}
 
+
+      {/* 本地备份包选择 */}
+      {showLocalBackupPicker && (
+        <div className="modal-overlay" onClick={() => setShowLocalBackupPicker(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="local-backup-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <div><h3 id="local-backup-title">选择本地备份</h3><small className="cloud-backup-picker-subtitle">{localBackups.directory}</small></div>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowLocalBackupPicker(false)}>×</button>
+            </div>
+            <div className="modal-body history-body">
+              {!localBackups.files.length ? <p className="empty-hint">导出目录里还没有 .aswbackup 备份包。先点“导出备份包到本地”生成一份。</p>
+                : <>
+                  <p className="empty-hint">恢复会覆盖本机对应的小说、书籍、拆书、扇榜、文风、技能、记忆和设置，完成后自动重新载入。</p>
+                  {localBackups.files.map(file => <article className="history-entry" key={file.name}>
+                    <div><strong>{file.name}</strong><small>{new Date(file.modifiedAt * 1000).toLocaleString('zh-CN', { hour12: false })} · {(file.size / 1_048_576).toFixed(1)} MB</small></div>
+                    <button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void restoreFromLocalBundle(file.name)}>恢复这个备份</button>
+                  </article>)}
+                </>}
+            </div>
+          </div>
+        </div>
+      )}
 
       {showCloudBackupPicker && (
         <div className="modal-overlay cloud-backup-picker-overlay" onClick={() => setShowCloudBackupPicker(false)}>
@@ -6812,7 +7101,7 @@ function App() {
             </div>
             <div className="modal-body">
               <p>确定删除《{chapterPendingDeletion.title}》吗？当前 {chapterPendingDeletion.wordCount.toLocaleString()} 字。</p>
-              <p className="delete-warning">正文、本章节记忆和图谱关系会一并清理；绑定的章纲会保留但解除关联。此操作不可撤销。</p>
+              <p className="delete-warning">正文会进回收站，可以恢复；本章节记忆和图谱关系会清理，恢复后需重新生成；绑定的章纲保留但解除关联。</p>
             </div>
             <div className="modal-footer">
               <button className="btn-secondary" onClick={() => setChapterPendingDeletion(null)}>取消</button>
@@ -6831,13 +7120,158 @@ function App() {
             </div>
             <div className="modal-body">
               <p>确定删除《{projectPendingDeletion.title}》吗？</p>
-              <p className="delete-warning">小说中的章节、大纲和本地保存内容都会被移除，此操作不可撤销。</p>
+              <p className="delete-warning">小说中的章节、大纲和本地保存内容都会被移除，此操作不可撤销。建议先在“设置 - 备份与同步”导出一份本地备份包。</p>
             </div>
             <div className="modal-footer">
               <button className="btn-secondary" onClick={() => setProjectPendingDeletion(null)}>取消</button>
               <button className="btn-danger" onClick={handleDeleteProject}>确认删除</button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* 导出小说：全书或当前章，TXT / Markdown */}
+      {showExportModal && editingProject && (
+        <div className="modal-overlay" onClick={() => setShowExportModal(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="export-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="export-title">导出小说</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowExportModal(false)}>×</button>
+            </div>
+            <div className="modal-body export-body">
+              <div className="export-option-row" role="radiogroup" aria-label="导出范围">
+                <button className={exportScope === 'book' ? 'active' : ''} onClick={() => setExportScope('book')}><strong>全书</strong><small>{editingProject.chapters.length} 章 · {editingProject.wordCount.toLocaleString()} 字</small></button>
+                <button className={exportScope === 'chapter' ? 'active' : ''} disabled={!activeChapter} onClick={() => setExportScope('chapter')}><strong>当前章</strong><small>{activeChapter ? `${activeChapter.title} · ${activeChapter.wordCount.toLocaleString()} 字` : '未选中章节'}</small></button>
+              </div>
+              <div className="export-option-row" role="radiogroup" aria-label="导出格式">
+                <button className={exportOptions.format === 'txt' ? 'active' : ''} onClick={() => setExportOptions({ ...exportOptions, format: 'txt' })}><strong>TXT</strong><small>纯文本，可直接往网文网站粘贴</small></button>
+                <button className={exportOptions.format === 'md' ? 'active' : ''} onClick={() => setExportOptions({ ...exportOptions, format: 'md' })}><strong>Markdown</strong><small>带标题层级，适合归档与版本管理</small></button>
+              </div>
+              {exportScope === 'book' && <div className="export-check-row">
+                <label><input type="checkbox" checked={exportOptions.includeOutlines} onChange={event => setExportOptions({ ...exportOptions, includeOutlines: event.target.checked })} /> 附上大纲与世界观设定（{editingProject.outlines.length} 篇）</label>
+                <label><input type="checkbox" checked={exportOptions.includeCards} onChange={event => setExportOptions({ ...exportOptions, includeCards: event.target.checked })} /> 附上设定卡片（{editingProject.cards.length} 张）</label>
+              </div>}
+              <small className="settings-network-note">文件写入系统下载目录的“ApiSaverWriter 导出”文件夹，完成后自动在文件管理器中选中。</small>
+            </div>
+            <div className="modal-footer">
+              <button className="btn-secondary" onClick={() => setShowExportModal(false)}>取消</button>
+              <button className="btn-primary" disabled={exportRunning} onClick={() => void exportCurrentTarget()}>{exportRunning ? '导出中...' : '开始导出'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 章节历史版本：AI 覆写、全书替换前的正文快照 */}
+      {showChapterHistory && activeChapter && (
+        <div className="modal-overlay" onClick={() => setShowChapterHistory(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="history-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="history-title">历史版本·{activeChapter.title}</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowChapterHistory(false)}>×</button>
+            </div>
+            <div className="modal-body history-body">
+              {!activeChapter.snapshots?.length ? <p className="empty-hint">本章还没有历史版本。AI 润色、去 AI 味、续写、Agent 修订和全书替换覆盖正文前，都会自动存一条。</p> : <>
+                <p className="empty-hint">每章最多保留 {chapterSnapshotLimit} 条，最新在前。回滚时当前正文会存为新快照，所以回滚可以再回滚。</p>
+                {activeChapter.snapshots.map(snapshot => <article className="history-entry" key={snapshot.savedAt}>
+                  <div><strong>{snapshot.reason}</strong><small>{new Date(snapshot.savedAt).toLocaleString('zh-CN', { hour12: false })} · {snapshot.wordCount.toLocaleString()} 字</small></div>
+                  <pre>{snapshot.content.slice(0, 400)}{snapshot.content.length > 400 ? '…' : ''}</pre>
+                  <button className="btn-secondary" onClick={() => void rollbackChapterSnapshot(snapshot.savedAt)}>恢复这个版本</button>
+                </article>)}
+              </>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 章节回收站 */}
+      {showRecycleBin && editingProject && (
+        <div className="modal-overlay" onClick={() => setShowRecycleBin(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="recycle-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="recycle-title">章节回收站</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowRecycleBin(false)}>×</button>
+            </div>
+            <div className="modal-body history-body">
+              {!editingProject.deletedChapters?.length ? <p className="empty-hint">回收站是空的。</p> : <>
+                <p className="empty-hint">最多保留最近删除的 20 章。恢复后章节记忆、图谱关系需要重新生成。</p>
+                {editingProject.deletedChapters.map(entry => <article className="history-entry" key={entry.chapter.id}>
+                  <div><strong>{entry.chapter.title}</strong><small>删除于 {new Date(entry.deletedAt).toLocaleString('zh-CN', { hour12: false })} · {entry.chapter.wordCount.toLocaleString()} 字</small></div>
+                  <pre>{entry.chapter.content.slice(0, 300) || '（空章节）'}{entry.chapter.content.length > 300 ? '…' : ''}</pre>
+                  <div className="history-entry-actions">
+                    <button className="btn-primary" onClick={() => void restoreChapterFromBin(entry.chapter.id)}>恢复</button>
+                    <button className="link-button danger-link" onClick={() => void purgeChapterFromBin(entry.chapter.id)}>彻底删除</button>
+                  </div>
+                </article>)}
+              </>}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 写作统计：作者视角的日更数据，不是 token 账单 */}
+      {showWritingStats && editingProject && (
+        <div className="modal-overlay" onClick={() => setShowWritingStats(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="stats-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="stats-title">写作统计</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowWritingStats(false)}>×</button>
+            </div>
+            <div className="modal-body stats-body">
+              <div className="stats-cards">
+                <div><span>今日码字</span><strong>{(editingProject.dailyWords?.[todayKey()] || 0).toLocaleString()}</strong></div>
+                <div><span>连续更新</span><strong>{writingStreak(editingProject.dailyWords)} 天</strong></div>
+                <div><span>全书字数</span><strong>{editingProject.wordCount.toLocaleString()}</strong></div>
+                <div><span>平均每章</span><strong>{editingProject.chapters.length ? Math.round(editingProject.wordCount / editingProject.chapters.length).toLocaleString() : 0}</strong></div>
+              </div>
+              <h4>最近 14 天</h4>
+              {(() => {
+                const days = Array.from({ length: 14 }, (_, offset) => ({ key: dayKeyOffset(13 - offset), words: editingProject.dailyWords?.[dayKeyOffset(13 - offset)] || 0 }));
+                const peak = Math.max(1, ...days.map(day => day.words));
+                return <div className="stats-chart">{days.map(day => <div key={day.key} title={`${day.key}：${day.words.toLocaleString()} 字`}>
+                  <i style={{ height: `${Math.round((day.words / peak) * 100)}%` }} />
+                  <small>{day.key.slice(5)}</small>
+                </div>)}</div>;
+              })()}
+              <small className="settings-network-note">日更只累加正增量，删改不从当日成绩里扣除。统计从本版本开始记录，旧章节不回溯。</small>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 快捷键说明 */}
+      {showShortcuts && (
+        <div className="modal-overlay" onClick={() => setShowShortcuts(false)}>
+          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" onClick={event => event.stopPropagation()}>
+            <div className="modal-header">
+              <h3 id="shortcuts-title">快捷键</h3>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowShortcuts(false)}>×</button>
+            </div>
+            <div className="modal-body shortcut-body">
+              {[
+                ['Ctrl / ⌘ S', '保存当前章节'],
+                ['Ctrl / ⌘ F', '本章搜索；在全书检索页再按切回'],
+                ['Ctrl / ⌘ E', '导出小说'],
+                ['Ctrl / ⌘ H', '当前章历史版本'],
+                ['Ctrl / ⌘ J', '写作统计'],
+                ['Ctrl / ⌘ P', '阅读模式'],
+                ['Ctrl / ⌘ /', '打开或关闭本面板'],
+                ['Alt ↑ / ↓', '切到上一章 / 下一章'],
+                ['Ctrl / ⌘ Enter', '在项目 Agent 输入框发送'],
+                ['Esc', '退出阅读模式'],
+              ].map(([keys, description]) => <div className="shortcut-row" key={keys}><kbd>{keys}</kbd><span>{description}</span></div>)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 阅读模式：只读通读，排版与正文外观设置一致 */}
+      {readingMode && activeChapter && (
+        <div className="reading-overlay" role="dialog" aria-modal="true" aria-label={`阅读 ${activeChapter.title}`}>
+          <header>
+            <div><strong>{activeChapter.title}</strong><small>{activeChapter.wordCount.toLocaleString()} 字</small></div>
+            <button className="editor-tool-button" onClick={() => setReadingMode(false)}>退出阅读（Esc）</button>
+          </header>
+          <article>{activeChapter.content.split(/\n+/u).filter(Boolean).map((paragraph, index) => <p key={`${index}-${paragraph.slice(0, 12)}`}>{paragraph}</p>)}</article>
         </div>
       )}
 

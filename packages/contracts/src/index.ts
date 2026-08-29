@@ -5,8 +5,8 @@ import { z } from "zod";
  * 这是全仓库唯一一份模型参数定义：字段名、类型和 TS 类型都从这里派生
  */
 export const modelParamsSchema = z.object({
+  // 每个配置只有一个 Key：多 Key 轮换曾让重试悄悄换到无权限的 Key，报成 403
   apiKey: z.string().optional(),
-  apiKeys: z.array(z.string()).optional(),
   baseURL: z.string().optional(),
   model: z.string().optional(),
   apiMode: z.enum(["openai", "anthropic", "responses"]).optional(),

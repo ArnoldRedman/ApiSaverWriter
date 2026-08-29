@@ -94,6 +94,10 @@ try {
 
     Stop-WorkspaceProcesses
 
+    Write-Step '安装工作区依赖'
+    Invoke-Checked $npmCommand @('install')
+    Invoke-Checked $npmCommand @('install', '--prefix', 'desktop-app')
+
     if ($SkipTests) {
         Write-Host '已跳过测试（-SkipTests）' -ForegroundColor Yellow
     } else {

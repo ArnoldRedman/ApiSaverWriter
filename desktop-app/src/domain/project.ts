@@ -1,6 +1,14 @@
 export type TagTab = '主分类' | '主题' | '角色' | '情节';
 export type Channel = '男频' | '女频';
 
+export interface ChapterSnapshot {
+  content: string;
+  wordCount: number;
+  savedAt: string;
+  /** 产生快照的原因，例如“AI 润色”、“去 AI 味” */
+  reason: string;
+}
+
 export interface Chapter {
   id: number;
   title: string;
@@ -8,6 +16,8 @@ export interface Chapter {
   wordCount: number;
   createdAt: string;
   updatedAt: string;
+  /** 覆盖正文前的历史版本，最新在前 */
+  snapshots?: ChapterSnapshot[];
 }
 
 export interface OutlineNode {
@@ -160,4 +170,17 @@ export interface Project {
   sourceDismantleBookId?: string;
   authorPreferences?: string[];
   githubRepositoryUrl?: string;
+  /** 每日码字量，键为本地日期 YYYY-MM-DD */
+  dailyWords?: Record<string, number>;
+  /** 回收站：删除的章节，最新在前 */
+  deletedChapters?: DeletedChapter[];
+  /** 小说本身被删除的时间；有值时列表不展示，但本地文件仍保留 */
+  deletedAt?: string;
+}
+
+export interface DeletedChapter {
+  chapter: Chapter;
+  /** 删除前的下标，恢复时尽量插回原位 */
+  index: number;
+  deletedAt: string;
 }

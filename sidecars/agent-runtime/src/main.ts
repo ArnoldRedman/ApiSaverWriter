@@ -18,7 +18,7 @@ import type { RpcResponse } from "@apisaverwriter/contracts";
 async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse> {
   try {
     if (req.method === "memory.write") {
-      const { projectTitle, chapterTitle, content, cards, knowledgeGraph, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, chapterTitle, content, cards, knowledgeGraph, apiKey, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!chapterTitle || !content || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
@@ -111,7 +111,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       return { id: req.id, result: { ...memoryResult, contextReport } };
     }
     if (req.method === "project.agent.chat") {
-      const { mode, instruction, project, history, activeChapterId, sessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { mode, instruction, project, history, activeChapterId, sessionId, apiKey, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!apiKey || !instruction || !project || typeof project !== "object") {
         return { id: req.id, error: { code: -32602, message: "缺少项目 Agent 所需的小说、指令或模型配置" } };
       }
@@ -294,7 +294,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       return { id: req.id, result };
     }
     if (req.method === "card.write") {
-      const { projectTitle, synopsis, cardType, cardTitle, existingContent, instruction, chapterTitle, chapterContent, outlines, cards, sessionId, previousSessionId, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, synopsis, cardType, cardTitle, existingContent, instruction, chapterTitle, chapterContent, outlines, cards, sessionId, previousSessionId, apiKey, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !cardType || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "缺少生成卡片所需参数" } };
       }
@@ -353,7 +353,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       }
     }
     if (req.method === "outline.write") {
-      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, apiKey, apiKeys, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
+      const { projectTitle, kind, existingContent, instruction, synopsis, cards, knowledgeGraph, worldSetting, skills, preferredSkillNames, sessionId, previousSessionId, outlineId, targetChapter, sourceChapter, formatOutline, apiKey, baseURL, model, apiMode, reasoningMode, contextWindow } = req.params ?? {};
       if (!projectTitle || !kind || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
@@ -480,7 +480,6 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         authorPreferences,
         preferredSkillNames,
         apiKey,
-        apiKeys,
         baseURL,
         model,
         apiMode,
@@ -606,7 +605,6 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         const graph = createChapterGraph({
           store,
           apiKey: String(apiKey),
-          apiKeys: stringList(apiKeys, 12),
           baseURL: String(baseURL || "https://api.apisaver.com/v1"),
           model: String(model || "gpt-4o-mini"),
           apiMode: normalizeWireMode(apiMode),

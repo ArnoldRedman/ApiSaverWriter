@@ -25,7 +25,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 mod runtime;
 
@@ -442,6 +442,130 @@ fn validate_agent_chat_id(value: &str, label: &str) -> Result<String, String> {
         return Err(format!("{label}格式无效"));
     }
     Ok(trimmed.to_string())
+}
+
+/// 导出目标目录：优先系统下载目录，其次文档目录，最后回退应用数据目录。
+/// ponytail: 固定写入下载目录并「打开位置」，不引入文件选择器插件；需要任意路径时再加 tauri-plugin-dialog
+fn export_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let target = app
+        .path()
+        .download_dir()
+        .or_else(|_| app.path().document_dir())
+        .or_else(|_| app_data_directory(app))
+        .map_err(|error| format!("无法确定导出目录: {error}"))?
+        .join("ApiSaverWriter 导出");
+    fs::create_dir_all(&target).map_err(|error| format!("创建导出目录失败: {error}"))?;
+    Ok(target)
+}
+
+/// 校验前端传入的文件名，禁止路径穿越和目录分隔符。
+fn validate_export_file_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 200 {
+        return Err("导出文件名长度无效".to_string());
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..") {
+        return Err("导出文件名包含非法路径字符".to_string());
+    }
+    if !matches!(Path::new(trimmed).extension().and_then(|value| value.to_str()), Some("txt" | "md")) {
+        return Err("导出只支持 .txt 与 .md".to_string());
+    }
+    Ok(safe_file_name(trimmed))
+}
+
+/// 把正文导出为本地 txt/md 文件，写入后在文件管理器中选中。
+#[tauri::command]
+fn export_text_file(app: tauri::AppHandle, file_name: String, content: String) -> Result<String, String> {
+    let file_name = validate_export_file_name(&file_name)?;
+    let path = export_directory(&app)?.join(&file_name);
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, content.as_bytes()).map_err(|error| format!("写入导出文件失败: {error}"))?;
+    fs::rename(&temporary, &path).map_err(|error| format!("保存导出文件失败: {error}"))?;
+    reveal_location(&path).ok();
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// 把完整备份包导出到本地，不经过任何云服务。复用云备份的打包逻辑，格式与云端一致，可直接用于恢复。
+#[tauri::command]
+fn export_backup_bundle(app: tauri::AppHandle, client_state: Value) -> Result<Value, String> {
+    let app_data = app_data_directory(&app)?;
+    let export_root = create_cloud_export(&app_data, &client_state)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("读取系统时间失败: {error}"))?
+        .as_secs();
+    let bundle_path = export_directory(&app)?.join(format!("ApiSaverWriter-{stamp}.aswbackup"));
+    let size = write_cloud_backup_bundle(&export_root, &bundle_path);
+    fs::remove_dir_all(&export_root).ok();
+    let size = size?;
+    reveal_location(&bundle_path).ok();
+    Ok(serde_json::json!({ "path": bundle_path.to_string_lossy(), "size": size }))
+}
+
+/// 列出导出目录里的本地备份包，供恢复时选择。
+#[tauri::command]
+fn list_local_backups(app: tauri::AppHandle) -> Result<Value, String> {
+    let directory = export_directory(&app)?;
+    let mut files = Vec::new();
+    if let Ok(entries) = fs::read_dir(&directory) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("aswbackup") {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs())
+                .unwrap_or(0);
+            files.push(serde_json::json!({
+                "name": path.file_name().unwrap_or_default().to_string_lossy(),
+                "size": metadata.len(),
+                "modifiedAt": modified,
+            }));
+        }
+    }
+    files.sort_by(|left, right| right["modifiedAt"].as_u64().cmp(&left["modifiedAt"].as_u64()));
+    Ok(serde_json::json!({ "directory": directory.to_string_lossy(), "files": files }))
+}
+
+/// 从本地备份包恢复，与云端恢复共用解包与替换逻辑。只接受导出目录内的文件名，避免任意路径读取。
+#[tauri::command]
+fn restore_backup_bundle(app: tauri::AppHandle, file_name: String) -> Result<Value, String> {
+    let trimmed = file_name.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 200
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains("..")
+        || Path::new(trimmed).extension().and_then(|value| value.to_str()) != Some("aswbackup")
+    {
+        return Err("备份文件名无效".to_string());
+    }
+    let bundle = export_directory(&app)?.join(safe_file_name(trimmed));
+    if !bundle.is_file() {
+        return Err("找不到所选备份包文件".to_string());
+    }
+    let app_data = app_data_directory(&app)?;
+    let restore_root = app_data.join(".local-restore");
+    if restore_root.exists() {
+        fs::remove_dir_all(&restore_root).map_err(|error| format!("清理上次恢复缓存失败: {error}"))?;
+    }
+    let export_root = restore_root.join("cloud-export");
+    extract_cloud_backup_bundle(&bundle, &export_root)?;
+    let client_state: Value = serde_json::from_str(
+        &fs::read_to_string(export_root.join("client-state.json"))
+            .map_err(|error| format!("读取备份内设置失败: {error}"))?,
+    )
+    .map_err(|error| format!("备份内设置格式错误: {error}"))?;
+    replace_cloud_data(&app_data, &export_root)?;
+    fs::remove_dir_all(&restore_root).ok();
+    Ok(serde_json::json!({ "reloaded": true, "clientState": client_state }))
 }
 
 #[tauri::command]
@@ -896,6 +1020,10 @@ pub fn run() {
             load_writing_styles,
             save_writing_styles,
             projects_storage_path,
+            export_text_file,
+            export_backup_bundle,
+            list_local_backups,
+            restore_backup_bundle,
             open_project_location,
             open_dismantle_location,
             delete_dismantle_book,
