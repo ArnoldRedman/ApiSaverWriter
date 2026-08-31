@@ -1,8 +1,17 @@
 // 正文外观：字体、字号、行距与纸张模式。
 // 只用系统已装字体，不引入 Web Font，保持离线可用。
 export type ReaderFontId = 'system' | 'serif' | 'mono' | 'kai' | 'hei' | 'custom';
+/** 书页（浅）与墨夜（深），auto 跟随系统 */
+export type ThemeId = 'paper' | 'ink' | 'auto';
+
+export const themes: Array<{ id: ThemeId; label: string; hint: string }> = [
+  { id: 'paper', label: '书页', hint: '书页黄与雪白底，墨色字，白天写作' },
+  { id: 'ink', label: '墨夜', hint: '暖墨底色，夜里长时间写作不刺眼' },
+  { id: 'auto', label: '跟随系统', hint: '按系统的浅色/深色偏好自动切换' },
+];
 
 export interface Appearance {
+  themeId: ThemeId;
   fontId: ReaderFontId;
   /** fontId 为 custom 时使用，可填任意已安装字体名 */
   customFont: string;
@@ -24,6 +33,7 @@ export const readerFonts: Array<{ id: ReaderFontId; label: string; hint: string;
 export const appearanceStorageKey = 'writer-appearance';
 
 export const defaultAppearance: Appearance = {
+  themeId: 'paper',
   fontId: 'serif',
   customFont: '',
   fontSize: 16,
@@ -44,7 +54,9 @@ export function readerFontStack(appearance: Appearance): string {
 export function normalizeAppearance(value: unknown): Appearance {
   const raw = (value && typeof value === 'object' ? value : {}) as Partial<Appearance>;
   const fontId = readerFonts.some(font => font.id === raw.fontId) ? raw.fontId as ReaderFontId : defaultAppearance.fontId;
+  const themeId = themes.some(theme => theme.id === raw.themeId) ? raw.themeId as ThemeId : defaultAppearance.themeId;
   return {
+    themeId,
     fontId,
     customFont: typeof raw.customFont === 'string' ? raw.customFont.slice(0, 60) : '',
     fontSize: clamp(Number(raw.fontSize) || defaultAppearance.fontSize, 12, 30),
@@ -61,12 +73,29 @@ export function loadAppearance(): Appearance {
   }
 }
 
-/** 写入 :root 自定义属性，正文与预览区的 CSS 直接读取这几个变量 */
+/** auto 时读系统偏好；拿不到 matchMedia 的环境按书页处理 */
+export function resolvedTheme(themeId: ThemeId): 'paper' | 'ink' {
+  if (themeId !== 'auto') return themeId;
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'ink' : 'paper';
+  } catch {
+    return 'paper';
+  }
+}
+
+/** 写入 :root 自定义属性与主题标记，CSS 直接读取这几个变量 */
 export function applyAppearance(appearance: Appearance): void {
   const root = document.documentElement;
   root.style.setProperty('--reader-font', readerFontStack(appearance));
   root.style.setProperty('--reader-size', `${appearance.fontSize}px`);
   root.style.setProperty('--reader-line', String(appearance.lineHeight));
+  // 只有墨夜需要标记，书页是 :root 的默认取值
+  if (resolvedTheme(appearance.themeId) === 'ink') {
+    root.setAttribute('data-theme', 'dark');
+  } else {
+    root.removeAttribute('data-theme');
+  }
+  root.style.colorScheme = resolvedTheme(appearance.themeId) === 'ink' ? 'dark' : 'light';
   document.body.classList.toggle('paper-editor', appearance.paperMode);
 }
 

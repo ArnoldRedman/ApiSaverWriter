@@ -13,7 +13,7 @@ import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, 
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
-import { readerFonts, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
+import { readerFonts, themes, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
 import { sidebarWidthKey, sidebarTabsHeightKey, clampSidebarWidth, clampSidebarTabsHeight } from './features/editor/layout';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
@@ -1320,6 +1320,12 @@ function App() {
   useEffect(() => {
     applyAppearance(appearance);
     localStorage.setItem(appearanceStorageKey, JSON.stringify(appearance));
+    // 跟随系统时，用户在系统里切换浅深主题要立刻反映到界面
+    if (appearance.themeId !== 'auto') return;
+    const query = window.matchMedia('(prefers-color-scheme: dark)');
+    const sync = () => applyAppearance(appearance);
+    query.addEventListener('change', sync);
+    return () => query.removeEventListener('change', sync);
   }, [appearance]);
   const [cloudRemotePath, setCloudRemotePath] = useState(() => {
     // 老版本存过两种旧路径；沿用旧目录才能继续看到已经上传的备份
@@ -6816,6 +6822,19 @@ function App() {
               </section>
               </>}
               {settingsSection === 'appearance' && <section className="settings-appearance-panel">
+                <div className="settings-network-header"><div><strong>界面主题</strong><small>影响整个应用的底色、文字与强调色</small></div></div>
+                <div className="appearance-theme-grid">
+                  {themes.map(theme => <button
+                    type="button"
+                    key={theme.id}
+                    className={`appearance-theme-option ${appearance.themeId === theme.id ? 'active' : ''}`}
+                    onClick={() => setAppearance({ ...appearance, themeId: theme.id })}
+                  >
+                    <span className={`appearance-theme-swatch ${theme.id}`} aria-hidden="true" />
+                    <strong>{theme.label}</strong>
+                    <small>{theme.hint}</small>
+                  </button>)}
+                </div>
                 <div className="settings-network-header"><div><strong>正文外观</strong><small>影响章节编辑器、大纲/卡片、小说预览与 Agent 对话</small></div></div>
                 <div className="appearance-font-grid">
                   {readerFonts.map(font => <button
