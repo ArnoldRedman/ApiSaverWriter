@@ -15,6 +15,7 @@ import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgent
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import { readerFonts, themes, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
 import { sidebarWidthKey, sidebarTabsHeightKey, clampSidebarWidth, clampSidebarTabsHeight } from './features/editor/layout';
+import { PlumBranch } from './features/editor/plum-branch';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
@@ -5714,6 +5715,7 @@ function App() {
         <p>{deviceStorageReady ? '正在载入本地写作资料…' : '正在启动本地数据服务…'}</p>
         <span className="startup-spinner" aria-hidden="true" />
         <small>首次启动可能需要几秒，请稍候</small>
+        <PlumBranch size="lg" />
       </div>
     );
   }
@@ -6098,7 +6100,7 @@ function App() {
                     <button className="btn-secondary" disabled={!searchQuery.trim() || !bookSearchMatches.length} onClick={() => void replaceAllInBook()}>全书替换 {bookSearchMatches.length || ''}</button>
                     <small>每章覆盖前自动存一条历史版本，可在“历史”里逐章回滚。</small>
                   </div>
-                  {!searchQuery.trim() ? <div className="project-search-empty"><b>⌕</b><strong>输入关键词后按回车搜索</strong><span>可检索人物、事件、地点、线索与伏笔。</span></div>
+                  {!searchQuery.trim() ? <div className="project-search-empty"><b>⌕</b><strong>输入关键词后按回车搜索</strong><span>可检索人物、事件、地点、线索与伏笔。</span><PlumBranch /></div>
                     : bookSearchResults.length ? <div className="project-search-results">
                       <div className="project-search-summary"><strong>找到 {bookSearchMatches.length} 处匹配</strong><span>分布在 {bookSearchResults.length} 个章节</span><div><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex - 1)} disabled={!bookSearchMatches.length}>上一个</button><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex + 1)} disabled={!bookSearchMatches.length}>下一个</button></div></div>
                       {bookSearchResults.map(({ chapter, count, snippets }) => <article className="project-search-result" key={chapter.id}>
@@ -6503,6 +6505,7 @@ function App() {
           <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); setShowMobileMore(false); }}>◈ 文风管理 <small>{writingStyles.length}</small></button>
         </div>
         <div className="sidebar-footer">
+          <PlumBranch size="sm" flip />
           <button className="settings-button" onClick={openSettings}><span aria-hidden="true">⚙</span><b>设置</b></button>
         </div>
       </aside>
@@ -6517,6 +6520,7 @@ function App() {
                 <h2>开始你的第一部小说</h2>
                 <p>创建一个本地写作项目，章节、大纲、卡片和记忆都会保存在你的设备上。</p>
                 <button className="btn-primary empty-project-cta" onClick={openNewProjectModal}>+ 新建小说</button>
+                <PlumBranch size="lg" />
               </div>
             ) : (
               <>

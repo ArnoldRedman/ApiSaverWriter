@@ -3644,3 +3644,115 @@ select.input {
 .appearance-theme-swatch.paper { background: linear-gradient(100deg, #EFE6D2 0 46%, #FFFDF8 46% 78%, #B4432F 78%); }
 .appearance-theme-swatch.ink { background: linear-gradient(100deg, #15120D 0 46%, #252019 46% 78%, #DD7057 78%); }
 .appearance-theme-swatch.auto { background: linear-gradient(100deg, #EFE6D2 0 39%, #B4432F 39% 50%, #15120D 50% 89%, #DD7057 89%); }
+
+
+/* ══ 装饰层 ═══════════════════════════════════════════════════════
+   纸纹和梅枝都用 SVG data URI，不引外部图片：矢量在任何缩放和高分屏下
+   都不糊，颜色跟着主题变量走，加起来不到 3KB。
+   全部 pointer-events: none，不影响任何交互。
+   ════════════════════════════════════════════════════════════════ */
+
+/* 纸纹：feTurbulence 生成纤维噪点，铺在整个应用底下。
+   叠加模式用 multiply，浅色下压出纸的颗粒，深色下自动变得几乎不可见 */
+.app::before,
+.startup-screen::before {
+  content: '';
+  position: fixed;
+  z-index: 0;
+  inset: 0;
+  opacity: var(--grain-opacity);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.82' numOctaves='4' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='180' height='180' filter='url(%23g)' opacity='.055'/%3E%3C/svg%3E");
+  mix-blend-mode: multiply;
+  pointer-events: none;
+}
+
+:root[data-theme="dark"] .app::before,
+:root[data-theme="dark"] .startup-screen::before {
+  mix-blend-mode: screen;
+}
+
+/* 正文区再加一层更细的横向纸纹，模拟稿纸的抄网纹 */
+.chapter-editor-wrap,
+.reading-overlay > article {
+  background-image: repeating-linear-gradient(
+    180deg,
+    transparent 0 27px,
+    color-mix(in srgb, var(--branch-ink) 3%, transparent) 27px 28px
+  );
+}
+
+/* 梅枝：一根斜出的枝条加五瓣梅，画在容器右下角。
+   枝条用 --branch-ink（墨），花瓣用 --plum-ink（梅红），浓度由主题控制 */
+.plum-branch {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 190px;
+  height: 150px;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+}
+
+.plum-branch svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.plum-branch .branch {
+  fill: none;
+  stroke: var(--branch-ink);
+  stroke-linecap: round;
+  opacity: calc(var(--branch-opacity) * 4);
+}
+
+.plum-branch .petal {
+  fill: var(--plum-ink);
+  opacity: var(--plum-opacity);
+}
+
+.plum-branch .stamen {
+  stroke: var(--branch-ink);
+  stroke-width: .5;
+  stroke-linecap: round;
+  opacity: calc(var(--branch-opacity) * 5);
+}
+
+.plum-branch .pistil {
+  fill: var(--plum-ink);
+  opacity: calc(var(--plum-opacity) * 1.5);
+}
+
+/* 空状态、启动页和侧栏页脚各放一枝，尺寸不同 */
+.plum-branch.lg { width: 300px; height: 235px; }
+.plum-branch.sm { width: 132px; height: 104px; }
+
+/* 页眉下的细枝分隔线：一条从粗到细的墨线，右端收笔 */
+.page-header {
+  position: relative;
+  padding-bottom: 14px;
+}
+
+.page-header::after {
+  content: '';
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 1px;
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--branch-ink) 26%, transparent) 0,
+    color-mix(in srgb, var(--branch-ink) 12%, transparent) 42%,
+    transparent 100%);
+}
+
+/* 空状态容器要能承载梅枝 */
+.empty-project-home,
+.project-search-empty,
+.startup-screen {
+  position: relative;
+  overflow: hidden;
+}
+
+.sidebar-footer { position: relative; }
