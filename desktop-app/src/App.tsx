@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ChangeEvent, type PointerEvent as ReactPointerEvent } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
@@ -14,7 +14,8 @@ import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, norma
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import { readerFonts, themes, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
-import { sidebarWidthKey, sidebarTabsHeightKey, clampSidebarWidth, clampSidebarTabsHeight } from './features/editor/layout';
+import { usePaneSizes } from './features/editor/use-pane-sizes';
+import { PaneResizer } from './features/editor/pane-resizer';
 import { PlumBranch } from './features/editor/plum-branch';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
@@ -1452,8 +1453,8 @@ function App() {
   const [readingMode, setReadingMode] = useState(false);
   const [draggingChapterId, setDraggingChapterId] = useState<number | null>(null);
   // 编辑器侧栏宽度与标签区高度：拖动手柄调整，松手写回 localStorage
-  const [sidebarWidth, setSidebarWidth] = useState(() => clampSidebarWidth(Number(localStorage.getItem(sidebarWidthKey))));
-  const [sidebarTabsHeight, setSidebarTabsHeight] = useState(() => clampSidebarTabsHeight(Number(localStorage.getItem(sidebarTabsHeightKey))));
+  // 所有可拖动分栏的尺寸集中在这里，见 features/editor/panes.ts
+  const panes = usePaneSizes();
   const [localBackups, setLocalBackups] = useState<{ directory: string; files: Array<{ name: string; size: number; modifiedAt: number }> }>({ directory: '', files: [] });
   const [showLocalBackupPicker, setShowLocalBackupPicker] = useState(false);
   const projectAgentMessagesRef = useRef<HTMLDivElement | null>(null);
@@ -2969,35 +2970,6 @@ function App() {
     setActiveCardId(null);
     setSelectedCardIds([]);
     setActiveChapterMemoryId(null);
-  };
-
-  const resizeSidebar = (value: number) => {
-    const next = clampSidebarWidth(value);
-    setSidebarWidth(next);
-    localStorage.setItem(sidebarWidthKey, String(next));
-  };
-
-  const resizeSidebarTabs = (value: number) => {
-    const next = clampSidebarTabsHeight(value);
-    setSidebarTabsHeight(next);
-    localStorage.setItem(sidebarTabsHeightKey, String(next));
-  };
-
-  // 侧栏两个拖动手柄共用：pointer capture 让指针移出手柄后仍能收到事件，松手自动解绑
-  const beginPanelResize = (event: ReactPointerEvent<HTMLDivElement>, axis: 'x' | 'y', from: number, resize: (value: number) => void) => {
-    event.preventDefault();
-    const handle = event.currentTarget;
-    const origin = axis === 'x' ? event.clientX : event.clientY;
-    handle.setPointerCapture(event.pointerId);
-    const move = (pointer: PointerEvent) => resize(from + (axis === 'x' ? pointer.clientX : pointer.clientY) - origin);
-    const finish = () => {
-      handle.removeEventListener('pointermove', move);
-      handle.removeEventListener('pointerup', finish);
-      handle.removeEventListener('pointercancel', finish);
-    };
-    handle.addEventListener('pointermove', move);
-    handle.addEventListener('pointerup', finish);
-    handle.addEventListener('pointercancel', finish);
   };
 
   // 选中章节并把它滚到列表可见区域，长篇不必手动滚动查找
@@ -5748,7 +5720,8 @@ function App() {
             {styleMode && <span className="editor-mode-label">作品文风</span>}
           </header>
 
-          {showProjectAgent && <aside className="project-agent-drawer" aria-label="项目 Agent 对话">
+          {showProjectAgent && <aside className="project-agent-drawer" aria-label="项目 Agent 对话" style={{ ['--pane-project-agent' as string]: `${panes.sizes.projectAgent}px` }}>
+            <PaneResizer name="projectAgent" axis="x" label="拖动调整对话抽屉宽度，双击复位" invert controller={panes} />
             <header className="project-agent-header">
               <div><strong>项目 Agent</strong><small>仅操作《{editingProject.title}》</small></div>
               <div className="project-agent-header-actions"><button className="icon-button" title="新建会话" disabled={projectAgentRunning} onClick={startNewProjectAgentSession}>＋</button><button className="icon-button" title="关闭" onClick={() => setShowProjectAgent(false)}>×</button></div>
@@ -5792,7 +5765,7 @@ function App() {
           <div className="editor-body">
             <aside
               className="editor-sidebar"
-              style={{ ['--editor-sidebar-width' as string]: `${sidebarWidth}px`, ['--editor-sidebar-tabs-height' as string]: `${sidebarTabsHeight}px` }}
+              style={{ ['--editor-sidebar-width' as string]: `${panes.sizes.editorSidebar}px`, ['--editor-sidebar-tabs-height' as string]: `${panes.sizes.editorSidebarTabs}px` }}
             >
               <div className="editor-sidebar-tabs" ref={sidebarTabsRef}>
                 <button
@@ -5844,21 +5817,12 @@ function App() {
                   AI 检测
                 </button>
               </div>
-              <div
-                className="editor-sidebar-tabs-resizer"
-                role="separator"
-                aria-orientation="horizontal"
-                aria-label="拖动调整标签区高度"
-                tabIndex={0}
-                title="拖动调整标签区高度，标签放不下时自行滚动"
-                onPointerDown={event => beginPanelResize(event, 'y', sidebarTabsRef.current?.offsetHeight || sidebarTabsHeight, resizeSidebarTabs)}
-                onKeyDown={event => {
-                  const step = event.key === 'ArrowUp' ? -16 : event.key === 'ArrowDown' ? 16 : 0;
-                  if (step) {
-                    event.preventDefault();
-                    resizeSidebarTabs(sidebarTabsHeight + step);
-                  }
-                }}
+              <PaneResizer
+                name="editorSidebarTabs"
+                axis="y"
+                label="拖动调整标签区高度，双击复位"
+                controller={panes}
+                measured={() => sidebarTabsRef.current?.offsetHeight}
               />
 
               {editorSidebarTab === 'ai-detect' && (() => {
@@ -6051,22 +6015,7 @@ function App() {
               </div>
             </aside>
 
-            <div
-              className="editor-sidebar-resizer"
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="拖动调整侧栏宽度"
-              tabIndex={0}
-              title="拖动调整侧栏宽度"
-              onPointerDown={event => beginPanelResize(event, 'x', sidebarWidth, resizeSidebar)}
-              onKeyDown={event => {
-                const step = event.key === 'ArrowLeft' ? -16 : event.key === 'ArrowRight' ? 16 : 0;
-                if (step) {
-                  event.preventDefault();
-                  resizeSidebar(sidebarWidth + step);
-                }
-              }}
-            />
+            <PaneResizer name="editorSidebar" axis="x" label="拖动调整侧栏宽度，双击复位" controller={panes} />
 
             <main className="editor-main">
               {editorSidebarTab === 'search' ? (
@@ -6290,7 +6239,8 @@ function App() {
               )}
             </main>
 
-          <aside className="agent-panel">
+          <aside className="agent-panel" style={{ ['--pane-agent-panel' as string]: `${panes.sizes.agentPanel}px` }}>
+            <PaneResizer name="agentPanel" axis="x" label="拖动调整 Agent 面板宽度，双击复位" invert controller={panes} />
               <div className="agent-panel-header">
                 <span>{outlineMode ? '大纲智能体' : cardMode ? '卡片创建智能体' : styleMode ? '文风说明' : 'AI 智能体'}</span>
                 <select
@@ -6468,7 +6418,7 @@ function App() {
         </div>
       ) : (
         <>
-      <aside className="sidebar">
+      <aside className="sidebar" style={{ ['--pane-app-sidebar' as string]: `${panes.sizes.appSidebar}px` }}>
         <div className="logo">
           <h1>织章</h1>
           <p>AI 小说写作助手</p>
@@ -6509,6 +6459,8 @@ function App() {
           <button className="settings-button" onClick={openSettings}><span aria-hidden="true">⚙</span><b>设置</b></button>
         </div>
       </aside>
+
+      <PaneResizer name="appSidebar" axis="x" label="拖动调整侧栏宽度，双击复位" controller={panes} />
 
       <main className="main">
         {activeTab === 'projects' && (
@@ -6578,7 +6530,8 @@ function App() {
         {activeTab === 'styles' && (
           <section className="global-management-page styles-management-page">
             <header className="page-header"><div><span className="page-eyebrow">全局写作资源</span><h2>文风管理</h2><p>新建或编辑文风 Skill。保存后可在每部小说的章节侧栏绑定使用。</p></div><button className="btn-primary" onClick={openNewWritingStyle}>+ 新建文风</button></header>
-            <div className="global-style-workspace">
+            <div className="global-style-workspace" style={{ ['--pane-style-list' as string]: `${panes.sizes.styleList}px` }}>
+              <PaneResizer name="styleList" axis="x" label="拖动调整文风列表宽度，双击复位" controller={panes} />
               <aside className="global-style-list"><div className="panel-section-title">全部文风 <span>{writingStyles.length}</span></div>{writingStyles.map(style => <button type="button" key={style.id} className={`writing-style-item ${styleDraft?.id === style.id ? 'active' : ''}`} onClick={() => setStyleDraft(style)}><strong>{style.name}</strong><small>{style.sourceBookId ? '拆书蒸馏' : '自定义'} · {style.tags.slice(0, 3).join('、') || '未分类'}</small></button>)}{!writingStyles.length && <p className="empty-hint">暂无文风，点击“新建文风”开始。</p>}</aside>
               <section className="global-style-editor">{styleDraft ? <div className="writing-style-editor"><div className="style-editor-heading"><div><span>Skill 文档</span><h3>{styleDraft.name || '未命名文风'}</h3></div><button className={`editor-tool-button ${showSearchPanel ? 'active' : ''}`} onClick={toggleSearchPanel}>搜索 / 替换</button></div><label>文风名称<input className="input" value={styleDraft.name} onChange={event => setStyleDraft({ ...styleDraft, name: event.target.value })} /></label><label>简短说明<input className="input" value={styleDraft.description} onChange={event => setStyleDraft({ ...styleDraft, description: event.target.value })} /></label>{renderDocumentSearchPanel('文风', styleDraft.content, content => setStyleDraft({ ...styleDraft, content }))}<label>Skill 内容<textarea className="style-content-editor" value={styleDraft.content} onChange={event => setStyleDraft({ ...styleDraft, content: event.target.value })} /></label><div className="style-editor-actions"><button className="btn-primary" onClick={saveWritingStyleDraft}>保存文风</button>{writingStyles.some(style => style.id === styleDraft.id) && <button className="link-button danger-link" onClick={() => deleteWritingStyle(styleDraft.id)}>删除</button>}</div></div> : <div className="empty-state"><p>选择一个文风，或新建文风开始编辑。</p></div>}</section>
             </div>
@@ -6588,9 +6541,10 @@ function App() {
           <div className="library-page">
             <header className="page-header library-page-header"><div><span className="page-eyebrow">本地资料库</span><h2>书籍管理</h2><p>搜索书名或作者后，系统会同时查询全部书源；从结果中选择要下载的来源。</p></div><div className="library-search"><input className="input" value={bookSearchQuery} onChange={event => setBookSearchQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') void runBookSearch(); }} placeholder="搜索书名或作者" /><button className="btn-primary" onClick={() => void runBookSearch()} disabled={bookSearchLoading}>{bookSearchLoading ? '全书源搜索中...' : '搜索全部书源'}</button><button className="btn-secondary" onClick={() => txtImportInputRef.current?.click()}>导入 TXT</button><input ref={txtImportInputRef} type="file" accept=".txt,text/plain" hidden onChange={event => void importLibraryTxt(event)} /></div></header>
             {librarySearchResults.length > 0 && <section className="library-search-results"><div className="panel-section-title">全部书源结果 <span>{librarySearchResults.length}</span></div><div className="library-result-grid">{librarySearchResults.map(book => <article className="library-result-card" key={book.id}><strong>{book.title}</strong><span>{book.author} · 来源：{book.source}</span><p>{book.intro || '暂无简介'}</p><button className="btn-secondary" disabled={bookDownloadRunningId === book.id} onClick={() => void downloadLibraryBook(book)}>{bookDownloadRunningId === book.id ? '下载中...' : `从${book.source}下载`}</button></article>)}</div></section>}
-            <div className="library-workspace">
+            <div className="library-workspace" style={{ ['--pane-library-list' as string]: `${panes.sizes.libraryList}px` }}>
+              <PaneResizer name="libraryList" axis="x" label="拖动调整书籍列表宽度，双击复位" controller={panes} />
               <aside className="library-list"><div className="panel-section-title">已下载书籍 <span>{libraryBooks.length}</span></div>{libraryBooks.length === 0 ? <p className="empty-hint">还没有下载书籍。可先搜索，或从扫榜管理下载。</p> : libraryBooks.map(book => <button type="button" key={book.id} className={`library-book-item ${book.id === activeLibraryBookId ? 'active' : ''}`} onClick={() => { setActiveLibraryBookId(book.id); setActiveLibraryChapterId(book.chapters[0]?.id || null); }}><strong>{book.title}</strong><small>{book.author} · {book.chapters.length} 章</small></button>)}</aside>
-              {activeLibraryBook ? <section className="library-detail"><header className="library-detail-header"><div><span>{activeLibraryBook.source}</span><h3>{activeLibraryBook.title}</h3><small>{activeLibraryBook.author} · {activeLibraryBook.chapters.length} 章 · {activeLibraryBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="library-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_library_book_location', { bookId: activeLibraryBook.id, bookTitle: activeLibraryBook.title }).catch(error => setNotice({ title: '打开书籍位置失败', content: String(error) }))}>打开位置</button>{activeLibraryBook.chapters.some(chapter => !chapter.downloaded) && <button className="link-button" disabled={libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryUnfinishedLibraryChapters(activeLibraryBook)}>{libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}` ? '重新下载中...' : '重新下载未完成'}</button>}<button className="btn-primary library-dismantle-button" onClick={() => createDismantleFromLibrary(activeLibraryBook)}><span>拆</span>一键拆书</button><button className="link-button danger-link" onClick={() => void deleteLibraryBook(activeLibraryBook)}>删除</button></div></header><p className="library-intro">{activeLibraryBook.intro || '暂无简介'}</p><div className="library-reading-workspace"><div className="library-chapter-pane"><div className="library-chapter-pane-heading"><strong>章节目录</strong><span>{activeLibraryBook.chapters.length} 章</span></div><div className="library-chapter-list">{activeLibraryBook.chapters.map(chapter => <div className={`library-chapter-row ${chapter.id === activeLibraryChapter?.id ? 'active' : ''}`} key={chapter.id}><button type="button" className="library-chapter-select" onClick={() => setActiveLibraryChapterId(chapter.id)}><span>第 {chapter.number} 章</span><strong>{chapter.title}</strong><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.downloaded ? '已下载' : '未下载'}</small></button>{!chapter.downloaded && <button type="button" className="library-chapter-retry" disabled={libraryChapterDownloadRunningId === chapter.id || libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryLibraryChapter(activeLibraryBook, chapter)}>{libraryChapterDownloadRunningId === chapter.id ? '下载中...' : '重新下载'}</button>}</div>)}</div></div><article className="library-reader">{activeLibraryChapter ? <><header className="library-reader-header"><div><span>第 {activeLibraryChapter.number} 章</span><h4>{activeLibraryChapter.title}</h4><small>{activeLibraryChapter.wordCount.toLocaleString()} 字</small></div><button className="btn-secondary" disabled={libraryOutlineRunningId === activeLibraryChapter.id || !activeLibraryChapter.content.trim()} onClick={() => void generateLibraryChapterOutline(activeLibraryBook, activeLibraryChapter)}>{libraryOutlineRunningId === activeLibraryChapter.id ? '生成章纲中...' : '生成章纲'}</button></header>{activeLibraryChapter.unavailableReason && <div className="library-chapter-warning">{activeLibraryChapter.unavailableReason}</div>}{activeLibraryChapter.content.trim() ? <pre className="library-reader-content">{activeLibraryChapter.content}</pre> : <div className="library-reader-empty">该章节没有可阅读的本地正文。</div>}{activeLibraryChapter.outline && <details className="library-reader-outline" open><summary>本章章纲</summary><pre>{activeLibraryChapter.outline}</pre></details>}</> : <div className="library-reader-empty">选择章节开始阅读。</div>}</article></div></section> : <div className="empty-state"><p>选择一本已下载书籍查看章节。</p></div>}
+              {activeLibraryBook ? <section className="library-detail"><header className="library-detail-header"><div><span>{activeLibraryBook.source}</span><h3>{activeLibraryBook.title}</h3><small>{activeLibraryBook.author} · {activeLibraryBook.chapters.length} 章 · {activeLibraryBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="library-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_library_book_location', { bookId: activeLibraryBook.id, bookTitle: activeLibraryBook.title }).catch(error => setNotice({ title: '打开书籍位置失败', content: String(error) }))}>打开位置</button>{activeLibraryBook.chapters.some(chapter => !chapter.downloaded) && <button className="link-button" disabled={libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryUnfinishedLibraryChapters(activeLibraryBook)}>{libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}` ? '重新下载中...' : '重新下载未完成'}</button>}<button className="btn-primary library-dismantle-button" onClick={() => createDismantleFromLibrary(activeLibraryBook)}><span>拆</span>一键拆书</button><button className="link-button danger-link" onClick={() => void deleteLibraryBook(activeLibraryBook)}>删除</button></div></header><p className="library-intro">{activeLibraryBook.intro || '暂无简介'}</p><div className="library-reading-workspace" style={{ ['--pane-library-reader' as string]: `${panes.sizes.libraryReader}px` }}><PaneResizer name="libraryReader" axis="x" label="拖动调整章节目录宽度，双击复位" controller={panes} /><div className="library-chapter-pane"><div className="library-chapter-pane-heading"><strong>章节目录</strong><span>{activeLibraryBook.chapters.length} 章</span></div><div className="library-chapter-list">{activeLibraryBook.chapters.map(chapter => <div className={`library-chapter-row ${chapter.id === activeLibraryChapter?.id ? 'active' : ''}`} key={chapter.id}><button type="button" className="library-chapter-select" onClick={() => setActiveLibraryChapterId(chapter.id)}><span>第 {chapter.number} 章</span><strong>{chapter.title}</strong><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.downloaded ? '已下载' : '未下载'}</small></button>{!chapter.downloaded && <button type="button" className="library-chapter-retry" disabled={libraryChapterDownloadRunningId === chapter.id || libraryChapterDownloadRunningId === `book:${activeLibraryBook.id}`} onClick={() => void retryLibraryChapter(activeLibraryBook, chapter)}>{libraryChapterDownloadRunningId === chapter.id ? '下载中...' : '重新下载'}</button>}</div>)}</div></div><article className="library-reader">{activeLibraryChapter ? <><header className="library-reader-header"><div><span>第 {activeLibraryChapter.number} 章</span><h4>{activeLibraryChapter.title}</h4><small>{activeLibraryChapter.wordCount.toLocaleString()} 字</small></div><button className="btn-secondary" disabled={libraryOutlineRunningId === activeLibraryChapter.id || !activeLibraryChapter.content.trim()} onClick={() => void generateLibraryChapterOutline(activeLibraryBook, activeLibraryChapter)}>{libraryOutlineRunningId === activeLibraryChapter.id ? '生成章纲中...' : '生成章纲'}</button></header>{activeLibraryChapter.unavailableReason && <div className="library-chapter-warning">{activeLibraryChapter.unavailableReason}</div>}{activeLibraryChapter.content.trim() ? <pre className="library-reader-content">{activeLibraryChapter.content}</pre> : <div className="library-reader-empty">该章节没有可阅读的本地正文。</div>}{activeLibraryChapter.outline && <details className="library-reader-outline" open><summary>本章章纲</summary><pre>{activeLibraryChapter.outline}</pre></details>}</> : <div className="library-reader-empty">选择章节开始阅读。</div>}</article></div></section> : <div className="empty-state"><p>选择一本已下载书籍查看章节。</p></div>}
             </div>
           </div>
         )}
@@ -6612,7 +6566,8 @@ function App() {
               <div><span className="page-eyebrow">本地资料库</span><h2>拆书管理</h2><p>从书籍管理选择已下载小说，逐章提炼剧情结构，再生成独立原创章节。</p></div>
               <button className="btn-secondary" onClick={() => setActiveTab('books')}>去书籍管理下载</button>
             </header>
-            {dismantleBooks.length === 0 ? <div className="dismantle-empty"><div className="dismantle-empty-mark">拆</div><h3>还没有拆书资料</h3><p>请先在书籍管理下载小说，再选择“加入拆书管理”。</p><button className="btn-primary" onClick={() => setActiveTab('books')}>选择本地书籍</button></div> : <div className="dismantle-workspace">
+            {dismantleBooks.length === 0 ? <div className="dismantle-empty"><div className="dismantle-empty-mark">拆</div><h3>还没有拆书资料</h3><p>请先在书籍管理下载小说，再选择“加入拆书管理”。</p><button className="btn-primary" onClick={() => setActiveTab('books')}>选择本地书籍</button></div> : <div className="dismantle-workspace" style={{ ['--pane-dismantle-library' as string]: `${panes.sizes.dismantleLibrary}px` }}>
+              <PaneResizer name="dismantleLibrary" axis="x" label="拖动调整拆书列表宽度，双击复位" controller={panes} />
               <aside className="dismantle-library">
                 <div className="dismantle-library-heading"><div><strong>拆书书库</strong><small>{dismantleBooks.length} 部作品</small></div><button className="link-button" onClick={() => setActiveTab('books')}>选择书籍</button></div>
                 <div className="dismantle-book-list">{dismantleBooks.map(book => <button type="button" key={book.id} className={`dismantle-book-item ${book.id === activeDismantleBookId ? 'active' : ''}`} onClick={() => { setActiveDismantleBookId(book.id); setActiveDismantleChapterId(book.chapters[0]?.id || null); setSelectedDismantleChapterIds(book.chapters.slice(0, 1).map(chapter => chapter.id)); }}><div><strong>{book.title}</strong><small>{book.chapters.length} 章 · {book.chapters.filter(chapter => chapter.status === 'analyzed' || chapter.status === 'rewritten').length} 章已分析</small>{book.boundProjectId && <em>已绑定小说</em>}</div></button>)}</div>
@@ -6620,7 +6575,8 @@ function App() {
               {activeDismantleBook && <section className="dismantle-detail">
                 <header className="dismantle-detail-header"><div><span>拆书资料</span><h3>{activeDismantleBook.title}</h3><small>{activeDismantleBook.chapters.length} 章 · {activeDismantleBook.chapters.reduce((sum, chapter) => sum + chapter.wordCount, 0).toLocaleString()} 字</small></div><div className="dismantle-detail-actions"><button className="link-button" onClick={() => void invoke<string>('open_dismantle_location', { bookTitle: activeDismantleBook.title }).catch(error => setNotice({ title: '打开拆书位置失败', content: String(error) }))}>打开位置</button><button className="link-button danger-link" onClick={() => void deleteDismantleBook(activeDismantleBook)}>删除</button></div></header>
                 <div className="dismantle-detail-toolbar"><label>绑定目标小说<select className="select" value={activeDismantleBook.boundProjectId?.toString() || ''} onChange={event => bindDismantleToProject(activeDismantleBook.id, event.target.value ? Number(event.target.value) : undefined)}><option value="">暂不绑定</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label><button className="btn-secondary" onClick={() => startDismantleImitation(activeDismantleBook)}>一键仿写此书</button><button className="btn-secondary" disabled={styleDistilling} onClick={() => void distillDismantleStyle()}>{styleDistilling ? '蒸馏中...' : '蒸馏文风 Skill'}</button><button className="btn-primary" disabled={Boolean(dismantleRunningIds.length)} onClick={() => void runDismantleAnalysis()}>{dismantleRunningIds.length ? `分析中 ${dismantleRunningIds.length} 章` : `生成选中章纲（${selectedDismantleChapterIds.length}）`}</button></div>
-                <div className="dismantle-detail-body">
+                <div className="dismantle-detail-body" style={{ ['--pane-dismantle-chapters' as string]: `${panes.sizes.dismantleChapters}px` }}>
+                  <PaneResizer name="dismantleChapters" axis="x" label="拖动调整章节列表宽度，双击复位" controller={panes} />
                   <div className="dismantle-chapter-list"><div className="dismantle-list-heading"><strong>章节选择</strong><button className="link-button" onClick={() => setSelectedDismantleChapterIds(activeDismantleBook.chapters.map(chapter => chapter.id))}>全选</button><button className="link-button" onClick={() => setSelectedDismantleChapterIds([])}>清空</button></div>{activeDismantleBook.chapters.map(chapter => <label key={chapter.id} className={`dismantle-chapter-row ${chapter.id === activeDismantleChapterId ? 'active' : ''}`}><input type="checkbox" checked={selectedDismantleChapterIds.includes(chapter.id)} onChange={() => setSelectedDismantleChapterIds(current => current.includes(chapter.id) ? current.filter(id => id !== chapter.id) : [...current, chapter.id])} /><button type="button" onClick={() => setActiveDismantleChapterId(chapter.id)}><strong>第 {chapter.number} 章</strong><span>{chapter.title}</span><small>{chapter.wordCount.toLocaleString()} 字 · {chapter.status === 'rewritten' ? '已改写' : chapter.status === 'analyzed' ? '已分析' : chapter.status === 'analyzing' ? '分析中' : '待分析'}</small></button></label>)}</div>
                   {activeDismantleChapter && <article className="dismantle-chapter-editor"><div className="dismantle-chapter-heading"><div><span>第 {activeDismantleChapter.number} 章</span><h4>{activeDismantleChapter.title}</h4></div><button className="btn-secondary" onClick={() => void runDismantleRewrite()} disabled={dismantleRewriteRunning || !activeDismantleChapter.detailedOutline.trim()}>{dismantleRewriteRunning ? '原创生成中...' : '根据章纲生成原创稿'}</button></div><div className="dismantle-analysis-grid"><div><strong>剧情摘要</strong><textarea value={activeDismantleChapter.summary} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, summary: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="分析后显示剧情摘要" /></div><div><strong>节奏判断</strong><textarea value={activeDismantleChapter.pacing} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, pacing: event.target.value, updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="开场、发展、转折、收束" /></div></div><label className="dismantle-outline-field"><strong>章节细纲（可人工修改）</strong><textarea value={activeDismantleChapter.detailedOutline} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, detailedOutline: event.target.value, status: event.target.value.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="选择章节后点击生成章纲" /></label><details className="dismantle-source-details"><summary>查看原文（只读）</summary><pre>{activeDismantleChapter.sourceContent}</pre></details><label className="dismantle-outline-field"><strong>原创改写稿（确认前可编辑）</strong><textarea value={activeDismantleChapter.rewriteContent} onChange={event => updateDismantleBook(activeDismantleBook.id, book => ({ ...book, chapters: book.chapters.map(item => item.id === activeDismantleChapter.id ? { ...item, rewriteContent: event.target.value, status: event.target.value.trim() ? 'rewritten' : item.detailedOutline.trim() ? 'analyzed' : 'pending', updatedAt: new Date().toISOString() } : item), updatedAt: new Date().toISOString() }))} placeholder="AI 生成后可人工修改，确认后生成到目标小说" /></label><div className="dismantle-rewrite-footer"><input className="input" value={dismantleRewriteInstruction} onChange={event => setDismantleRewriteInstruction(event.target.value)} placeholder="原创改写要求（可选）" />{activeDismantleBook.boundProjectId && <button className="btn-primary" onClick={() => void generateDismantleChapter()}>确认并生成目标章节</button>}</div></article>}
                 </div>
