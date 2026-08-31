@@ -1,4 +1,4 @@
-import { createModelClient } from "../application/model-client.js";
+import { createModelApiClient } from "../application/model-client.js";
 import type { RpcRegistry } from "./registry.js";
 
 const textModes = new Set(["polish", "de-ai", "continue", "revise"]);
@@ -8,7 +8,7 @@ export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => regi
     const { mode, instruction, content, previousChapter, maxWords, projectTitle, chapterTitle } = params;
     if (!content && !previousChapter) throw new Error("缺少文本处理所需参数");
     if (typeof mode !== "string" || !textModes.has(mode)) throw new Error("不支持的文本处理类型");
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const extraRequirement = String(instruction || "").trim();
     const numericLimit = Math.max(1, Math.floor(Number(maxWords) || 0));
     const prompt = mode === "polish"

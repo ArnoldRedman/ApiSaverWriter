@@ -25,7 +25,7 @@ function normalizeEmbeddingBaseURL(value: string): string {
  * OpenAI 兼容的 Embedding Provider
  * 通过传入的 Base URL 调用远程 embedding 模型
  */
-export class ApiSaverEmbeddingProvider implements EmbeddingProvider {
+export class RemoteEmbeddingProvider implements EmbeddingProvider {
   private dimensions: number;
   private baseURL: string;
 

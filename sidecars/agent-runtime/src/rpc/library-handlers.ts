@@ -1,5 +1,5 @@
 import { compactText, contextBudgetBytes } from "../context/context-optimizer.js";
-import { createModelClient, stringList } from "../application/model-client.js";
+import { createModelApiClient, stringList } from "../application/model-client.js";
 import {
   qianyueSources, webBookSources, searchQianyueSource, searchConfiguredBookSource, searchFanqieSource,
   searchAllBookSources, fetchNovelCatchRankingCategories, fetchQidianRanking, fetchFalooRanking,
@@ -123,7 +123,7 @@ export const registerLibraryHandlers = (registry: RpcRegistry): RpcRegistry => r
   .register("ranking.analyze", async params => {
     const { books, platform, rankType, gender, contextWindow } = params;
     if (!Array.isArray(books) || books.length === 0) throw new Error("缺少榜单样本或模型配置");
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const samples = books.slice(0, 60).map((item, index) => {
       const book = item && typeof item === "object" ? item as Record<string, unknown> : {};
       return `${index + 1}. ${compactText(book.title || "未命名", 80)}｜${compactText(book.author || "未知", 40)}｜${compactText(book.category || "未分类", 40)}｜${compactText(book.intro || "", 260)}`;
@@ -137,7 +137,7 @@ export const registerLibraryHandlers = (registry: RpcRegistry): RpcRegistry => r
     if (!sourceContent) {
       throw new Error("缺少拆书分析所需的正文或模型配置");
     }
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const source = compactText(sourceContent, Math.min(contextBudgetBytes(Number(contextWindow) || undefined, 35, 18), 28_000));
     const prompt = `你是长篇小说结构分析编辑。请拆解《${String(bookTitle || "未命名作品")}》第 ${Number(chapterNumber) || 1} 章《${String(chapterTitle || "未命名章节")}》的剧情结构，生成可用于原创创作的细纲。
 
@@ -175,7 +175,7 @@ ${source}
     if (!Array.isArray(samples) || samples.length === 0) {
       throw new Error("请选择至少一个章节用于蒸馏文风");
     }
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const sampleText = compactText(samples.map((sample, index) => {
       const item = sample && typeof sample === "object" ? sample as Record<string, unknown> : {};
       return `### 样本 ${index + 1}｜${String(item.title || "章节")}\n${String(item.content || "")}`;
@@ -212,7 +212,7 @@ ${sampleText}
     if (!detailedOutline) {
       throw new Error("请先生成并确认章节细纲");
     }
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const wordLimit = Math.max(600, Math.min(8000, Math.floor(Number(targetWords) || 2200)));
     const prompt = `你是原创网络小说作者。根据下面从《${String(bookTitle || "参考作品")}》抽象出的章节结构，写一份完全独立的新章节草稿。
 
@@ -232,7 +232,7 @@ ${compactText(detailedOutline, 14_000)}`;
     if ((!detailedOutline && !rewriteContent)) {
       throw new Error("请先准备章节细纲或原创改写稿");
     }
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const prompt = `你是《${String(projectTitle || "未命名小说")}》的章节作者。把下列原创章节素材转换成符合目标小说设定的可编辑正文。
 
 只使用目标小说的人物、世界观和大纲；如果素材与设定冲突，以目标设定为准并重构。必须写成独立原创内容，不复用参考作品的专名、句子和可识别桥段。只输出章节正文，不加标题。

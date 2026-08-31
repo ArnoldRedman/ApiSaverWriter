@@ -5,10 +5,10 @@ import { ProxyAgent } from "undici";
 import { fitMessagesToTokenBudget } from "../context/token-budget.js";
 import { anthropicText, anthropicThinkingBudget, authHeaders as protocolAuthHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from "@zhizhang/model-protocol";
 
-export type ApiSaverProvider = "openai" | "claude";
+export type ModelProvider = "openai" | "claude";
 
-export interface ApiSaverModelInput {
-  provider: ApiSaverProvider;
+export interface ModelInput {
+  provider: ModelProvider;
   apiKey: string;
   model: string;
   baseUrl?: string;
@@ -16,8 +16,8 @@ export interface ApiSaverModelInput {
   maxTokens?: number;
 }
 
-export interface ApiSaverModelConfig {
-  provider: ApiSaverProvider;
+export interface ModelConfig {
+  provider: ModelProvider;
   apiKey: string;
   model: string;
   baseUrl: string;
@@ -243,7 +243,7 @@ function apiErrorMessage(context: ApiErrorContext): string {
   return `模型接口请求失败（${status}）${routeHint}${requestHint}${protocolHint(status, mode)}${sizeHint}：${body.text || statusText || "未知错误"}`;
 }
 
-export function buildModelConfig(input: ApiSaverModelInput): ApiSaverModelConfig {
+export function buildModelConfig(input: ModelInput): ModelConfig {
   const anthropicBaseURL = trimTrailingSlash(input.baseUrl?.trim() || DEFAULT_ANTHROPIC_ROOT);
   const baseUrl = input.provider === "openai"
     ? normalizeOpenAIBaseURL(input.baseUrl)
@@ -258,7 +258,7 @@ export function buildModelConfig(input: ApiSaverModelInput): ApiSaverModelConfig
   };
 }
 
-export function createChatModel(config: ApiSaverModelConfig): BaseChatModel {
+export function createChatModel(config: ModelConfig): BaseChatModel {
   if (config.provider === "openai") {
     return new ChatOpenAI({
       apiKey: config.apiKey,
@@ -278,7 +278,7 @@ export function createChatModel(config: ApiSaverModelConfig): BaseChatModel {
 }
 
 // Simple client for direct API calls
-export interface ApiSaverClientConfig {
+export interface ModelApiClientConfig {
   apiKey: string;
   baseURL?: string;
   defaultModel?: string;
@@ -465,7 +465,7 @@ const isPrivateOrLocalHost = (hostname: string) => {
   return parts.length === 4 && parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31;
 };
 
-const proxyURLForRequest = (targetURL: string, config: Pick<ApiSaverClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
+const proxyURLForRequest = (targetURL: string, config: Pick<ModelApiClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
   if (!config.proxyEnabled || !config.proxyURL?.trim()) return "";
   try {
     const proxy = new URL(config.proxyURL.trim());
@@ -478,7 +478,7 @@ const proxyURLForRequest = (targetURL: string, config: Pick<ApiSaverClientConfig
   }
 };
 
-const proxyDispatcherFor = (targetURL: string, config: Pick<ApiSaverClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
+const proxyDispatcherFor = (targetURL: string, config: Pick<ModelApiClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
   const proxyURL = proxyURLForRequest(targetURL, config);
   if (!proxyURL) return undefined;
   const existing = proxyAgents.get(proxyURL);
@@ -488,7 +488,7 @@ const proxyDispatcherFor = (targetURL: string, config: Pick<ApiSaverClientConfig
   return agent;
 };
 
-const proxyRouteHint = (targetURL: string, config: Pick<ApiSaverClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
+const proxyRouteHint = (targetURL: string, config: Pick<ModelApiClientConfig, "proxyEnabled" | "proxyURL" | "proxyBypassLocal">) => {
   const proxyURL = proxyURLForRequest(targetURL, config);
   if (!proxyURL) return "";
   try {
@@ -499,10 +499,10 @@ const proxyRouteHint = (targetURL: string, config: Pick<ApiSaverClientConfig, "p
   }
 };
 
-export class ApiSaverClient {
-  private config: ApiSaverClientConfig;
+export class ModelApiClient {
+  private config: ModelApiClientConfig;
 
-  constructor(config: ApiSaverClientConfig) {
+  constructor(config: ModelApiClientConfig) {
     this.config = config;
   }
 

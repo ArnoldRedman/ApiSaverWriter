@@ -1,4 +1,4 @@
-import { createModelClient, stringList } from "../application/model-client.js";
+import { createModelApiClient, stringList } from "../application/model-client.js";
 import type { RpcRegistry } from "./registry.js";
 
 /** 从模型返回里剥掉 ```json 围栏，失败时返回原始文本 */
@@ -18,7 +18,7 @@ export const registerContentHandlers = (registry: RpcRegistry): RpcRegistry => r
   .register("project.generate", async params => {
     const { field, source, title, synopsis, channel, tags, protagonist1, protagonist2, outlines, chapters } = params;
     if (field !== "title" && field !== "synopsis") throw new Error("缺少生成作品信息所需参数");
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const tagRecord = tags && typeof tags === "object" ? tags as Record<string, unknown> : {};
     const tagText = Object.entries(tagRecord).flatMap(([kind, values]) => stringList(values).map(value => `${kind}：${value}`)).join("；");
     const outlineContext = Array.isArray(outlines) && outlines.length
@@ -57,7 +57,7 @@ export const registerContentHandlers = (registry: RpcRegistry): RpcRegistry => r
     const changes = params.changes && typeof params.changes === "object" ? params.changes : {};
     const fallbackTitle = String(params.fallbackTitle || `更新《${projectTitle}》创作资料`);
     const fallbackBody = String(params.fallbackBody || "");
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const prompt = `你是 Git 提交信息编辑。程序已经计算出《${projectTitle}》本次备份的真实差异。\n\n真实差异 JSON：\n${JSON.stringify(changes, null, 2)}\n\n程序回退标题：${fallbackTitle}\n程序明细：\n${fallbackBody}\n\n只返回 JSON：{"title":"中文提交标题","body":"2-5 行中文概述"}\n规则：title 不超过 60 个字符；body 不超过 1000 个字符；只能概括给定差异，不得编造章节、人物、剧情或数量；明确说明新增几章、修改哪几章、删除哪几章，其他资料按大纲/卡片/记忆/图谱分类概括。`;
     const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, temperature: 0.2, max_tokens: 800, retryAttempts: 2 });
     const parsed = parseJsonContent(response.content);
@@ -69,7 +69,7 @@ export const registerContentHandlers = (registry: RpcRegistry): RpcRegistry => r
   .register("skill.write", async params => {
     const { name, category, description, content, tags } = params;
     if (!name && !description && !content) throw new Error("缺少创建技能所需参数");
-    const client = createModelClient(params, { model: "gpt-4o-mini" });
+    const client = createModelApiClient(params, { model: "gpt-4o-mini" });
     const prompt = `你是 skill-creator。请把用户的小说写作需求整理成一个可复用技能。\n\n名称：${String(name || "待命名技能")}\n分类：${String(category || "write")}\n用途：${String(description || "暂无")}\n草稿：${String(content || "暂无")}\n标签：${stringList(tags).join("、") || "暂无"}\n\n只返回 JSON：\n{\n  "name": "短名称（英文 kebab-case）",\n  "category": "setup|write|review|polish|import|analyze|tool|creator",\n  "description": "一句话用途",\n  "tags": ["标签"],\n  "content": "Markdown 技能正文，包含触发条件、输入、步骤、输出格式、质量检查和失败处理"\n}\n不要输出 JSON 以外的文字。`;
     const response = await client.chat([{ role: "user", content: prompt }], { response_format: { type: "json_object" }, temperature: 0.3, max_tokens: 2200 });
     const parsed = parseJsonContent(response.content);

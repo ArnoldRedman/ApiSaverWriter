@@ -1,7 +1,7 @@
 import { StateGraph, Annotation } from "@langchain/langgraph";
 import type { BaseMessage } from "@langchain/core/messages";
 import { StoryStore } from "../storage/story-store.js";
-import { ApiSaverClient, type ApiUsage, type ApiWireMode } from "../models/api-saver.js";
+import { ModelApiClient, type ApiUsage, type ApiWireMode } from "../models/model-api.js";
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, type ContextReport } from "../context/context-optimizer.js";
@@ -259,7 +259,7 @@ interface ChapterGraphConfig {
 
 export function createChapterGraph(config: ChapterGraphConfig) {
   const store = config.store;
-  const client = new ApiSaverClient({
+  const client = new ModelApiClient({
     apiKey: config.apiKey,
     baseURL: config.baseURL,
     defaultModel: config.model,

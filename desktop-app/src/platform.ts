@@ -372,7 +372,7 @@ async function mobileChat(params: MobileParams, messages: ChatMessage[], onChunk
   const fetcher = await httpFetch();
   const apiMode = normalizeWireMode(params.apiMode);
   const model = stringValue(params.model, 'gpt-4o-mini');
-  // ApiSaver's Gemini-compatible routes can reject OpenAI's response_format
+  // Some Gemini-compatible relay routes can reject OpenAI's response_format
   // option upstream. The prompt still asks for JSON, so parsing remains safe.
   const supportsJsonMode = !/^gemini(?:[-:/]|$)/iu.test(model.trim());
   const base = baseURL(params.baseURL, apiMode);

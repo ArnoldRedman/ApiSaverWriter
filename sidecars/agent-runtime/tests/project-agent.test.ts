@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { ApiSaverClient } from "../src/models/api-saver.js";
+import { ModelApiClient } from "../src/models/model-api.js";
 import { buildProjectAgentContext, ProjectAgentChangeSchema, runProjectAgent } from "../src/project-agent.js";
 
 const project = {
@@ -22,7 +22,7 @@ const delegates = () => ({ chapter: vi.fn(), chapterRevise: vi.fn(), outline: vi
 
 const clientWith = (content: string) => ({
   chat: vi.fn().mockResolvedValue({ content, model: "test" }),
-}) as unknown as ApiSaverClient;
+}) as unknown as ModelApiClient;
 
 describe("project agent", () => {
   it("selects relevant project documents within the context packet", () => {
@@ -153,7 +153,7 @@ describe("project agent", () => {
       JSON.stringify({ action: "finish", message: "林舟已确认旧书来自码头仓库。", changes: [] }),
     ];
     const chat = vi.fn().mockImplementation(() => Promise.resolve({ content: turns.shift(), model: "test" }));
-    const client = { chat } as unknown as ApiSaverClient;
+    const client = { chat } as unknown as ModelApiClient;
 
     const result = await runProjectAgent({
       mode: "discuss",
@@ -184,7 +184,7 @@ describe("project agent", () => {
       instruction: "把旧仓库相关的章节全看一遍",
       project: bulky,
       maxSteps: 8,
-    }, { chat } as unknown as ApiSaverClient, delegates());
+    }, { chat } as unknown as ModelApiClient, delegates());
 
     expect(chat).toHaveBeenCalledTimes(8);
     // 被省略早期轮次时要如实告知模型，而不是默默丢掉
@@ -197,7 +197,7 @@ describe("project agent", () => {
 
   it("stops the loop at maxSteps and still returns a result", async () => {
     const chat = vi.fn().mockResolvedValue({ content: JSON.stringify({ action: "search", query: "林舟" }), model: "test" });
-    const client = { chat } as unknown as ApiSaverClient;
+    const client = { chat } as unknown as ModelApiClient;
 
     const result = await runProjectAgent({
       mode: "discuss",
@@ -223,7 +223,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "继续写第三章", project,
-    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapter: delegate });
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapter: delegate });
 
     expect(delegate).toHaveBeenCalledOnce();
     expect(result.changes.map(change => change.type)).toEqual(["chapter.create"]);
@@ -244,7 +244,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "整理林舟卡片", project,
-    }, { chat } as unknown as ApiSaverClient, { ...delegates(), card });
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), card });
 
     expect(result.message).toBe("整理完成。");
     expect(card).toHaveBeenCalledOnce();
@@ -265,7 +265,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "把第二章的 AI 味去掉", project,
-    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapterRevise });
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     expect(chapterRevise).toHaveBeenCalledWith(expect.objectContaining({ targetId: 2, instruction: "保留情节和人物口吻" }));
     expect(result.changes).toEqual([{ type: "chapter.update", summary: "去 AI 味", targetId: 2, content: "夜雨敲在窗框上。" }]);
@@ -284,7 +284,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "把全书都润色一遍", project,
-    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapterRevise });
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
 
     // 前 10 章真的执行，剩下的如实报错而不静默丢弃
     expect(chapterRevise).toHaveBeenCalledTimes(10);
@@ -306,7 +306,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "一口气把后面几章都写了", project, delegateBudgetMs: 5,
-    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapter });
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapter });
 
     // 第一项在预算内开跑，跑完就超时，后面三项不再发请求
     expect(chapter).toHaveBeenCalledOnce();
@@ -327,7 +327,7 @@ describe("project agent", () => {
 
     const result = await runProjectAgent({
       mode: "execute", instruction: "整理时间线并删掉空稿", project, delegateBudgetMs: 1,
-    }, { chat } as unknown as ApiSaverClient, delegates());
+    }, { chat } as unknown as ModelApiClient, delegates());
 
     expect(result.changes.map(change => change.type)).toEqual(["memory.document.upsert", "chapter.delete"]);
     expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(0);

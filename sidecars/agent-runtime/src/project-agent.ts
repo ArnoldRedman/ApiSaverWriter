@@ -2,7 +2,7 @@ import { z } from "zod";
 import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@zhizhang/contracts";
 export { ProjectAgentChangeSchema };
 export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@zhizhang/contracts";
-import { ApiSaverClient } from "./models/api-saver.js";
+import { ModelApiClient } from "./models/model-api.js";
 import { byteLength, compactText } from "./context/context-optimizer.js";
 
 // 三个委托口子都指向应用里已经存在的智能体
@@ -357,7 +357,7 @@ function boundedMessages(messages: AgentMessage[]): AgentMessage[] {
 
 export async function runProjectAgent(
   input: ProjectAgentInput,
-  client: ApiSaverClient,
+  client: ModelApiClient,
   delegates: ProjectAgentDelegates,
 ): Promise<ProjectAgentResult> {
   const context = buildProjectAgentContext(input);

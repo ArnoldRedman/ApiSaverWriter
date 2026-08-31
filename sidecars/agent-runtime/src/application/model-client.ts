@@ -1,4 +1,4 @@
-import { ApiSaverClient, normalizeWireMode } from "../models/api-saver.js";
+import { ModelApiClient, normalizeWireMode } from "../models/model-api.js";
 
 export const stringList = (value: unknown, limit = 20): string[] => Array.isArray(value)
   ? value.filter((item): item is string => typeof item === "string").map(item => item.trim()).filter(Boolean).slice(0, limit)
@@ -10,7 +10,7 @@ export const networkProxyConfig = (params?: Record<string, unknown>) => ({
   proxyBypassLocal: params?.proxyBypassLocal === true,
 });
 
-export const createModelClient = (params: Record<string, unknown>, defaults: { model?: string; requireModel?: boolean; allowMissingKey?: boolean } = {}) => {
+export const createModelApiClient = (params: Record<string, unknown>, defaults: { model?: string; requireModel?: boolean; allowMissingKey?: boolean } = {}) => {
   const apiKey = String(params.apiKey || "");
   const model = String(params.model || defaults.model || "");
   const baseURL = String(params.baseURL || "").trim();
@@ -21,7 +21,7 @@ export const createModelClient = (params: Record<string, unknown>, defaults: { m
   if (!baseURL && normalizeWireMode(params.apiMode) === "openai") {
     throw new Error("请先在设置中填写 API 接口地址。");
   }
-  return new ApiSaverClient({
+  return new ModelApiClient({
     apiKey,
     baseURL,
     defaultModel: model,

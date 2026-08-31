@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { createChapterGraph, selectSkillsByIntent, type SkillDefinition } from "./graphs/chapter-write.graph.js";
 import { StoryStore } from "./storage/story-store.js";
-import { ApiSaverClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/api-saver.js";
+import { ModelApiClient, getRuntimeUsageSummary, normalizeWireMode } from "./models/model-api.js";
 import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
-import { createModelClient, networkProxyConfig, stringList } from "./application/model-client.js";
+import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
 import { registerLibraryHandlers } from "./rpc/library-handlers.js";
@@ -53,7 +53,7 @@ async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse>
         };
         return { id: req.id, result: { ...cachedMemory, contextReport: cachedReport } };
       }
-      const client = createModelClient(req.params ?? {}, { model: "gpt-5.5" });
+      const client = createModelApiClient(req.params ?? {}, { model: "gpt-5.5" });
       const cardContext = Array.isArray(cards) && cards.length
         ? `\n## 已有卡片及当前状态（仅更新正文有证据的卡片）\n${cards.map(card => { const item = card as Record<string, unknown>; return `${String(item.id || "")}|${String(item.title || "卡片")}：${String(item.content || "")}\n当前状态：${String(item.currentState || "暂无")}`; }).join("\n")}`
         : "";
@@ -121,7 +121,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         if (runId) process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event: { ...event, timestamp: Date.now() } }) + "\n");
       };
       emitProjectEvent({ type: "progress", data: { step: "project-search", progress: 8, message: "正在检索全书章节、大纲、卡片、记忆和知识图谱" } });
-      const client = createModelClient(req.params ?? {}, { model: "gpt-4o-mini" });
+      const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
       // 三个委托都直接复用应用里已有的专用智能体 RPC，Agent 自己不写内容。
       // `...req.params` 会把 apiKey、skills、writingStyle 等一并带过去，和界面上点按钮走同一条路。
       const projectList = (key: string) => Array.isArray(projectRecord[key])
@@ -298,7 +298,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       if (!projectTitle || !cardType || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "缺少生成卡片所需参数" } };
       }
-      const client = createModelClient(req.params ?? {}, { model: "gpt-5.5" });
+      const client = createModelApiClient(req.params ?? {}, { model: "gpt-5.5" });
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
       const emitter = new StreamEmitter();
       emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
@@ -357,7 +357,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
       if (!projectTitle || !kind || !apiKey) {
         return { id: req.id, error: { code: -32602, message: "Missing required params" } };
       }
-      const client = createModelClient(req.params ?? {}, { model: "gpt-4o-mini" });
+      const client = createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" });
       const runId = typeof req.params?.runId === "string" ? req.params.runId : "";
       const emitter = new StreamEmitter();
       emitter.subscribe(event => process.stdout.write(JSON.stringify({ type: "agent_stream", runId, event }) + "\n"));
