@@ -17,14 +17,15 @@ export interface AgentConfig {
   proxyBypassLocal: boolean;
 }
 
-export const defaultBaseURL = 'https://api.apisaver.com/v1';
+/** 应用不内置任何中转厂商：OpenAI 兼容模式的地址必须由用户自己填。
+ *  Anthropic 有唯一的官方地址，所以只有它保留默认值。 */
 export const defaultAnthropicBaseURL = 'https://api.anthropic.com';
 export const apiModes: Array<{ value: ApiMode; label: string; hint: string; placeholder: string; endpoint: string }> = [
   { value: 'openai', label: 'OpenAI 兼容', hint: '走 /v1/chat/completions，请求头 Authorization: Bearer', placeholder: 'https://api.example.com/v1', endpoint: '/v1/chat/completions' },
   { value: 'anthropic', label: 'Anthropic Messages', hint: '走 /v1/messages，请求头 x-api-key + anthropic-version', placeholder: 'https://api.anthropic.com', endpoint: '/v1/messages' },
 ];
 export const apiModeLabel = (mode: ApiMode) => apiModes.find(item => item.value === mode)?.label ?? 'OpenAI 兼容';
-export const defaultBaseURLFor = (mode: ApiMode) => mode === 'anthropic' ? defaultAnthropicBaseURL : defaultBaseURL;
+export const defaultBaseURLFor = (mode: ApiMode) => mode === 'anthropic' ? defaultAnthropicBaseURL : '';
 /** OpenAI-compatible relays are addressed by their `/v1` root, Anthropic ones by
  * the host that serves `/v1/messages`. Returns '' for an unusable address so
  * callers can report it instead of silently falling back. */
@@ -46,10 +47,11 @@ export const resolvedEndpoint = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'
   if (!base) return '';
   return config.apiMode === 'anthropic' ? `${base}/v1/messages` : `${base}/chat/completions`;
 };
-// The gateway dashboard reads New API endpoints that only the managed ApiSaver
-// relay serves, so both the protocol and the host have to match.
-export const isDefaultApiService = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) =>
-  config.apiMode === 'openai' && normalizeBaseURL(config.baseURL, 'openai') === defaultBaseURL;
+// 用量面板读的是 New API 那套 /api/status、/api/user/self 端点。New API 是通用的
+// 中转站软件，不是某一家专有，所以只要是填了地址的 OpenAI 兼容配置就允许查询；
+// 对方没有这些端点时按接口报错处理，而不是提前把面板藏起来。
+export const supportsGatewayUsage = (config: Pick<AgentConfig, 'apiMode' | 'baseURL'>) =>
+  config.apiMode === 'openai' && Boolean(normalizeBaseURL(config.baseURL, 'openai'));
 
 export const contextWindowPresets = [64, 128, 200, 256, 512, 1024, 2048];
 export const maxContextWindowKTokens = 2048;
@@ -81,7 +83,7 @@ export const normalizeAgentConfig = (value: unknown): AgentConfig => {
   const storedWindow = Number((parsed as Record<string, unknown>).contextWindowKB ?? parsed.contextWindow) || 0;
   const storedReasoning = (parsed as Record<string, unknown>).reasoningMode;
   return {
-    serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : 'ApiSaver（省API）',
+    serviceName: typeof parsed.serviceName === 'string' ? parsed.serviceName : '自定义中转站',
     enabled: parsed.enabled !== false,
     apiMode,
     baseURL: normalizeBaseURL(typeof parsed.baseURL === 'string' ? parsed.baseURL : defaultBaseURLFor(apiMode), apiMode) || defaultBaseURLFor(apiMode),
@@ -137,10 +139,9 @@ export const loadAgentProfiles = (): { profiles: AgentProfile[]; activeId: strin
   return { profiles, activeId: profiles.some(profile => profile.id === storedActive) ? storedActive : profiles[0].id };
 };
 export const profilePresets: Array<{ id: string; label: string; hint: string; config: Partial<AgentConfig> }> = [
-  { id: 'apisaver', label: 'ApiSaver（省API）', hint: 'OpenAI 兼容 · 官方中转站', config: { serviceName: 'ApiSaver（省API）', apiMode: 'openai', baseURL: defaultBaseURL, model: fallbackModels[0] } },
+  { id: 'openai-relay', label: 'OpenAI 兼容', hint: '任意支持 /v1/chat/completions 的地址，需自行填写', config: { serviceName: '自定义中转站', apiMode: 'openai', baseURL: '' } },
   { id: 'anthropic', label: 'Anthropic 官方', hint: 'Messages · api.anthropic.com', config: { serviceName: 'Anthropic 官方', apiMode: 'anthropic', baseURL: defaultAnthropicBaseURL, model: 'claude-opus-5', enabledModels: ['claude-opus-5'] } },
-  { id: 'openai-relay', label: '自定义中转（OpenAI 兼容）', hint: '任意支持 /v1/chat/completions 的地址', config: { serviceName: '自定义中转站', apiMode: 'openai', baseURL: defaultBaseURL } },
-  { id: 'anthropic-relay', label: '自定义中转（Anthropic）', hint: '任意支持 /v1/messages 的地址', config: { serviceName: '自定义 Claude 中转', apiMode: 'anthropic', baseURL: defaultAnthropicBaseURL } },
+  { id: 'anthropic-relay', label: 'Anthropic 兼容中转', hint: '任意支持 /v1/messages 的地址', config: { serviceName: '自定义 Claude 中转', apiMode: 'anthropic', baseURL: '' } },
 ];
 
 /** Mirror of the runtime's `settings.diagnose` result. */

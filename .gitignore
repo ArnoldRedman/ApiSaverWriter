@@ -36,3 +36,6 @@ output/playwright/
 __pycache__/
 *.pyc
 .toolchains/
+
+# 临时补丁脚本
+.tmp-patch.py

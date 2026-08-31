@@ -13,12 +13,17 @@ export const networkProxyConfig = (params?: Record<string, unknown>) => ({
 export const createModelClient = (params: Record<string, unknown>, defaults: { model?: string; requireModel?: boolean; allowMissingKey?: boolean } = {}) => {
   const apiKey = String(params.apiKey || "");
   const model = String(params.model || defaults.model || "");
+  const baseURL = String(params.baseURL || "").trim();
   if ((!apiKey && !defaults.allowMissingKey) || (defaults.requireModel && !model)) {
     throw new Error(defaults.requireModel ? "缺少模型配置" : "请先在设置中填写 API Key。");
   }
+  // Anthropic 有唯一官方地址可以兜底，OpenAI 兼容模式必须由用户填写
+  if (!baseURL && normalizeWireMode(params.apiMode) === "openai") {
+    throw new Error("请先在设置中填写 API 接口地址。");
+  }
   return new ApiSaverClient({
     apiKey,
-    baseURL: String(params.baseURL || "https://api.apisaver.com/v1"),
+    baseURL,
     defaultModel: model,
     apiMode: normalizeWireMode(params.apiMode),
     reasoningMode: String(params.reasoningMode || "auto"),

@@ -12,7 +12,7 @@ import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOp
 import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
-import { defaultBaseURL, defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, isDefaultApiService, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
+import { defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, supportsGatewayUsage, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import { readerFonts, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
 import { sidebarWidthKey, sidebarTabsHeightKey, clampSidebarWidth, clampSidebarTabsHeight } from './features/editor/layout';
 import './App.css';
@@ -1383,9 +1383,9 @@ function App() {
     return () => window.clearInterval(timer);
   }, []);
   const refreshGatewayUsage = async () => {
-    if (!isDefaultApiService(settingsDraft)) {
+    if (!supportsGatewayUsage(settingsDraft)) {
       setGatewayUsage(null);
-      setGatewayUsageError('自定义接口不支持 ApiSaver 中转站用量查询。');
+      setGatewayUsageError('请先填写 OpenAI 兼容接口地址，再查询中转站用量。');
       return;
     }
     const key = settingsDraft.apiKey.trim() || agentConfig.apiKey.trim();
@@ -1459,7 +1459,7 @@ function App() {
   const refreshGatewayUsageRef = useRef(refreshGatewayUsage);
   refreshGatewayUsageRef.current = refreshGatewayUsage;
   const gatewayUsageRequestRef = useRef('');
-  const gatewayUsageRequestKey = showSettingsModal && settingsSection === 'usage' && isDefaultApiService(settingsDraft)
+  const gatewayUsageRequestKey = showSettingsModal && settingsSection === 'usage' && supportsGatewayUsage(settingsDraft)
     ? `${settingsDraft.apiMode}:${settingsDraft.baseURL}:${settingsDraft.apiKey}`
     : '';
   useEffect(() => {
@@ -2159,7 +2159,7 @@ function App() {
           outlines,
           chapters,
           apiKey: agentConfig.apiKey.trim(),
-          baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
           reasoningMode: agentConfig.reasoningMode,
@@ -2482,7 +2482,7 @@ function App() {
     try {
       const result = await agentRpc<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('book.dismantle', {
           bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.content,
-          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2527,7 +2527,7 @@ function App() {
         updateDismantleBook(book.id, current => ({ ...current, chapters: current.chapters.map(item => item.id === chapter.id ? { ...item, status: 'analyzing' } : item), updatedAt: new Date().toISOString() }));
         const result = await agentRpc<{ summary?: string; detailedOutline?: string; plotBeats?: string[]; characterDynamics?: string[]; setupPayoff?: string[]; pacing?: string }>('book.dismantle', {
             bookTitle: book.title, chapterTitle: chapter.title, chapterNumber: chapter.number, sourceContent: chapter.sourceContent,
-            apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+            apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim(),
             model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
             contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
           });
@@ -2562,7 +2562,7 @@ function App() {
       const result = await agentRpc<{ content?: string }>('book.rewrite', {
           bookTitle: book.title, chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline,
           instruction: dismantleRewriteInstruction, targetWords: 2200,
-          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2592,7 +2592,7 @@ function App() {
     try {
       const result = await agentRpc<{ name?: string; description?: string; tags?: string[]; content?: string }>('book.style.distill', {
           bookTitle: book.title, styleName: `${book.title}文风`, samples: chapters.map(chapter => ({ title: chapter.title, content: chapter.sourceContent })),
-          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2645,7 +2645,7 @@ function App() {
       const result = await agentRpc<{ title?: string; content?: string }>('book.adapt', {
           projectTitle: target.title, projectSynopsis: target.synopsis, projectOutlines: target.outlines.map(outline => `## ${outline.kind}\n${outline.content}`).join('\n\n'),
           chapterTitle: chapter.title, detailedOutline: chapter.detailedOutline, rewriteContent: chapter.rewriteContent, styleProfile: style?.content,
-          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          apiKey: agentConfig.apiKey.trim(), baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0], apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode,
           contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
@@ -2853,7 +2853,7 @@ function App() {
           content: newSkill.content.trim(),
           tags: newSkill.tags.split(',').map(tag => tag.trim()).filter(Boolean),
           apiKey: agentConfig.apiKey.trim(),
-          baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+          baseURL: agentConfig.baseURL.trim(),
           model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode,
           reasoningMode: agentConfig.reasoningMode,
@@ -3424,7 +3424,7 @@ function App() {
             projectTitle: editingProject.title,
             chapterTitle: activeChapter.title,
             apiKey: agentConfig.apiKey.trim(),
-            baseURL: agentConfig.baseURL.trim() || defaultBaseURL, model: agentConfig.model.trim() || fallbackModels[0],
+            baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0],
             apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
           });
         const content = result.content?.trim() || '';
@@ -3455,7 +3455,7 @@ function App() {
           mode, instruction: aiToolInstruction.trim(), content: source,
           projectTitle: editingProject.title, chapterTitle: activeChapter.title,
           apiKey: agentConfig.apiKey.trim(),
-          baseURL: agentConfig.baseURL.trim() || defaultBaseURL, model: agentConfig.model.trim() || fallbackModels[0],
+          baseURL: agentConfig.baseURL.trim(), model: agentConfig.model.trim() || fallbackModels[0],
           apiMode: agentConfig.apiMode, reasoningMode: agentConfig.reasoningMode, contextWindow: agentConfig.contextWindow, ...agentNetworkParams(agentConfig),
         });
       const content = result.content?.trim() || '';
@@ -3865,7 +3865,7 @@ function App() {
             content: chapter.content,
             cards: localProject.cards.filter(card => selectedCardIds.includes(card.id) || (card.title.trim() && chapter.content.includes(card.title))).slice(0, 10),
             apiKey: agentConfig.apiKey.trim(),
-              baseURL: agentConfig.baseURL.trim() || defaultBaseURL,
+              baseURL: agentConfig.baseURL.trim(),
             model: agentConfig.model.trim() || fallbackModels[0],
             apiMode: agentConfig.apiMode,
             reasoningMode: agentConfig.reasoningMode,
@@ -5300,7 +5300,7 @@ function App() {
     const apiKey = settingsDraft.apiKey.trim();
     const saved: AgentConfig = {
       ...settingsDraft,
-      serviceName: settingsDraft.serviceName.trim() || 'ApiSaver（省API）',
+      serviceName: settingsDraft.serviceName.trim() || '自定义中转站',
       baseURL: normalizedBaseURL,
       apiKey,
       model: selectedModel,
@@ -6863,9 +6863,9 @@ function App() {
                 <label className="settings-network-check"><input type="checkbox" checked={settingsDraft.proxyBypassLocal} onChange={(event) => setSettingsDraft({ ...settingsDraft, proxyBypassLocal: event.target.checked })} /> 本地地址不走代理（推荐）</label>
                 <small className="settings-network-note">支持 HTTP/HTTPS 代理，例如 Clash、Surge、V2Ray 的本地 HTTP 端口。</small>
               </section>}
-              {settingsSection === 'usage' && isDefaultApiService(settingsDraft) && <section className="usage-dashboard">
+              {settingsSection === 'usage' && supportsGatewayUsage(settingsDraft) && <section className="usage-dashboard">
                 <div className="usage-filter-bar"><div className="usage-range-checks">{[['all', '全部时间'], ['today', '今天'], ['1', '近 1 天'], ['7', '近 7 天'], ['14', '近 14 天'], ['30', '近 30 天']].map(([value, label]) => <button type="button" key={value} className={!usageStartDate && !usageEndDate && usageDateFilter === value ? 'active' : ''} onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter(value); }}>{label}</button>)}</div><div className="usage-date-controls"><label>开始<input type="date" value={usageStartDate} onChange={event => { setUsageStartDate(event.target.value); setUsageDateFilter('custom'); }} /></label><span>至</span><label>结束<input type="date" value={usageEndDate} onChange={event => { setUsageEndDate(event.target.value); setUsageDateFilter('custom'); }} /></label><button className="link-button" onClick={() => { setUsageStartDate(''); setUsageEndDate(''); setUsageDateFilter('all'); }}>重置</button></div></div>
-                <div className="gateway-usage-heading"><div><strong>ApiSaver 中转站用量</strong><small>余额、模型广场定价与日志均直接来自中转站；仅使用当前配置的 API Key 查询。</small></div><button className="btn-secondary" disabled={gatewayUsageLoading} onClick={() => void refreshGatewayUsage()}>{gatewayUsageLoading ? '刷新中...' : '刷新中转站数据'}</button></div>
+                <div className="gateway-usage-heading"><div><strong>中转站用量</strong><small>余额、模型定价与日志直接来自你配置的中转站（需支持 New API 端点）；仅使用当前配置的 API Key 查询。</small></div><button className="btn-secondary" disabled={gatewayUsageLoading} onClick={() => void refreshGatewayUsage()}>{gatewayUsageLoading ? '刷新中...' : '刷新中转站数据'}</button></div>
                 {gatewayUsageError && <p className="model-list-message error">{gatewayUsageError}</p>}
                 {gatewayUsage?.errors.length ? <p className="model-list-message error">{gatewayUsage.errors.join('；')}</p> : null}
                 {gatewayUsage && <>
@@ -6891,7 +6891,7 @@ function App() {
                 </>}
                 <details className="local-usage-details"><summary>本机应用统计（离线回退）</summary><div className="usage-total"><span>{usageDateFilter === 'all' ? '全部时间本机处理 Tokens' : '筛选时间本机处理 Tokens'}</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div><div className="usage-metrics"><div><span>输入</span><b>{usageView.inputTokens.toLocaleString()}</b></div><div><span>输出</span><b>{usageView.outputTokens.toLocaleString()}</b></div><div><span>缓存命中</span><b>{usageView.cachedInputTokens.toLocaleString()}</b></div><div><span>缓存命中率</span><b>{usageView.inputTokens ? `${((usageView.cachedInputTokens / usageView.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div></div><div className="usage-day-list"><h4>按天统计</h4>{usageRows.sort((a, b) => b.date.localeCompare(a.date)).map(day => <div className="usage-day-row" key={day.date}><strong>{day.date}</strong><span>{day.totalTokens.toLocaleString()} tokens</span><span>缓存 {day.cachedInputTokens.toLocaleString()}</span><b>{day.inputTokens ? `${((day.cachedInputTokens / day.inputTokens) * 100).toFixed(1)}%` : '--'}</b></div>)}</div></details>
               </section>}
-              {settingsSection === 'usage' && !isDefaultApiService(settingsDraft) && <section className="usage-dashboard"><p className="empty-hint">自定义接口可使用本机 Token 统计，但不提供 ApiSaver 中转站余额、价格和日志查询。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
+              {settingsSection === 'usage' && !supportsGatewayUsage(settingsDraft) && <section className="usage-dashboard"><p className="empty-hint">Anthropic 接口或未填写地址时只有本机 Token 统计，没有中转站余额、价格和日志。</p><details className="local-usage-details" open><summary>本机应用统计</summary><div className="usage-total"><span>本机处理 Tokens</span><strong>{usageView.totalTokens.toLocaleString()}</strong><small>请求 {usageView.requests} 次</small></div></details></section>}
               {settingsSection === 'sync' && <>
                 <section className="settings-sync-card">
                   <div className="settings-network-header"><div><strong>本地备份包</strong><small>不需要百度网盘或 GitHub 账号，直接写到本机下载目录</small></div><span className="settings-sync-badge">离线</span></div>

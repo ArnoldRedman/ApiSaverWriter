@@ -605,7 +605,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         const graph = createChapterGraph({
           store,
           apiKey: String(apiKey),
-          baseURL: String(baseURL || "https://api.apisaver.com/v1"),
+          baseURL: String(baseURL || ""),
           model: String(model || "gpt-4o-mini"),
           apiMode: normalizeWireMode(apiMode),
           reasoningMode: String(reasoningMode || "auto"),

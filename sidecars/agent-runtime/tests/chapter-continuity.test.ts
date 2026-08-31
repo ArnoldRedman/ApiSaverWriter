@@ -30,6 +30,7 @@ describe("chapter continuity context", () => {
     const graph = createChapterGraph({
       store,
       apiKey: "test-key",
+      baseURL: "https://relay.test/v1",
       model: "test-model",
     });
     const result = await graph.invoke({

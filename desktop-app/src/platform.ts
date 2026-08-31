@@ -41,7 +41,9 @@ const isQuotaExceeded = (value: string) => /quota\s+(?:has\s+been\s+)?exceeded|i
  * the host that serves `/v1/messages`. */
 const baseURL = (value: unknown, mode: 'openai' | 'anthropic' = 'openai') => {
   const raw = stringValue(value).trim().replace(/\/+$/u, '');
-  const fallback = mode === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.apisaver.com/v1';
+  // 只有 Anthropic 有唯一官方地址可以兜底；OpenAI 兼容模式不内置任何厂商
+  const fallback = mode === 'anthropic' ? 'https://api.anthropic.com' : '';
+  if (!raw && !fallback) throw new Error('请先在设置中填写 API 接口地址');
   try {
     const parsed = new URL(raw || fallback);
     if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('协议不受支持');

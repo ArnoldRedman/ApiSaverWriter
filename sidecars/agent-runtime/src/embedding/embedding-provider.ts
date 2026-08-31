@@ -16,7 +16,8 @@ export interface EmbeddingProvider {
 
 function normalizeEmbeddingBaseURL(value: string): string {
   const raw = value.trim().replace(/\/+$/, '');
-  if (!/^https?:\/\//i.test(raw)) return "https://api.apisaver.com/v1";
+  // 不内置厂商地址：填错或没填时直接报错，否则会静默把正文发到别人的服务上
+  if (!/^https?:\/\//i.test(raw)) throw new Error("Embedding 接口地址无效，请在设置中填写完整的 http:// 或 https:// 地址");
   return /\/v1$/i.test(raw) ? raw : `${raw}/v1`;
 }
 
@@ -30,7 +31,7 @@ export class ApiSaverEmbeddingProvider implements EmbeddingProvider {
 
   constructor(
     private apiKey: string,
-    baseURL: string = "https://api.apisaver.com/v1",
+    baseURL: string,
     private model: string = "text-embedding-3-small",
     dimensions?: number
   ) {

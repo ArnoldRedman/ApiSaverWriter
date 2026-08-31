@@ -13,12 +13,12 @@ describe("API Saver model configuration", () => {
       provider: "openai",
       apiKey: "test-key",
       model: "gpt-4o-mini",
-      baseUrl: "https://api.apisaver.com",
+      baseUrl: "https://relay.test",
     })).toEqual({
       provider: "openai",
       apiKey: "test-key",
       model: "gpt-4o-mini",
-      baseUrl: "https://api.apisaver.com/v1",
+      baseUrl: "https://relay.test/v1",
     });
   });
 
@@ -27,12 +27,12 @@ describe("API Saver model configuration", () => {
       provider: "claude",
       apiKey: "test-key",
       model: "claude-3-5-sonnet",
-      baseUrl: "https://api.apisaver.com/v1/messages",
-    }).baseUrl).toBe("https://api.apisaver.com/v1/messages");
+      baseUrl: "https://relay.test/v1/messages",
+    }).baseUrl).toBe("https://relay.test/v1/messages");
   });
 
   it("creates a LangChain chat model for both providers", () => {
-    expect(createChatModel(buildModelConfig({ provider: "openai", apiKey: "x", model: "gpt-4o-mini" }))._llmType()).toBe("openai");
+    expect(createChatModel(buildModelConfig({ provider: "openai", apiKey: "x", model: "gpt-4o-mini", baseUrl: "https://relay.test/v1" }))._llmType()).toBe("openai");
     expect(createChatModel(buildModelConfig({ provider: "claude", apiKey: "x", model: "claude-3-5-sonnet" }))._llmType()).toBe("anthropic");
   });
 
@@ -189,11 +189,11 @@ describe("API Saver model configuration", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ model: "gpt-5.6-terra", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
 
     await expect(new ApiSaverClient({
-      apiKey: "test-key", defaultModel: "gpt-5.6-terra", apiMode: "responses",
+      apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-5.6-terra", apiMode: "responses",
     }).chat([{ role: "user", content: "测试" }], { response_format: { type: "json_object" } }))
       .resolves.toMatchObject({ content: "OK" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apisaver.com/v1/chat/completions");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://relay.test/v1/chat/completions");
   });
 
   it("uses the configured custom address for chat requests", async () => {
@@ -211,7 +211,7 @@ describe("API Saver model configuration", () => {
       .mockResolvedValue(new Response(JSON.stringify({ model: "gemini-3.7-flash", choices: [{ message: { content: "{}" } }] }), { status: 200 }));
 
     await new ApiSaverClient({
-      apiKey: "test-key", defaultModel: "gemini-3.7-flash", reasoningMode: "high",
+      apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gemini-3.7-flash", reasoningMode: "high",
     }).chat([{ role: "user", content: "请输出 JSON" }], { response_format: { type: "json_object" } });
 
     const requestBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
@@ -224,9 +224,9 @@ describe("API Saver model configuration", () => {
       .mockResolvedValueOnce(new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: [{ type: "text", text: "第一段" }, { text: "第二段" }] } }] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ model: "gpt-test", choices: [{ text: "旧格式正文" }] }), { status: 200 }));
 
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
       .chat([{ role: "user", content: "测试" }])).resolves.toMatchObject({ content: "第一段\n第二段" });
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
       .chat([{ role: "user", content: "测试" }])).resolves.toMatchObject({ content: "旧格式正文" });
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -237,7 +237,7 @@ describe("API Saver model configuration", () => {
       choices: [{ message: { role: "assistant", content: "" }, finish_reason: "length" }],
     }), { status: 200 }));
 
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gemini-3.7-flash" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gemini-3.7-flash" })
       .chat([{ role: "user", content: "测试" }], { max_tokens: 8, retryAttempts: 1 }))
       .rejects.toThrow("模型输出被截断（max_tokens=8）");
   });
@@ -248,7 +248,7 @@ describe("API Saver model configuration", () => {
       choices: [{ message: { reasoning_content: "内部推理" }, finish_reason: "stop" }],
     }), { status: 200 }));
 
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
       .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
       .rejects.toThrow("只返回了推理内容");
   });
@@ -269,7 +269,7 @@ describe("API Saver model configuration", () => {
       { status: 200, headers: { "Content-Type": "text/event-stream" } },
     ));
 
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
       .chatStream([{ role: "user", content: "测试" }]))
       .resolves.toMatchObject({ content: "第一段", model: "gpt-test" });
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -290,7 +290,7 @@ describe("API Saver model configuration", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: "OK" } }] }), { status: 200 }));
 
-    await new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test", reasoningMode: "max" })
+    await new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test", reasoningMode: "max" })
       .chat([{ role: "user", content: "测试" }]);
 
     const body = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as Record<string, unknown>;
@@ -304,7 +304,7 @@ describe("API Saver model configuration", () => {
       { status: 400 },
     ));
 
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "claude-x" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "claude-x" })
       .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
       .rejects.toThrow("model: claude-x not found");
   });
@@ -312,7 +312,7 @@ describe("API Saver model configuration", () => {
   it("explains a 404 as a possible API format mismatch", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("not found", { status: 404 }));
 
-    await expect(new ApiSaverClient({ apiKey: "test-key", defaultModel: "gpt-test" })
+    await expect(new ApiSaverClient({ apiKey: "test-key", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
       .chat([{ role: "user", content: "测试" }], { retryAttempts: 1 }))
       .rejects.toThrow("切换为 Anthropic Messages");
   });

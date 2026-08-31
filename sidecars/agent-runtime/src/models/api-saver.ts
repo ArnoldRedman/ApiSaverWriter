@@ -25,11 +25,12 @@ export interface ApiSaverModelConfig {
   maxTokens?: number;
 }
 
-const DEFAULT_API_BASE_URL = "https://api.apisaver.com/v1";
 const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, "");
 
+// 应用不内置任何 OpenAI 兼容厂商：地址为空时直接报错，不能悄悄连到某个默认站点
 function normalizeOpenAIBaseURL(value?: string): string {
-  const raw = trimTrailingSlash(value?.trim() || DEFAULT_API_BASE_URL);
+  const raw = trimTrailingSlash(value?.trim() || "");
+  if (!raw) throw new Error("请先在设置中填写 API 接口地址");
   let parsed: URL;
   try {
     parsed = new URL(raw);
@@ -239,11 +240,11 @@ function apiErrorMessage(context: ApiErrorContext): string {
       : upstream;
     return `模型接口拒绝了请求（${status}）${requestHint}${routeHint}${protocolHint(status, mode)}。${cause}`;
   }
-  return `API Saver 请求失败（${status}）${routeHint}${requestHint}${protocolHint(status, mode)}${sizeHint}：${body.text || statusText || "未知错误"}`;
+  return `模型接口请求失败（${status}）${routeHint}${requestHint}${protocolHint(status, mode)}${sizeHint}：${body.text || statusText || "未知错误"}`;
 }
 
 export function buildModelConfig(input: ApiSaverModelInput): ApiSaverModelConfig {
-  const anthropicBaseURL = trimTrailingSlash(input.baseUrl?.trim() || "https://api.apisaver.com");
+  const anthropicBaseURL = trimTrailingSlash(input.baseUrl?.trim() || DEFAULT_ANTHROPIC_ROOT);
   const baseUrl = input.provider === "openai"
     ? normalizeOpenAIBaseURL(input.baseUrl)
     : anthropicBaseURL.endsWith("/messages") ? anthropicBaseURL : `${anthropicBaseURL}/v1/messages`;
@@ -667,7 +668,8 @@ export class ApiSaverClient {
    * relay keys. These endpoints deliberately authenticate each key on its own,
    * so the app never needs a dashboard cookie and cannot see another user. */
   async getGatewayUsageSnapshot(): Promise<GatewayUsageSnapshot> {
-    const root = "https://api.apisaver.com";
+    // /api/status 与 /api/user/self 挂在中转站根域上，不在 /v1 下面
+    const root = trimTrailingSlash(normalizeOpenAIBaseURL(this.config.baseURL).replace(/\/v1$/i, ""));
     const endpoint = (path: string) => `${root}${path}`;
     const keys = [this.requestKey];
     const requestJSON = async (path: string, key?: string): Promise<Record<string, unknown>> => {
