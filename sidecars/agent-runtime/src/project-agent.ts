@@ -33,6 +33,8 @@ interface ProjectAgentInput {
   activeChapterId?: unknown;
   contextWindowKTokens?: unknown;
   maxSteps?: unknown;
+  /** 委派阶段的整轮墙钟预算，缺省用 DELEGATE_BUDGET_MS */
+  delegateBudgetMs?: unknown;
   onStep?: (step: { kind: "search" | "open"; message: string }) => void;
 }
 
@@ -291,7 +293,7 @@ changes 里每一项只能是下列九种之一，字段必须原样铺平，不
 章节修订和删除的额外约束：
 - chapter.revise 和 chapter.delete 的 targetId 必须是项目索引里真实存在的章节 id，不是第几章的序号。
 - 修订前先 open 该章正文，确认真的需要改，不要凭标题猜。
-- chapter.revise 会重写整章正文，一次最多提 3 章；更多章节请分批，并在 message 里说明已处理范围和剩下的部分。
+- chapter.revise 会重写整章正文，一次最多提 10 章；更多章节请分批，并在 message 里说明已处理范围和剩下的部分。
 - 删除是不可恢复操作：只有作者明确要求删除时才能提，不要自作主张清理你觉得多余的章节。`;
 
 type AgentMessage = { role: "system" | "user" | "assistant"; content: string };
@@ -304,6 +306,21 @@ type AgentMessage = { role: "system" | "user" | "assistant"; content: string };
  * ponytail: 固定上限并从中间丢旧工具结果；若以后需要更长的检索链，再改为按轮次摘要压缩
  */
 const REQUEST_BODY_LIMIT = 40_000;
+
+/**
+ * 单轮修订章数上限
+ * 修订一章要跑一次完整的正文重写，成本接近写新章；超出的部分如实告知而不静默丢弃。
+ */
+const REVISE_LIMIT = 10;
+
+/**
+ * 委派阶段的整轮墙钟预算
+ * 每个委派内部的 fetch 各自有超时（最长 300 秒 × 重试），但一轮 changes 最多 16 项，
+ * 串行跑下来仍可能几十分钟不返回，前端只看到项目 Agent 一直转。
+ * 超预算后剩余委派如实报出来，让作者再说一次继续。
+ * ponytail: 固定预算，需要按模型实际速度自适应时再做成设置项
+ */
+const DELEGATE_BUDGET_MS = 20 * 60_000;
 
 function boundedMessages(messages: AgentMessage[]): AgentMessage[] {
   const size = (list: AgentMessage[]) => list.reduce((sum, message) => sum + byteLength(message.content), 0);
@@ -410,8 +427,8 @@ export async function runProjectAgent(
   if (input.mode === "discuss") return { message: plan.message, changes: [], toolEvents };
 
   const changes: ProjectAgentChange[] = [];
-  // 修订一章要跑一次完整的正文重写，成本接近写新章；单轮硬限 3 章，超出部分如实告知而不静默丢弃
-  const reviseLimit = 3;
+  const budgetMs = Math.max(0, Number(input.delegateBudgetMs) || DELEGATE_BUDGET_MS);
+  const deadline = Date.now() + budgetMs;
   let revisedCount = 0;
   for (const raw of plan.changes) {
     // 逐条校验：一条写坏只丢这一条并如实报出来，不连累其余变更和回复正文
@@ -424,8 +441,8 @@ export async function runProjectAgent(
     const change = parsed.data;
     if (change.type === "chapter.revise") {
       revisedCount += 1;
-      if (revisedCount > reviseLimit) {
-        toolEvents.push({ tool: "chapter.revise", status: "error", message: `单轮最多修订 ${reviseLimit} 章，章节 ${change.targetId} 本轮未处理，请再说一次继续` });
+      if (revisedCount > REVISE_LIMIT) {
+        toolEvents.push({ tool: "chapter.revise", status: "error", message: `单轮最多修订 ${REVISE_LIMIT} 章，章节 ${change.targetId} 本轮未处理，请再说一次继续` });
         continue;
       }
     }
@@ -438,6 +455,11 @@ export async function runProjectAgent(
     }[change.type as string];
     if (!delegateFor) {
       changes.push(ProjectAgentChangeSchema.parse(change));
+      continue;
+    }
+    // 预算只拦委派：其余变更不调模型，几乎不花时间
+    if (Date.now() >= deadline) {
+      toolEvents.push({ tool: change.type, status: "error", message: `本轮委派已用满 ${Math.round(budgetMs / 60_000)} 分钟预算，「${change.summary}」未处理，请再说一次继续` });
       continue;
     }
     try {

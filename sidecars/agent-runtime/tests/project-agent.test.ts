@@ -273,7 +273,7 @@ describe("project agent", () => {
 
   it("caps revises per turn so one request cannot rewrite the whole book", async () => {
     const chat = vi.fn().mockResolvedValue({
-      content: JSON.stringify({ action: "finish", message: "开始批量修订。", changes: Array.from({ length: 5 }, (_, index) => ({
+      content: JSON.stringify({ action: "finish", message: "开始批量修订。", changes: Array.from({ length: 13 }, (_, index) => ({
         type: "chapter.revise", summary: `修订 ${index + 1}`, targetId: index + 1, instruction: "润色",
       })) }),
       model: "test",
@@ -286,9 +286,50 @@ describe("project agent", () => {
       mode: "execute", instruction: "把全书都润色一遍", project,
     }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapterRevise });
 
-    // 前 3 章真的执行，剩下的如实报错而不静默丢弃
-    expect(chapterRevise).toHaveBeenCalledTimes(3);
-    expect(result.changes).toHaveLength(3);
-    expect(result.toolEvents.filter(event => event.tool === "chapter.revise" && event.status === "error")).toHaveLength(2);
+    // 前 10 章真的执行，剩下的如实报错而不静默丢弃
+    expect(chapterRevise).toHaveBeenCalledTimes(10);
+    expect(result.changes).toHaveLength(10);
+    expect(result.toolEvents.filter(event => event.tool === "chapter.revise" && event.status === "error")).toHaveLength(3);
+  });
+
+  it("整轮委派超预算后停手，剩余变更如实报出", async () => {
+    // 回归：一轮最多 16 项委派，每项都要跑完整的正文生成，串行下来可能几十分钟不返回
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "开始批量起草。", changes: Array.from({ length: 4 }, (_, index) => ({
+        type: "chapter.draft_next", summary: `起草 ${index + 1}`, title: `第 ${index + 3} 章`, instruction: "承接上一章",
+      })) }),
+      model: "test",
+    });
+    const chapter = vi.fn().mockImplementation((request: { summary: string; title: string }) => new Promise(resolve => {
+      setTimeout(() => resolve({ type: "chapter.create", summary: request.summary, title: request.title, content: "正文。" }), 12);
+    }));
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "一口气把后面几章都写了", project, delegateBudgetMs: 5,
+    }, { chat } as unknown as ApiSaverClient, { ...delegates(), chapter });
+
+    // 第一项在预算内开跑，跑完就超时，后面三项不再发请求
+    expect(chapter).toHaveBeenCalledOnce();
+    expect(result.changes).toHaveLength(1);
+    const skipped = result.toolEvents.filter(event => event.tool === "chapter.draft_next" && event.status === "error");
+    expect(skipped).toHaveLength(3);
+    expect(skipped[0].message).toContain("未处理");
+  });
+
+  it("预算只拦委派，不影响本地就能落地的变更", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "整理完成。", changes: [
+        { type: "memory.document.upsert", summary: "整理时间线", kind: "时间线", title: "时间线", content: "第一天入城。" },
+        { type: "chapter.delete", summary: "删除空稿", targetId: 2, title: "第二章 夜雨" },
+      ] }),
+      model: "test",
+    });
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "整理时间线并删掉空稿", project, delegateBudgetMs: 1,
+    }, { chat } as unknown as ApiSaverClient, delegates());
+
+    expect(result.changes.map(change => change.type)).toEqual(["memory.document.upsert", "chapter.delete"]);
+    expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(0);
   });
 });
