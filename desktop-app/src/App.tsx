@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ChangeEvent } from 'react';
+import { useState, useEffect, useRef, type ChangeEvent, type PointerEvent as ReactPointerEvent } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
@@ -14,6 +14,7 @@ import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, norma
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
 import { defaultBaseURL, defaultBaseURLFor, apiModes, apiModeLabel, normalizeBaseURL, resolvedEndpoint, isDefaultApiService, contextWindowPresets, maxContextWindowKTokens, formatContextWindow, clampContextWindow, reasoningModes, fallbackModels, normalizeAgentConfig, profilesStorageKey, activeProfileStorageKey, newProfileId, normalizeAgentProfile, loadAgentProfiles, profilePresets, diagnosticStatusIcon, agentNetworkParams, type AgentConfig, type AgentProfile, type DiagnosticReport } from './features/settings/model-config';
 import { readerFonts, appearanceStorageKey, loadAppearance, applyAppearance, type Appearance } from './features/settings/appearance';
+import { sidebarWidthKey, sidebarTabsHeightKey, clampSidebarWidth, clampSidebarTabsHeight } from './features/editor/layout';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
@@ -1441,10 +1442,14 @@ function App() {
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [readingMode, setReadingMode] = useState(false);
   const [draggingChapterId, setDraggingChapterId] = useState<number | null>(null);
+  // 编辑器侧栏宽度与标签区高度：拖动手柄调整，松手写回 localStorage
+  const [sidebarWidth, setSidebarWidth] = useState(() => clampSidebarWidth(Number(localStorage.getItem(sidebarWidthKey))));
+  const [sidebarTabsHeight, setSidebarTabsHeight] = useState(() => clampSidebarTabsHeight(Number(localStorage.getItem(sidebarTabsHeightKey))));
   const [localBackups, setLocalBackups] = useState<{ directory: string; files: Array<{ name: string; size: number; modifiedAt: number }> }>({ directory: '', files: [] });
   const [showLocalBackupPicker, setShowLocalBackupPicker] = useState(false);
   const projectAgentMessagesRef = useRef<HTMLDivElement | null>(null);
   const chaptersListRef = useRef<HTMLDivElement | null>(null);
+  const sidebarTabsRef = useRef<HTMLDivElement | null>(null);
   const chapterEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
@@ -2955,6 +2960,35 @@ function App() {
     setActiveCardId(null);
     setSelectedCardIds([]);
     setActiveChapterMemoryId(null);
+  };
+
+  const resizeSidebar = (value: number) => {
+    const next = clampSidebarWidth(value);
+    setSidebarWidth(next);
+    localStorage.setItem(sidebarWidthKey, String(next));
+  };
+
+  const resizeSidebarTabs = (value: number) => {
+    const next = clampSidebarTabsHeight(value);
+    setSidebarTabsHeight(next);
+    localStorage.setItem(sidebarTabsHeightKey, String(next));
+  };
+
+  // 侧栏两个拖动手柄共用：pointer capture 让指针移出手柄后仍能收到事件，松手自动解绑
+  const beginPanelResize = (event: ReactPointerEvent<HTMLDivElement>, axis: 'x' | 'y', from: number, resize: (value: number) => void) => {
+    event.preventDefault();
+    const handle = event.currentTarget;
+    const origin = axis === 'x' ? event.clientX : event.clientY;
+    handle.setPointerCapture(event.pointerId);
+    const move = (pointer: PointerEvent) => resize(from + (axis === 'x' ? pointer.clientX : pointer.clientY) - origin);
+    const finish = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', finish);
+      handle.removeEventListener('pointercancel', finish);
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', finish);
   };
 
   // 选中章节并把它滚到列表可见区域，长篇不必手动滚动查找
@@ -5757,8 +5791,11 @@ function App() {
           )}
 
           <div className="editor-body">
-            <aside className="editor-sidebar">
-              <div className="editor-sidebar-tabs">
+            <aside
+              className="editor-sidebar"
+              style={{ ['--editor-sidebar-width' as string]: `${sidebarWidth}px`, ['--editor-sidebar-tabs-height' as string]: `${sidebarTabsHeight}px` }}
+            >
+              <div className="editor-sidebar-tabs" ref={sidebarTabsRef}>
                 <button
                   className={editorSidebarTab === 'chapters' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('chapters')}
@@ -5808,6 +5845,22 @@ function App() {
                   AI 检测
                 </button>
               </div>
+              <div
+                className="editor-sidebar-tabs-resizer"
+                role="separator"
+                aria-orientation="horizontal"
+                aria-label="拖动调整标签区高度"
+                tabIndex={0}
+                title="拖动调整标签区高度，标签放不下时自行滚动"
+                onPointerDown={event => beginPanelResize(event, 'y', sidebarTabsRef.current?.offsetHeight || sidebarTabsHeight, resizeSidebarTabs)}
+                onKeyDown={event => {
+                  const step = event.key === 'ArrowUp' ? -16 : event.key === 'ArrowDown' ? 16 : 0;
+                  if (step) {
+                    event.preventDefault();
+                    resizeSidebarTabs(sidebarTabsHeight + step);
+                  }
+                }}
+              />
 
               {editorSidebarTab === 'ai-detect' && (() => {
                 const report = editingProject.aiDetection;
@@ -5827,19 +5880,22 @@ function App() {
                 </div>;
               })()}
 
-              {editorSidebarTab === 'chapters' && (
+              {editorSidebarTab === 'chapters' && (() => {
+                const chapters = editingProject.chapters;
+                const activeIndex = activeChapter ? chapters.findIndex(item => item.id === activeChapter.id) : -1;
+                const selected = activeIndex >= 0 ? chapters[activeIndex] : null;
+                const recycled = editingProject.deletedChapters?.length || 0;
+                return (
                 <div className="chapters-panel">
                   <div className="project-writing-stats">
                     <strong>{editingProject.wordCount.toLocaleString()} <small>总字数</small></strong>
-                    <span>{editingProject.chapters.length} 章</span>
+                    <span>{chapters.length} 章</span>
                   </div>
                   <div className="chapter-target-row">
                     <label htmlFor="chapter-target-words">本章目标</label>
                     <input id="chapter-target-words" className="input" type="number" min="200" step="100" value={chapterTargetWordsDraft} onChange={event => setChapterTargetWordsDraft(event.target.value)} onBlur={updateChapterTargetWords} />
                     <span>字</span>
                   </div>
-                  <button className="btn-add-chapter" onClick={handleAddChapter}>+ 新建章节</button>
-                  {(editingProject.deletedChapters?.length || 0) > 0 && <button className="chapter-recycle-entry" onClick={() => setShowRecycleBin(true)}>回收站 {editingProject.deletedChapters?.length}</button>}
                   <div className="chapter-jump-row">
                     <input
                       className="input"
@@ -5851,14 +5907,26 @@ function App() {
                       onKeyDown={event => { if (event.key === 'Enter') jumpToChapterByQuery(); }}
                     />
                     <button type="button" onClick={jumpToChapterByQuery} disabled={!chapterJumpQuery.trim()}>跳转</button>
-                    <button type="button" onClick={jumpToLatestChapter} disabled={!editingProject.chapters.length}>最新章</button>
+                    <button type="button" onClick={jumpToLatestChapter} disabled={!chapters.length}>最新章</button>
+                  </div>
+                  {/* 排序、插入、定位、删除统一放在列表上方，只作用于当前选中章节；
+                      挤在列表项里会把标题压成每行三个字，长篇几乎看不到目录 */}
+                  <div className="chapter-toolbar" role="toolbar" aria-label="章节操作">
+                    <button type="button" title="在末尾新建章节" onClick={handleAddChapter}>＋ 新建</button>
+                    <button type="button" title={selected ? `上移《${selected.title}》` : '先选中章节'} aria-label="上移当前章节" disabled={activeIndex <= 0} onClick={() => { if (selected) void moveActiveChapter(selected.id, -1); }}>↑</button>
+                    <button type="button" title={selected ? `下移《${selected.title}》` : '先选中章节'} aria-label="下移当前章节" disabled={activeIndex < 0 || activeIndex === chapters.length - 1} onClick={() => { if (selected) void moveActiveChapter(selected.id, 1); }}>↓</button>
+                    <button type="button" title={selected ? `在《${selected.title}》后插入新章` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void insertChapterBelow(selected.id); }}>插入</button>
+                    <button type="button" title={selected ? `打开《${selected.title}》文件所在位置` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void handleOpenChapterLocation(selected); }}>定位</button>
+                    <button type="button" className="chapter-toolbar-danger" title={selected ? `删除《${selected.title}》` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) setChapterPendingDeletion(selected); }}>删除</button>
+                    {recycled > 0 && <button type="button" className="chapter-toolbar-recycle" title="查看已删除章节" onClick={() => setShowRecycleBin(true)}>回收站 {recycled}</button>}
                   </div>
                   <div className="chapters-list" ref={chaptersListRef}>
-                    {editingProject.chapters.map((chapter, chapterIndex) => (
+                    {chapters.map(chapter => (
                       <div
                         key={chapter.id}
                         data-chapter-id={chapter.id}
                         className={`chapter-item ${activeChapter?.id === chapter.id ? 'active' : ''} ${draggingChapterId === chapter.id ? 'dragging' : ''}`}
+                        title={chapter.title}
                         draggable
                         onDragStart={() => setDraggingChapterId(chapter.id)}
                         onDragEnd={() => setDraggingChapterId(null)}
@@ -5866,38 +5934,14 @@ function App() {
                         onDrop={event => { event.preventDefault(); void dropChapterOn(chapter.id); }}
                         onClick={() => selectChapter(chapter)}
                       >
-                        <div className="chapter-copy">
-                          <div className="chapter-title">{chapter.title}</div>
-                          <div className="chapter-meta">{chapter.wordCount} 字{chapter.snapshots?.length ? ` · ${chapter.snapshots.length} 个历史版本` : ''}</div>
-                        </div>
-                        <div className="chapter-order-buttons">
-                          <button title="上移" aria-label={`上移${chapter.title}`} disabled={chapterIndex === 0} onClick={event => { event.stopPropagation(); void moveActiveChapter(chapter.id, -1); }}>↑</button>
-                          <button title="下移" aria-label={`下移${chapter.title}`} disabled={chapterIndex === editingProject.chapters.length - 1} onClick={event => { event.stopPropagation(); void moveActiveChapter(chapter.id, 1); }}>↓</button>
-                          <button title="在此章后插入新章" aria-label={`在${chapter.title}后插入新章`} onClick={event => { event.stopPropagation(); void insertChapterBelow(chapter.id); }}>+</button>
-                        </div>
-                        <button
-                          className="chapter-location-button"
-                          title="打开章节文件所在位置"
-                          aria-label={`打开${chapter.title}文件所在位置`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            handleOpenChapterLocation(chapter);
-                          }}
-                        >打开位置</button>
-                        <button
-                          className="icon-delete"
-                          title="删除章节"
-                          aria-label={`删除${chapter.title}`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            setChapterPendingDeletion(chapter);
-                          }}
-                        >×</button>
+                        <div className="chapter-title">{chapter.title}</div>
+                        <div className="chapter-meta">{chapter.wordCount} 字{chapter.snapshots?.length ? ` · ${chapter.snapshots.length} 版本` : ''}</div>
                       </div>
                     ))}
                   </div>
                 </div>
-              )}
+                );
+              })()}
 
               {editorSidebarTab === 'outline' && (
                 <div className="outline-panel">
@@ -6007,6 +6051,23 @@ function App() {
                 <button className="settings-button" onClick={openSettings}>⚙ 设置</button>
               </div>
             </aside>
+
+            <div
+              className="editor-sidebar-resizer"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="拖动调整侧栏宽度"
+              tabIndex={0}
+              title="拖动调整侧栏宽度"
+              onPointerDown={event => beginPanelResize(event, 'x', sidebarWidth, resizeSidebar)}
+              onKeyDown={event => {
+                const step = event.key === 'ArrowLeft' ? -16 : event.key === 'ArrowRight' ? 16 : 0;
+                if (step) {
+                  event.preventDefault();
+                  resizeSidebar(sidebarWidth + step);
+                }
+              }}
+            />
 
             <main className="editor-main">
               {editorSidebarTab === 'search' ? (
