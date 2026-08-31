@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS user_config (
     id INTEGER PRIMARY KEY,
     api_key TEXT NOT NULL,
-    api_endpoint TEXT DEFAULT 'https://api.apisaver.com',
+    api_endpoint TEXT NOT NULL,
     default_model TEXT DEFAULT 'gpt-4',
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
