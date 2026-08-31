@@ -5777,7 +5777,7 @@ function App() {
               <div className="editor-popover-header"><strong>禁词提示</strong><button className="icon-delete" title="关闭" onClick={() => setShowBannedWords(false)}>×</button></div>
               <p>每行一个，或用逗号分隔。写作时会以红色波浪线标记。</p>
               <textarea value={bannedWordsDraft} onChange={event => setBannedWordsDraft(event.target.value)} placeholder="输入需要提示的禁词" />
-              <div><button className="btn-secondary" onClick={() => setShowBannedWords(false)}>取消</button><button className="btn-primary" onClick={saveBannedWords}>保存列表</button></div>
+              <div><button className="btn-ghost" onClick={() => setShowBannedWords(false)}>取消</button><button className="btn-primary" onClick={saveBannedWords}>保存列表</button></div>
             </div>
           )}
 
@@ -6645,7 +6645,7 @@ function App() {
               <div className="form-group"><label>标签（逗号分隔）</label><input type="text" className="input" placeholder="场景,过渡,技巧" value={newSkill.tags} onChange={(event) => setNewSkill({ ...newSkill, tags: event.target.value })} /></div>
               <div className="skill-creator-actions"><button className="btn-secondary" onClick={generateSkillWithAI} disabled={skillGenerating}>{skillGenerating ? '生成中...' : 'AI 生成技能草稿'}</button><span>可先填写一句需求，再由 skill-creator 补全步骤和输出格式。</span></div>
             </div>
-            <div className="modal-footer"><button className="btn-secondary" onClick={() => setShowNewSkillModal(false)}>取消</button><button className="btn-primary" onClick={handleCreateSkill}>{skillEditingId === null ? '创建' : '保存修改'}</button></div>
+            <div className="modal-footer"><button className="btn-ghost" onClick={() => setShowNewSkillModal(false)}>取消</button><button className="btn-primary" onClick={handleCreateSkill}>{skillEditingId === null ? '创建' : '保存修改'}</button></div>
           </div>
         </div>
       )}
@@ -6920,7 +6920,7 @@ function App() {
             </div>
             </div>
             <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setShowSettingsModal(false)}>取消</button>
+              <button className="btn-ghost" onClick={() => setShowSettingsModal(false)}>取消</button>
               <button className="btn-primary" onClick={saveSettings}>保存设置</button>
             </div>
           </div>
@@ -6979,7 +6979,7 @@ function App() {
             </div>
             <div className="modal-footer">
               <span className="cloud-backup-selection-status">{selectedCloudBackup ? `已选择：${selectedCloudBackup.name}` : '请选择一个备份文件'}</span>
-              <div className="cloud-backup-picker-actions"><button className="btn-secondary" onClick={() => setShowCloudBackupPicker(false)}>取消</button>
+              <div className="cloud-backup-picker-actions"><button className="btn-ghost" onClick={() => setShowCloudBackupPicker(false)}>取消</button>
               <button className="btn-primary" disabled={!selectedCloudBackup || cloudSyncRunning} onClick={() => selectedCloudBackup && void restoreFromCloud(selectedCloudBackup)}>恢复所选备份</button>
               </div>
             </div>
@@ -7169,7 +7169,7 @@ function App() {
             </div>
             <div className="work-tags-footer">
               <p>主分类必选且只能选一个，主题、角色、情节最多可选两个</p>
-              <div><button className="btn-secondary" onClick={() => setShowTagPicker(false)}>取消</button><button className="btn-primary" onClick={confirmProjectTags}>确认</button></div>
+              <div><button className="btn-ghost" onClick={() => setShowTagPicker(false)}>取消</button><button className="btn-primary" onClick={confirmProjectTags}>确认</button></div>
             </div>
           </div>
         </div>
@@ -7187,7 +7187,7 @@ function App() {
               <p className="delete-warning">正文会进回收站，可以恢复；本章节记忆和图谱关系会清理，恢复后需重新生成；绑定的章纲保留但解除关联。</p>
             </div>
             <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setChapterPendingDeletion(null)}>取消</button>
+              <button className="btn-ghost" onClick={() => setChapterPendingDeletion(null)}>取消</button>
               <button className="btn-danger" onClick={() => void handleDeleteChapter()}>确认删除</button>
             </div>
           </div>
@@ -7206,7 +7206,7 @@ function App() {
               <p className="delete-warning">小说中的章节、大纲和本地保存内容都会被移除，此操作不可撤销。建议先在“设置 - 备份与同步”导出一份本地备份包。</p>
             </div>
             <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setProjectPendingDeletion(null)}>取消</button>
+              <button className="btn-ghost" onClick={() => setProjectPendingDeletion(null)}>取消</button>
               <button className="btn-danger" onClick={handleDeleteProject}>确认删除</button>
             </div>
           </div>
@@ -7237,7 +7237,7 @@ function App() {
               <small className="settings-network-note">文件写入系统下载目录的“织章导出”文件夹，完成后自动在文件管理器中选中。</small>
             </div>
             <div className="modal-footer">
-              <button className="btn-secondary" onClick={() => setShowExportModal(false)}>取消</button>
+              <button className="btn-ghost" onClick={() => setShowExportModal(false)}>取消</button>
               <button className="btn-primary" disabled={exportRunning} onClick={() => void exportCurrentTarget()}>{exportRunning ? '导出中...' : '开始导出'}</button>
             </div>
           </div>
