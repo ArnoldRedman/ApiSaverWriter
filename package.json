@@ -1,5 +1,5 @@
 {
-  "name": "apisaverwriter",
+  "name": "zhizhang",
   "version": "0.1.6",
   "private": true,
   "type": "module",
@@ -7,18 +7,17 @@
   "scripts": {
     "pretest": "npm run build:shared",
     "test": "npm run test:runtime && npm run test:desktop",
-    "test:runtime": "npm --workspace @apisaverwriter/agent-runtime test",
+    "test:runtime": "npm --workspace @zhizhang/agent-runtime test",
     "test:desktop": "npm --prefix desktop-app test",
     "pretypecheck": "npm run build:shared",
     "typecheck": "npm run typecheck:contracts && npm run typecheck:model-protocol && npm run typecheck:runtime",
-    "typecheck:runtime": "npm --workspace @apisaverwriter/agent-runtime run typecheck",
-    "typecheck:contracts": "npm --workspace @apisaverwriter/contracts run typecheck",
-    "typecheck:model-protocol": "npm --workspace @apisaverwriter/model-protocol run typecheck",
-    "build:shared": "npm --workspace @apisaverwriter/contracts run build && npm --workspace @apisaverwriter/model-protocol run build",
+    "typecheck:runtime": "npm --workspace @zhizhang/agent-runtime run typecheck",
+    "typecheck:contracts": "npm --workspace @zhizhang/contracts run typecheck",
+    "typecheck:model-protocol": "npm --workspace @zhizhang/model-protocol run typecheck",
+    "build:shared": "npm --workspace @zhizhang/contracts run build && npm --workspace @zhizhang/model-protocol run build",
     "check:rust": "cargo check --manifest-path desktop-app/src-tauri/Cargo.toml",
     "test:rust": "cargo test --manifest-path desktop-app/src-tauri/Cargo.toml",
     "check": "npm run build:shared && npm run test:runtime && npm run typecheck:contracts && npm run typecheck:model-protocol && npm run typecheck:runtime && npm --prefix sidecars/agent-runtime run build && npm --prefix desktop-app run lint && npm --prefix desktop-app run test && npm --prefix desktop-app run build && npm run check:rust && npm run test:rust",
-    "dev:agent": "npm --workspace @apisaverwriter/agent-runtime run dev",
-    "sync:feishu-release": "node scripts/sync-feishu-release.mjs"
+    "dev:agent": "npm --workspace @zhizhang/agent-runtime run dev"
   }
 }

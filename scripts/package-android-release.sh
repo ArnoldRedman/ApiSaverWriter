@@ -35,10 +35,10 @@ if [[ -z "$unsigned_apk" || ! -f "$unsigned_apk" ]]; then
 fi
 
 mkdir -p "$release_dir"
-aligned_apk="$(mktemp "${TMPDIR:-/tmp}/apisaverwriter-aligned.XXXXXX.apk")"
+aligned_apk="$(mktemp "${TMPDIR:-/tmp}/zhizhang-aligned.XXXXXX.apk")"
 trap 'rm -f "$aligned_apk"' EXIT
 
-apk_name="ApiSaverWriter_${release_tag}_Android_arm64.apk"
+apk_name="Zhizhang_${release_tag}_Android_arm64.apk"
 apk_path="$release_dir/$apk_name"
 
 "$zipalign" -p -f 4 "$unsigned_apk" "$aligned_apk"
@@ -53,12 +53,12 @@ apk_path="$release_dir/$apk_name"
 "$zipalign" -c -p 4 "$apk_path"
 "$apksigner" verify --verbose --print-certs "$apk_path"
 metadata="$($aapt2 dump badging "$apk_path")"
-printf '%s\n' "$metadata" | grep -E "^package: name='com\.apisaverwriter\.app'.*versionName='0\.1\.4'"
+printf '%s\n' "$metadata" | grep -E "^package: name='com\.zhizhang\.app'.*versionName='0\.1\.4'"
 printf '%s\n' "$metadata" | grep -E "versionCode='${expected_version_code}'"
 unzip -t "$apk_path" >/dev/null
 
 if [[ -n "$unsigned_aab" && -f "$unsigned_aab" ]]; then
-  aab_path="$release_dir/ApiSaverWriter_${release_tag}_Android_arm64.aab"
+  aab_path="$release_dir/Zhizhang_${release_tag}_Android_arm64.aab"
   cp "$unsigned_aab" "$aab_path"
   jarsigner \
     -keystore "$ANDROID_KEYSTORE_PATH" \

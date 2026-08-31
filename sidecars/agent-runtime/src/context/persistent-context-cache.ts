@@ -15,8 +15,9 @@ interface CacheRecord<T> {
 }
 
 function cacheDirectory(): string {
-  return process.env.APISAVERWRITER_CONTEXT_CACHE_DIR
-    || join(homedir(), ".apisaverwriter", "context-cache");
+  // 纯缓存目录，改名后从空目录重建即可，不需要迁移旧内容
+  return process.env.ZHIZHANG_CONTEXT_CACHE_DIR
+    || join(homedir(), ".zhizhang", "context-cache");
 }
 
 function fileFor(key: string): string {

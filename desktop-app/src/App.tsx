@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, type ChangeEvent, type PointerEvent as Rea
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import type { AgentProgressEvent, RuntimeUsageSummary } from '@apisaverwriter/contracts';
+import type { AgentProgressEvent, RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionChapter, AIDetectionLabel, AIDetectionSegment, AIDetectionReport, MemoryDocumentKind, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -1322,8 +1322,10 @@ function App() {
     localStorage.setItem(appearanceStorageKey, JSON.stringify(appearance));
   }, [appearance]);
   const [cloudRemotePath, setCloudRemotePath] = useState(() => {
+    // 老版本存过两种旧路径；沿用旧目录才能继续看到已经上传的备份
     const saved = localStorage.getItem('cloud-remote-path');
-    return !saved || saved === 'ApiSaverWriter/projects' ? 'ApiSaverWriter/backup' : saved;
+    if (saved === 'ApiSaverWriter/projects') return 'ApiSaverWriter/backup';
+    return saved || 'Zhizhang/backup';
   });
   const [cloudSyncRunning, setCloudSyncRunning] = useState(false);
   const [cloudSyncMessage, setCloudSyncMessage] = useState('');
@@ -1890,7 +1892,7 @@ function App() {
   useEffect(() => {
     const id = 'fanqie-private-font';
     const existing = document.getElementById(id) as HTMLStyleElement | null;
-    const defaultFont = '@font-face{font-family:ApiSaverWriterFanqie;font-display:swap;src:url(https://lf6-awef.bytetos.com/obj/awesome-font/c/dc027189e0ba4cd.woff2) format("woff2");unicode-range:U+E000-F8FF;}';
+    const defaultFont = '@font-face{font-family:ZhizhangFanqie;font-display:swap;src:url(https://lf6-awef.bytetos.com/obj/awesome-font/c/dc027189e0ba4cd.woff2) format("woff2");unicode-range:U+E000-F8FF;}';
     const fontCss = [defaultFont, rankingFontCss, ...libraryBooks.map(book => book.fontCss || '')].filter(Boolean).join('\n');
     if (!fontCss.trim()) {
       existing?.remove();
@@ -4615,17 +4617,6 @@ function App() {
     setSettingsSection('model');
   };
 
-  const openTutorial = async () => {
-    const url = 'https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb?from=from_copylink';
-    try {
-      await invoke('open_external_url', { url });
-    } catch {
-      const opened = window.open(url, '_blank', 'noopener,noreferrer');
-      if (!opened) window.location.href = url;
-    }
-    setNotice({ title: '正在打开使用教程', content: '已在浏览器打开飞书使用教程。' });
-  };
-
   const checkCloudSyncStatus = async () => {
     setCloudSyncRunning(true);
     setCloudSyncMessage('正在检查百度网盘登录状态...');
@@ -5713,7 +5704,7 @@ function App() {
     return (
       <div className="startup-screen" role="status" aria-live="polite">
         <div className="startup-mark" aria-hidden="true">文</div>
-        <h1>ApiSaverWriter</h1>
+        <h1>织章</h1>
         <p>{deviceStorageReady ? '正在载入本地写作资料…' : '正在启动本地数据服务…'}</p>
         <span className="startup-spinner" aria-hidden="true" />
         <small>首次启动可能需要几秒，请稍候</small>
@@ -6471,7 +6462,7 @@ function App() {
         <>
       <aside className="sidebar">
         <div className="logo">
-          <h1>ApiSaverWriter</h1>
+          <h1>织章</h1>
           <p>AI 小说写作助手</p>
         </div>
 
@@ -6896,11 +6887,11 @@ function App() {
                 <section className="settings-sync-card">
                   <div className="settings-network-header"><div><strong>本地备份包</strong><small>不需要百度网盘或 GitHub 账号，直接写到本机下载目录</small></div><span className="settings-sync-badge">离线</span></div>
                   <div className="settings-sync-actions"><button className="btn-primary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void exportBackupBundle()}>{cloudSyncRunning ? '处理中...' : '导出备份包到本地'}</button><button className="btn-secondary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void loadLocalBackups()}>从本地备份包恢复</button></div>
-                  <p className="settings-network-note">备份包格式与云端完全一致，两边可以互相恢复。文件保存在下载目录的“ApiSaverWriter 导出”文件夹，可自行拷到移动硬盘或其他网盘。恢复会替换本地对应数据并重新载入，建议先导出一份当前备份。</p>
+                  <p className="settings-network-note">备份包格式与云端完全一致，两边可以互相恢复。文件保存在下载目录的“织章导出”文件夹，可自行拷到移动硬盘或其他网盘。恢复会替换本地对应数据并重新载入，建议先导出一份当前备份。</p>
                 </section>
                 <section className="settings-sync-card">
                   <div className="settings-network-header"><div><strong>百度网盘完整备份与同步</strong><small>备份所有写作资料与本机配置，安装新应用后可直接恢复</small></div><span className="settings-sync-badge">完整快照</span></div>
-                  <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="ApiSaverWriter/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
+                  <label className="form-group settings-sync-path"><span>云端备份目录</span><input className="input" value={cloudRemotePath} onChange={event => setCloudRemotePath(event.target.value)} placeholder="Zhizhang/backup" /><small>使用相对路径，不要填写 /apps/bdpan 前缀。</small></label>
                   <div className="settings-sync-actions"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void checkCloudSyncStatus()}>{cloudSyncRunning ? '处理中...' : '检查登录状态'}</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void beginBaiduLogin()}>登录百度网盘</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void backupToCloud()}>备份到百度网盘</button><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void loadCloudBackups()}>选择备份恢复</button></div>
                   {baiduAuthURL && <div className="settings-baidu-auth"><strong>完成授权</strong><small>{isDirectBaiduRuntime() ? '复制以下链接到浏览器完成授权，再粘贴浏览器地址栏中的完整授权结果或 access_token。' : '复制以下链接到浏览器完成授权，再粘贴页面显示的 32 位授权码。'}</small><div className="settings-baidu-url"><input className="input" value={baiduAuthURL} readOnly aria-label="百度网盘授权链接" /><button className="btn-secondary" onClick={() => void copyText(baiduAuthURL)}>复制链接</button></div><div><input className="input" type="password" value={baiduAuthCode} onChange={event => setBaiduAuthCode(event.target.value)} placeholder={isDirectBaiduRuntime() ? '粘贴完整授权结果或 access_token' : '粘贴 32 位授权码'} autoComplete="off" /><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void confirmBaiduLogin()}>确认登录</button></div></div>}
                   <p className="settings-network-note">备份范围：小说及章节/大纲/记忆/卡片/知识图谱、书籍管理、拆书、扫榜缓存、文风、技能、API 与网络配置、用量统计和禁词。同步只操作应用自己的 /apps/bdpan/ 目录；恢复会替换对应本地数据并重新载入。</p>
@@ -6910,13 +6901,20 @@ function App() {
                   <label className="form-group settings-sync-path"><span>本地小说</span><select className="input" value={githubProjectId ?? ''} onChange={event => selectGithubProject(Number(event.target.value))}><option value="">{projects.length ? '选择一本小说' : '本地还没有小说'}</option>{projects.map(project => <option key={project.id} value={project.id}>{project.title}</option>)}</select></label>
                   <label className="form-group settings-sync-path"><span>GitHub 仓库链接</span><input className="input" value={githubRepositoryUrl} onChange={event => setGithubRepositoryUrl(event.target.value)} placeholder="https://github.com/owner/novel.git" spellCheck={false} /><small>支持 HTTPS 或 SSH；使用本机 Git 登录状态，不在应用中保存 Token。</small></label>
                   <div className="settings-sync-actions"><button className="btn-primary" disabled={cloudSyncRunning || !githubProjectId || isMobileRuntime()} onClick={() => void backupProjectToGithub()}>备份到 GitHub</button><button className="btn-secondary" disabled={cloudSyncRunning || isMobileRuntime()} onClick={() => void restoreProjectFromGithub()}>从 GitHub 恢复</button></div>
-                  <p className="settings-network-note">提交正文会列出新增、修改和删除的章节，以及大纲、卡片、记忆、图谱变更数量；不会提交 API Key 和应用账号配置。目标仓库必须为空或已是 ApiSaverWriter 规范仓库，桌面端需安装 Git 并提前完成登录。</p>
+                  <p className="settings-network-note">提交正文会列出新增、修改和删除的章节，以及大纲、卡片、记忆、图谱变更数量；不会提交 API Key 和应用账号配置。目标仓库必须为空或已是织章规范仓库，桌面端需安装 Git 并提前完成登录。</p>
                 </section>
                 {cloudSyncMessage && <p className={`model-list-message settings-sync-message ${/失败|错误|未找到|未登录|拒绝|无效|不是规范/iu.test(cloudSyncMessage) ? 'error' : ''}`}>{cloudSyncMessage}</p>}
               </>}
               {settingsSection === 'tutorial' && <section className="settings-tutorial-card">
-                <div className="settings-tutorial-heading"><strong>使用教程</strong><small>飞书文档会持续更新最新功能说明与操作步骤。</small></div>
-                <div className="settings-tutorial-link"><div><span>ApiSaverWriter 使用教程</span><strong>飞书文档</strong><small>点击后在浏览器打开完整教程。</small></div><button className="btn-primary" onClick={() => void openTutorial()}>打开教程</button></div>
+                <div className="settings-tutorial-heading"><strong>快速上手</strong><small>全部数据保存在本机，模型调用走你自己配置的接口。</small></div>
+                <ol className="settings-tutorial-steps">
+                  <li><strong>配置模型</strong><span>在「模型与接口」新增配置，填写接口地址与 API Key，点「拉取模型」后勾选要启用的模型。</span></li>
+                  <li><strong>建立作品</strong><span>新建小说，先写作品简介与世界观，再建总纲；总纲是后续所有章纲的依据。</span></li>
+                  <li><strong>铺开设定</strong><span>为主角、关键道具和势力建卡片，卡片状态会随章节推进自动更新到知识图谱。</span></li>
+                  <li><strong>逐章推进</strong><span>先生成章纲，再由章纲生成正文；保存后确认章节记忆，后续章节才能接上前文。</span></li>
+                  <li><strong>校对润色</strong><span>用 AI 检测看分段疑似度，配合去 AI 味技能重写；禁词和人物名标记在编辑器里实时提示。</span></li>
+                  <li><strong>留好退路</strong><span>在「备份与同步」导出完整备份，或提交到自己的 GitHub 私有仓库；导出不含 API Key。</span></li>
+                </ol>
               </section>}
               <p className="settings-hint">保存后，编辑器中的 AI 智能体会使用模型与网络配置。密钥仅保存到本机。</p>
             </div>
@@ -7031,7 +7029,7 @@ function App() {
                     <>
                       <span className="cover-book-name">{newProject.title || '书本名称'}</span>
                       <span className="cover-decoration">文</span>
-                      <small>ApiSaverWriter</small>
+                      <small>织章</small>
                     </>
                   )}
                 </div>
@@ -7236,7 +7234,7 @@ function App() {
                 <label><input type="checkbox" checked={exportOptions.includeOutlines} onChange={event => setExportOptions({ ...exportOptions, includeOutlines: event.target.checked })} /> 附上大纲与世界观设定（{editingProject.outlines.length} 篇）</label>
                 <label><input type="checkbox" checked={exportOptions.includeCards} onChange={event => setExportOptions({ ...exportOptions, includeCards: event.target.checked })} /> 附上设定卡片（{editingProject.cards.length} 张）</label>
               </div>}
-              <small className="settings-network-note">文件写入系统下载目录的“ApiSaverWriter 导出”文件夹，完成后自动在文件管理器中选中。</small>
+              <small className="settings-network-note">文件写入系统下载目录的“织章导出”文件夹，完成后自动在文件管理器中选中。</small>
             </div>
             <div className="modal-footer">
               <button className="btn-secondary" onClick={() => setShowExportModal(false)}>取消</button>

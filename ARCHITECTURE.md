@@ -1,4 +1,4 @@
-# ApiSaverWriter 架构
+# 织章架构
 
 本文描述当前仓库的运行边界、模块职责和重构约束。产品使用方式见 [README.md](README.md)，待办与阶段验收见 [TODO.md](TODO.md)。
 
@@ -25,7 +25,7 @@ contracts 不依赖 desktop-app、agent-runtime 或 Tauri
 ## 目录结构
 
 ```text
-ApiSaverWriter/
+织章/
 ├── packages/contracts/          跨端 RPC DTO、方法表、运行时参数校验
 ├── packages/model-protocol/     OpenAI/Anthropic 共享纯协议规则
 ├── desktop-app/

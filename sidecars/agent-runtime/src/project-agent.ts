@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@apisaverwriter/contracts";
+import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@zhizhang/contracts";
 export { ProjectAgentChangeSchema };
-export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@apisaverwriter/contracts";
+export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@zhizhang/contracts";
 import { ApiSaverClient } from "./models/api-saver.js";
 import { byteLength, compactText } from "./context/context-optimizer.js";
 

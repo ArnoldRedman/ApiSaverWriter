@@ -1,4 +1,4 @@
-import type { ProjectAgentChange as ProjectAgentRawChange } from '@apisaverwriter/contracts';
+import type { ProjectAgentChange as ProjectAgentRawChange } from '@zhizhang/contracts';
 import type { Project, OutlineKind, CardType, MemoryDocumentKind, KnowledgeGraphNode } from '../../domain/project';
 
 export type ProjectAgentMode = 'discuss' | 'execute';

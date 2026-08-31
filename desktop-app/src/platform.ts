@@ -1,6 +1,6 @@
 import { invoke as nativeInvoke } from '@tauri-apps/api/core';
-import type { AgentRpcCall } from '@apisaverwriter/contracts';
-import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@apisaverwriter/model-protocol';
+import type { AgentRpcCall } from '@zhizhang/contracts';
+import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@zhizhang/model-protocol';
 import { fitMessagesToTokenBudget } from './utils/token-budget';
 import { mobileBaiduStatus, mobileBaiduLoginURL, mobileBaiduCompleteLogin, mobileBaiduBackup, mobileBaiduListBackups, mobileBaiduRestore } from './platform/mobile/cloud-sync';
 import { mobileFanqieSearch, mobileNovelCatchCategories, mobileRankingFetch, mobileQianyueSources, mobileSearchOneQianyueSource, mobileQianyueDownload, mobileQianyueDownloadChapter, mobileSearchAllQianyue } from './platform/mobile/book-sources';

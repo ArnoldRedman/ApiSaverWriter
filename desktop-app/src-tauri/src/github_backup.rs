@@ -8,7 +8,11 @@ use super::{copy_cloud_backup_contents, find_project_directory};
 use super::project_store::app_data_directory;
 use super::runtime::{call_agent_rpc, AgentRuntimeState};
 
-const GITHUB_PROJECT_MARKER: &str = ".apisaverwriter-project.json";
+const GITHUB_PROJECT_MARKER: &str = ".zhizhang-project.json";
+const GITHUB_PROJECT_KIND: &str = "zhizhang-project";
+/// 改名前写出的标记文件与 kind，只用于识别既有备份仓库，不再写出
+const LEGACY_GITHUB_PROJECT_MARKER: &str = ".apisaverwriter-project.json";
+const LEGACY_GITHUB_PROJECT_KIND: &str = "apisaverwriter-project";
 const GITHUB_PROJECT_DATA: &str = "project.json";
 const GITHUB_MANAGED_PATHS: [&str; 8] = [
     GITHUB_PROJECT_MARKER,
@@ -83,21 +87,29 @@ pub fn clone_github_repository(app_data: &Path, repository_url: &str, cache_name
 }
 
 pub fn read_github_project(checkout: &Path) -> Result<Value, String> {
-    let marker_path = checkout.join(GITHUB_PROJECT_MARKER);
     let project_path = checkout.join(GITHUB_PROJECT_DATA);
     let regular_file = |path: &Path| fs::symlink_metadata(path)
         .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
         .unwrap_or(false);
-    if !regular_file(&marker_path) || !regular_file(&project_path) {
-        return Err("该仓库不是规范的 ApiSaverWriter 小说备份仓库".to_string());
+    // 改名前建的备份仓库用的是旧标记名，恢复时两种都认
+    let marker_path = [GITHUB_PROJECT_MARKER, LEGACY_GITHUB_PROJECT_MARKER]
+        .into_iter()
+        .map(|name| checkout.join(name))
+        .find(|path| regular_file(path));
+    let Some(marker_path) = marker_path else {
+        return Err("该仓库不是规范的织章小说备份仓库".to_string());
+    };
+    if !regular_file(&project_path) {
+        return Err("该仓库不是规范的织章小说备份仓库".to_string());
     }
     let marker: Value = serde_json::from_str(&fs::read_to_string(marker_path)
         .map_err(|error| format!("读取 GitHub 备份标记失败: {error}"))?)
         .map_err(|error| format!("GitHub 备份标记格式错误: {error}"))?;
-    if marker.get("kind").and_then(Value::as_str) != Some("apisaverwriter-project")
+    let kind = marker.get("kind").and_then(Value::as_str).unwrap_or_default();
+    if (kind != GITHUB_PROJECT_KIND && kind != LEGACY_GITHUB_PROJECT_KIND)
         || marker.get("schemaVersion").and_then(Value::as_u64).unwrap_or(0) != 1
     {
-        return Err("该仓库的 ApiSaverWriter 备份格式不受支持".to_string());
+        return Err("该仓库的织章备份格式不受支持".to_string());
     }
     let project: Value = serde_json::from_str(&fs::read_to_string(project_path)
         .map_err(|error| format!("读取 GitHub 小说数据失败: {error}"))?)
@@ -137,17 +149,17 @@ pub fn validate_github_backup_destination(checkout: &Path, project_id: i64, proj
         .map(|entry| entry.file_name().to_string_lossy().to_ascii_lowercase())
         .any(|name| name != ".git" && !allowed.contains(&name.as_str()));
     if has_other_files {
-        return Err("仓库已有其他内容且不是 ApiSaverWriter 规范仓库，为避免覆盖已拒绝备份".to_string());
+        return Err("仓库已有其他内容且不是织章规范仓库，为避免覆盖已拒绝备份".to_string());
     }
     Ok(())
 }
 
 pub fn ensure_git_identity(checkout: &Path) -> Result<(), String> {
     if run_git(&["config", "user.name"], Some(checkout)).unwrap_or_default().trim().is_empty() {
-        run_git(&["config", "user.name", "ApiSaverWriter"], Some(checkout))?;
+        run_git(&["config", "user.name", "Zhizhang"], Some(checkout))?;
     }
     if run_git(&["config", "user.email"], Some(checkout)).unwrap_or_default().trim().is_empty() {
-        run_git(&["config", "user.email", "apisaverwriter@local.invalid"], Some(checkout))?;
+        run_git(&["config", "user.email", "zhizhang@local.invalid"], Some(checkout))?;
     }
     Ok(())
 }
@@ -295,7 +307,7 @@ fn write_github_project_snapshot(app: &tauri::AppHandle, checkout: &Path, projec
         }
     }
     fs::write(checkout.join(GITHUB_PROJECT_DATA), serde_json::to_vec_pretty(&project_snapshot).map_err(|error| format!("序列化 GitHub 小说备份失败: {error}"))?).map_err(|error| format!("写入 GitHub 小说备份失败: {error}"))?;
-    let marker = serde_json::json!({ "kind": "apisaverwriter-project", "schemaVersion": 1, "projectId": project_id, "title": &project_title });
+    let marker = serde_json::json!({ "kind": GITHUB_PROJECT_KIND, "schemaVersion": 1, "projectId": project_id, "title": &project_title });
     fs::write(checkout.join(GITHUB_PROJECT_MARKER), serde_json::to_vec_pretty(&marker).map_err(|error| format!("序列化 GitHub 备份标记失败: {error}"))?).map_err(|error| format!("写入 GitHub 备份标记失败: {error}"))?;
     run_git(&["add", "--all"], Some(checkout))?;
     let status = run_git(&["-c", "core.quotepath=false", "diff", "--cached", "--name-status"], Some(checkout))?;

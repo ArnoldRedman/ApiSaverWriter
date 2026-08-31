@@ -1352,6 +1352,10 @@ main {
 .settings-tutorial-heading { display: grid; gap: 4px; }
 .settings-tutorial-heading strong { color: #F8FAFC; font-size: 15px; }
 .settings-tutorial-heading small { color: #7E91AA; font-size: 11px; line-height: 1.5; }
+.settings-tutorial-steps { display: grid; gap: 10px; margin: 0; padding-left: 20px; color: #94A3B8; }
+.settings-tutorial-steps li { padding-left: 2px; }
+.settings-tutorial-steps strong { display: block; color: #CFFAFE; font-size: 13px; }
+.settings-tutorial-steps span { display: block; margin-top: 3px; font-size: 11px; line-height: 1.6; }
 .settings-tutorial-link { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 14px; border: 1px solid #1E4D66; border-radius: 8px; background: #0C1B2A; }
 .settings-tutorial-link > div { display: grid; gap: 4px; min-width: 0; }
 .settings-tutorial-link span { color: #94A3B8; font-size: 11px; }
@@ -2533,7 +2537,7 @@ select.input {
 .library-book-item { display: grid; gap: 4px; width: 100%; margin-bottom: 7px; padding: 11px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: #CBD5E1; text-align: left; cursor: pointer; }
 .library-book-item:hover, .library-book-item.active { border-color: #665CC4; background: #22204A; }
 .library-book-item small { color: #718198; font-size: 10px; }
-.library-detail { min-width: 0; overflow: hidden; font-family: ApiSaverWriterFanqie, ui-sans-serif, system-ui, sans-serif; }
+.library-detail { min-width: 0; overflow: hidden; font-family: ZhizhangFanqie, ui-sans-serif, system-ui, sans-serif; }
 .library-detail-header { display: flex; justify-content: space-between; gap: 14px; padding: 20px 22px; border-bottom: 1px solid #25344A; }
 .library-detail-header span { color: #8E86E7; font-size: 11px; }
 .library-detail-header h3 { margin: 4px 0; color: #F5F3FF; font-size: 20px; }
@@ -2565,7 +2569,7 @@ select.input {
 .library-retry-chapter-button:hover:not(:disabled) { background: #0C6FA8; }
 .library-retry-chapter-button:disabled { cursor: default; opacity: 0.72; }
 .library-chapter-warning { margin: 14px 20px 0; padding: 8px 10px; border: 1px solid #7C5A25; background: #2B2112; color: #F4C77B; font-size: 12px; }
-.library-reader-content { flex: 1; max-height: 520px; margin: 0; padding: 22px; overflow: auto; color: #D7DFEA; font: var(--reader-size)/var(--reader-line) ApiSaverWriterFanqie, var(--reader-font); white-space: pre-wrap; word-break: break-word; }
+.library-reader-content { flex: 1; max-height: 520px; margin: 0; padding: 22px; overflow: auto; color: #D7DFEA; font: var(--reader-size)/var(--reader-line) ZhizhangFanqie, var(--reader-font); white-space: pre-wrap; word-break: break-word; }
 .library-reader-empty { display: grid; flex: 1; min-height: 260px; place-items: center; color: #718198; font-size: 12px; }
 .library-reader-outline { margin: 0 18px 18px; border: 1px solid #34445B; border-radius: 6px; background: #101A2B; }
 .library-reader-outline summary { padding: 10px 12px; color: #93C5FD; font-size: 12px; cursor: pointer; }
@@ -2575,9 +2579,9 @@ select.input {
 .ranking-toolbar { display: flex; gap: 8px; margin: 18px 0; }
 .ranking-toolbar .input { min-width: 220px; flex: 1; }
 .ranking-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 10px; }
-.ranking-book-card { display: grid; grid-template-columns: 30px 58px minmax(0, 1fr); gap: 12px; padding: 14px; border: 1px solid #293A51; border-radius: 7px; background: #101A2B; font-family: ApiSaverWriterFanqie, ui-sans-serif, system-ui, sans-serif; }
+.ranking-book-card { display: grid; grid-template-columns: 30px 58px minmax(0, 1fr); gap: 12px; padding: 14px; border: 1px solid #293A51; border-radius: 7px; background: #101A2B; font-family: ZhizhangFanqie, ui-sans-serif, system-ui, sans-serif; }
 .ranking-source-label { align-self: center; color: #7F91A8; font-size: 11px; white-space: nowrap; }
-.library-result-card { font-family: ApiSaverWriterFanqie, ui-sans-serif, system-ui, sans-serif; }
+.library-result-card { font-family: ZhizhangFanqie, ui-sans-serif, system-ui, sans-serif; }
 .ranking-book-rank { color: #E6B86A; font-size: 22px; font-weight: 700; text-align: center; }
 .ranking-book-cover { position: relative; align-self: start; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid #344762; border-radius: 4px; background: #17263A; color: #8DCBF1; }
 .ranking-book-cover span { display: grid; width: 100%; height: 100%; place-items: center; font-size: 19px; font-weight: 700; }
@@ -2874,7 +2878,7 @@ select.input {
 .dismantle-outline-field textarea { min-height: 190px; }
 .dismantle-source-details { margin-top: 13px; border: 1px solid #293A51; border-radius: 5px; background: #101A2B; }
 .dismantle-source-details summary { padding: 9px 10px; color: #91A0B5; font-size: 11px; cursor: pointer; }
-.dismantle-source-details pre { max-height: 220px; margin: 0; padding: 10px; border-top: 1px solid #293A51; overflow: auto; color: #8695AA; font: 11px/1.55 ApiSaverWriterFanqie, ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+.dismantle-source-details pre { max-height: 220px; margin: 0; padding: 10px; border-top: 1px solid #293A51; overflow: auto; color: #8695AA; font: 11px/1.55 ZhizhangFanqie, ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
 .dismantle-rewrite-footer { display: flex; align-items: center; gap: 8px; margin-top: 13px; }
 .dismantle-rewrite-footer .input { min-width: 0; flex: 1; }
 .styles-panel { min-height: 0; padding: 14px; overflow-y: auto; }

@@ -117,7 +117,7 @@ const fanqieBookFromHtml = (html: string, query: string): Array<Record<string, u
 
 const fanqiePrivateFontCss = (html: string): string => Array.from(html.matchAll(/@font-face\{[^}]+\}/gu))
   .map(match => match[0]
-    .replace(/font-family:[^;]+;/u, "font-family:ApiSaverWriterFanqie;")
+    .replace(/font-family:[^;]+;/u, "font-family:ZhizhangFanqie;")
     .replace(/}$/, "unicode-range:U+E000-F8FF;}"))
   .join("\n");
 

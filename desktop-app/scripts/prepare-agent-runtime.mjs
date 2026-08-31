@@ -8,7 +8,7 @@ const desktopRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = resolve(desktopRoot, '..');
 const runtimeRoot = join(desktopRoot, 'src-tauri', 'runtime', 'agent-runtime');
 const sidecarEntry = join(workspaceRoot, 'sidecars', 'agent-runtime', 'dist', 'main.js');
-const nodeBinary = process.env.APISAVERWRITER_NODE_BINARY || process.execPath;
+const nodeBinary = process.env.ZHIZHANG_NODE_BINARY || process.execPath;
 const mobileTarget = ['android', 'ios'].includes(String(process.env.TAURI_ENV_PLATFORM || '').toLowerCase());
 const sqliteCheck = "const Database = require('better-sqlite3'); const db = new Database(':memory:'); db.close();";
 
@@ -51,7 +51,7 @@ if (mobileTarget) {
   process.exit(0);
 }
 
-runNpm(['run', 'build', '--workspace', '@apisaverwriter/agent-runtime']);
+runNpm(['run', 'build', '--workspace', '@zhizhang/agent-runtime']);
 ensureNativeDependencies();
 buildSync({
   entryPoints: [sidecarEntry],

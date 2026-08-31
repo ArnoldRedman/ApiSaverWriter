@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# ApiSaverWriter 快速启动脚本
+# 织章快速启动脚本
 
-echo "🚀 ApiSaverWriter - AI 小说写作助手"
+echo "🚀 织章 - AI 小说写作工作台"
 echo "=================================="
 echo ""
 

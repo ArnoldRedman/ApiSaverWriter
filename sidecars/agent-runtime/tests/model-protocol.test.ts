@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@apisaverwriter/model-protocol';
+import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@zhizhang/model-protocol';
 
 describe('shared model protocol', () => {
   it('normalizes wire mode and authentication consistently', () => {

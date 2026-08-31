@@ -1,4 +1,4 @@
-import type { AgentRpcMethod } from '@apisaverwriter/contracts';
+import type { AgentRpcMethod } from '@zhizhang/contracts';
 import { invoke } from '../platform';
 
 /**

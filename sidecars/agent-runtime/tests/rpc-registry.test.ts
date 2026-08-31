@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { agentRpcMethods, ProjectAgentChangeSchema, ProjectAgentPlannerChangeSchema } from "@apisaverwriter/contracts";
+import { agentRpcMethods, ProjectAgentChangeSchema, ProjectAgentPlannerChangeSchema } from "@zhizhang/contracts";
 import { RpcRegistry } from "../src/rpc/registry.js";
 
 describe("RPC registry", () => {

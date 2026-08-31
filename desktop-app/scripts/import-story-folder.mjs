@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 把 StoryForge 风格的小说工作目录导入成 ApiSaverWriter 的一本书。
+// 把 StoryForge 风格的小说工作目录导入成织章的一本书。
 //
 //   node scripts/import-story-folder.mjs "C:\AI工作流搭建" [--dry-run] [--app-data <目录>]
 //
@@ -18,7 +18,7 @@ const dryRun = args.includes('--dry-run');
 const githubRoot = flag('--github-repo') ? resolve(flag('--github-repo')) : undefined;
 const repositoryUrl = flag('--repository-url')?.trim();
 const appDataRoot = resolve(flag('--app-data')
-  ?? join(process.env.APPDATA ?? join(process.env.HOME ?? '.', '.config'), 'com.apisaverwriter.app'));
+  ?? join(process.env.APPDATA ?? join(process.env.HOME ?? '.', '.config'), 'com.zhizhang.app'));
 
 const now = new Date().toISOString();
 const read = (...parts) => {
@@ -221,8 +221,8 @@ const memoryDocuments = stateMarkdown ? [{
   manuallyEdited: true,
 }] : [];
 
-const existingGithubMarker = githubRoot && existsSync(join(githubRoot, '.apisaverwriter-project.json'))
-  ? readFileSync(join(githubRoot, '.apisaverwriter-project.json'), 'utf8')
+const existingGithubMarker = githubRoot && existsSync(join(githubRoot, '.zhizhang-project.json'))
+  ? readFileSync(join(githubRoot, '.zhizhang-project.json'), 'utf8')
   : '';
 let existingProjectId = 0;
 try { existingProjectId = Number(JSON.parse(existingGithubMarker).projectId) || 0; } catch { /* First export has no marker yet. */ }
@@ -322,14 +322,14 @@ if (githubRoot) {
 
   writeFileSync(join(githubRoot, 'project.json'), JSON.stringify(project, null, 2), 'utf8');
   writeFileSync(join(githubRoot, 'metadata.json'), JSON.stringify(metadata, null, 2), 'utf8');
-  writeFileSync(join(githubRoot, '.apisaverwriter-project.json'), JSON.stringify({
-    kind: 'apisaverwriter-project',
+  writeFileSync(join(githubRoot, '.zhizhang-project.json'), JSON.stringify({
+    kind: 'zhizhang-project',
     schemaVersion: 1,
     projectId: project.id,
     title: project.title,
   }, null, 2), 'utf8');
   console.log(`\n已导出 GitHub 规范小说仓库：${githubRoot}`);
-  console.log(`规范标记：${join(githubRoot, '.apisaverwriter-project.json')}`);
+  console.log(`规范标记：${join(githubRoot, '.zhizhang-project.json')}`);
   console.log(`完整快照：${join(githubRoot, 'project.json')}`);
   process.exit(0);
 }

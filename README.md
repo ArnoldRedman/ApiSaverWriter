@@ -1,34 +1,33 @@
-# AI写作软件｜AI写小说软件｜ApiSaverWriter
+# AI写作软件｜AI写小说软件｜织章 Zhizhang
 
 **关键词：AI写作软件、AI写小说软件、AI网文写作、小说智能体、长篇小说创作、网文大纲、章节记忆、Tauri 多端写作。**
 
-> ApiSaverWriter 是一款面向长篇网文创作的 AI 写作软件、AI 写小说软件和本地优先写作工作台。
+> 织章是一款面向长篇网文创作的 AI 写作软件、AI 写小说软件和本地优先写作工作台。
 
-[![Version](https://img.shields.io/badge/version-0.1.6-1677ff)](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
+[![Version](https://img.shields.io/badge/version-0.1.6-1677ff)](https://github.com/ArnoldRedman/Zhizhang/releases)
 [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Android%20%7C%20iOS-20a162)](#下载安装)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-8a2be2)](LICENSE)
 
-ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记忆与写作技能组织在一个本地项目中。它面向需要持续创作、追踪设定与维持上下文一致性的长篇网文作者，而不是一次性文本生成器。
+织章将作品资料、世界观、大纲、章节、角色卡、记忆与写作技能组织在一个本地项目中。它面向需要持续创作、追踪设定与维持上下文一致性的长篇网文作者，而不是一次性文本生成器。
 
 ## 下载安装
 
-最新安装包、校验值与版本更新记录统一发布在飞书文档：
-
-**[下载 ApiSaverWriter](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)**
+安装包与版本更新记录发布在 [GitHub Releases](https://github.com/ArnoldRedman/Zhizhang/releases)。
 
 当前提供 macOS、Windows、Android 与 iOS 构建版本。iOS 安装包为未签名 IPA，需使用适合设备的签名或安装方式导入。
 
-## 使用教程
+## 快速上手
 
-完整图文教程请查看[飞书使用教程](https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb)。下面保留教程中的操作目录，方便在仓库首页快速查找。
+应用自带「设置 - 使用教程」快速上手清单。核心流程如下。
 
-### 一、创建大模型 ApiKey
+### 一、配置模型接口
 
-1. 注册 ApiSaverWriter 中转站账户。
-2. 登录中转站。
-3. 创建一个 ApiKey。
-4. 打开 ApiSaverWriter，在设置中粘贴 ApiKey。
-5. 点击“拉取模型”，选择启用的模型并保存设置。
+织章不内置任何模型中转厂商，接口地址与 API Key 都由你自己填写。
+
+1. 打开设置，在「模型与接口」点「+ 新增配置」。
+2. 选择接口协议：OpenAI 兼容（`/v1/chat/completions`）或 Anthropic Messages（`/v1/messages`）。
+3. 填写接口地址与 API Key。
+4. 点击「拉取模型」，勾选要启用的模型并保存。
 
 ### 二、小说管理
 
@@ -66,12 +65,6 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 
 可以新建文风，并添加图标、封面和文风说明，供章节写作时绑定使用。
 
-### 教程与下载
-
-- [打开完整飞书使用教程](https://my.feishu.cn/wiki/UMTkwQAuEiIm3UkTNqrcAN3lnWb)
-- [下载最新安装包与查看版本更新](https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa)
-- [ApiSaverWriter 开源仓库](https://github.com/Vaxue/ApiSaverWriter)
-
 ## 界面预览
 
 以下截图来自 v0.1.4 的实际构建，用于展示主要工作流；移动端采用独立的窄屏布局。
@@ -86,7 +79,7 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 
 ## 使用方式
 
-1. 在“设置”中添加 ApiSaver API Key，拉取该 Key 所属分组可用的模型并选择模型。
+1. 在“设置”中填写自己的接口地址与 API Key，拉取该 Key 可用的模型并选择模型。
 2. 新建小说，先建立世界观与作品设定，再创建总纲、章纲或正文。
 3. 保存正文后确认章节记忆，后续章节会按固定资料、历史摘要与最近对话的顺序构建上下文。
 4. 通过“设置 - 备份与同步”创建完整备份，在新设备上恢复同一份创作资料。
@@ -94,7 +87,7 @@ ApiSaverWriter 将作品资料、世界观、大纲、章节、角色卡、记�
 ## 架构
 
 ```text
-ApiSaverWriter/
+织章/
 ├── packages/contracts/      # 桌面、移动端与 Agent Runtime 共享 RPC 契约
 ├── packages/model-protocol/ # OpenAI/Anthropic 共享纯协议规则
 ├── desktop-app/             # React + TypeScript + Tauri 多端客户端
@@ -105,7 +98,7 @@ ApiSaverWriter/
 │   └── src-tauri/           # Rust 原生能力与移动端工程
 ├── sidecars/agent-runtime/  # Node.js 写作智能体、上下文和本地存储
 ├── schema/                  # 本地数据结构
-└── scripts/                 # 版本发布和飞书同步脚本
+└── scripts/                 # 版本发布脚本
 ```
 
 - **客户端**：React、TypeScript、Vite、Tauri 2，按 domain/features/services/platform 分层。
@@ -138,15 +131,22 @@ npm run tauri:build --prefix desktop-app
 
 移动端构建步骤请查看 [desktop-app/MOBILE.md](desktop-app/MOBILE.md)。
 
-## 开源边界与隐私
+## 隐私边界
 
-本仓库公开的是客户端、写作工作流和本地数据能力。以下内容不在仓库内，也不会随客户端源码提交：
+- 模型渠道、余额、计费与风控由你自己配置的中转站或模型厂商负责，不在本仓库内。
+- API Key、访问令牌、签名证书、个人小说内容和云端备份内容不随源码提交。
+- 请勿在 Issue、Pull Request、日志或截图中提交任何 Key、Cookie、备份文件或私密作品资料。
 
-- ApiSaver 的模型渠道、模型路由、余额、计费、风控与运营系统。
-- API Key、访问令牌、签名证书、个人小说内容、云端备份内容和其他用户数据。
-- 生产服务配置与服务端密钥。
+## 来源与致谢
 
-客户端默认使用 ApiSaver 服务地址，用户需在设置中配置自己的 API Key。请勿在 Issue、Pull Request、日志或截图中提交任何 Key、Cookie、备份文件或私密作品资料。
+织章基于 [ApiSaverWriter](https://github.com/Vaxue/ApiSaverWriter) 二次开发，原项目以 AGPL-3.0-or-later 发布。
+
+相对上游的主要改动：
+
+- 移除内置的模型中转厂商，接口地址与 API Key 完全由用户配置。
+- 重做编辑器侧栏布局，侧栏宽度与标签区高度可拖动。
+- 项目 Agent 增加整轮委派预算，单轮修订上限放宽到 10 章。
+- 移除与上游运营相关的发布与文档同步流程。
 
 ## 贡献
 

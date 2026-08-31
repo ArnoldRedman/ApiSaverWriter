@@ -4,12 +4,65 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::Manager;
 
+/// 0.1.6 之前应用叫 ApiSaverWriter，bundle identifier 是 com.apisaverwriter.app。
+/// Tauri 用 identifier 拼数据目录，改名后目录跟着变，老用户的小说会“看起来丢了”。
+const LEGACY_APP_DATA_DIRECTORY: &str = "com.apisaverwriter.app";
+
+/// 应用数据目录。新目录还不存在而旧目录在时，整体搬过来；搬不动就继续用旧目录，
+/// 宁可留着旧名字也不让已有小说落空。
 pub fn app_data_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     let directory = app
         .path()
         .app_data_dir()
         .map_err(|error| format!("无法确定应用数据目录: {error}"))?;
-    Ok(directory)
+    Ok(adopt_legacy_data_directory(directory))
+}
+
+fn adopt_legacy_data_directory(directory: PathBuf) -> PathBuf {
+    if directory.exists() {
+        return directory;
+    }
+    let Some(legacy) = directory.parent().map(|parent| parent.join(LEGACY_APP_DATA_DIRECTORY)) else {
+        return directory;
+    };
+    if !legacy.is_dir() || legacy == directory {
+        return directory;
+    }
+    match fs::rename(&legacy, &directory) {
+        Ok(()) => directory,
+        // 跨卷或目录被占用时搬不动：这次继续用旧目录，下次启动再试
+        Err(error) => {
+            eprintln!("旧数据目录迁移失败，继续使用 {}: {error}", legacy.display());
+            legacy
+        }
+    }
+}
+
+#[cfg(test)]
+mod data_directory_tests {
+    use super::adopt_legacy_data_directory;
+    use std::fs;
+
+    #[test]
+    fn 旧数据目录在改名后被接管() {
+        let root = std::env::temp_dir().join(format!("zhizhang-migrate-{}", std::process::id()));
+        let legacy = root.join(super::LEGACY_APP_DATA_DIRECTORY);
+        let current = root.join("com.zhizhang.app");
+        fs::create_dir_all(legacy.join("projects")).unwrap();
+        fs::write(legacy.join("projects").join("metadata.json"), b"{}").unwrap();
+
+        let resolved = adopt_legacy_data_directory(current.clone());
+        assert_eq!(resolved, current, "新目录应当接管旧数据");
+        assert!(current.join("projects").join("metadata.json").exists(), "小说文件必须跟着搬过去");
+        assert!(!legacy.exists(), "搬完后旧目录不应残留");
+
+        // 新目录已经存在时不再回看旧目录，避免二次搬运覆盖新数据
+        fs::create_dir_all(&legacy).unwrap();
+        assert_eq!(adopt_legacy_data_directory(current.clone()), current);
+        assert!(legacy.exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
 }
 
 #[tauri::command]
@@ -454,7 +507,7 @@ pub fn graph_node_to_markdown(node: &Value, nodes: &[Value], edges: &[Value]) ->
         relation_lines.push(format!("- {other_label}｜{relation}｜{direction}｜权重：{weight:.2}"));
     }
     let relation_text = if relation_lines.is_empty() { "- 暂无".to_string() } else { relation_lines.join("\n") };
-    format!("# {title}\n\n<!-- ApiSaverWriter Graph Node: {id} -->\n\n## 基础信息\n- 节点类型：{}\n- 当前状态：{status}\n- 来源路径：{}\n\n## 档案内容\n{content}\n\n## 关系网络\n{relation_text}\n", graph_node_type_label(node), graph_node_relative_path(node).to_string_lossy())
+    format!("# {title}\n\n<!-- Zhizhang Graph Node: {id} -->\n\n## 基础信息\n- 节点类型：{}\n- 当前状态：{status}\n- 来源路径：{}\n\n## 档案内容\n{content}\n\n## 关系网络\n{relation_text}\n", graph_node_type_label(node), graph_node_relative_path(node).to_string_lossy())
 }
 
 

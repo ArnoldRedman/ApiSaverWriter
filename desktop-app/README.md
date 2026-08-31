@@ -1,4 +1,4 @@
-# ApiSaverWriter Desktop
+# 织章 Desktop
 
 桌面端 AI 小说写作助手 - 基于 Tauri + React 构建的跨平台应用
 

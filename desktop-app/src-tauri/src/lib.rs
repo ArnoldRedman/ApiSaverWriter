@@ -59,8 +59,8 @@ fn validate_cloud_backup_path(remote_path: &str, backup_path: &str) -> Result<St
     let relative = normalized.strip_prefix("apps/bdpan/").unwrap_or(&normalized);
     let prefix = format!("{base}/");
     let file_name = relative.strip_prefix(&prefix).ok_or_else(|| "所选备份文件不在当前云端备份目录中".to_string())?;
-    if file_name.is_empty() || file_name.contains('/') || file_name.contains("..") || !file_name.to_ascii_lowercase().ends_with(".aswbackup") {
-        return Err("所选云端文件不是有效的 ApiSaverWriter 备份包".to_string());
+    if file_name.is_empty() || file_name.contains('/') || file_name.contains("..") || !has_backup_extension(file_name) {
+        return Err("所选云端文件不是有效的织章备份包".to_string());
     }
     validate_cloud_path(relative)
 }
@@ -125,8 +125,17 @@ pub(crate) fn copy_cloud_backup_contents(source: &Path, target: &Path) -> Result
 }
 
 const CLOUD_BACKUP_DIRECTORIES: [&str; 6] = ["projects", "books", "dismantles", "rankings", "styles", "agent-chats"];
-const CLOUD_BACKUP_BUNDLE_NAME: &str = "ApiSaverWriter-backup.aswbackup";
-const CLOUD_BACKUP_MAGIC: &[u8] = b"ASWBACKUP\x01";
+const CLOUD_BACKUP_BUNDLE_NAME: &str = "Zhizhang-backup.zzbackup";
+const CLOUD_BACKUP_MAGIC: &[u8] = b"ZZBACKUP\x01";
+/// 改名前写出的备份包标识；只用于读取，不再写出
+const LEGACY_CLOUD_BACKUP_MAGIC: &[u8] = b"ASWBACKUP\x01";
+/// 两种扩展名都要能恢复，否则改名当天用户手上的备份全部作废
+const BACKUP_EXTENSIONS: [&str; 2] = ["zzbackup", "aswbackup"];
+
+fn has_backup_extension(name: &str) -> bool {
+    let lowered = name.to_ascii_lowercase();
+    BACKUP_EXTENSIONS.iter().any(|extension| lowered.ends_with(&format!(".{extension}")))
+}
 
 fn cloud_export_directory(app_data: &Path) -> PathBuf {
     app_data.join("cloud-export")
@@ -225,8 +234,8 @@ fn extract_cloud_backup_bundle(bundle_path: &Path, export_root: &Path) -> Result
     };
     let mut magic = vec![0_u8; CLOUD_BACKUP_MAGIC.len()];
     bundle.read_exact(&mut magic).map_err(|error| format!("读取云端备份包标识失败: {error}"))?;
-    if magic != CLOUD_BACKUP_MAGIC {
-        return Err("云端文件不是有效的 ApiSaverWriter 完整备份包".to_string());
+    if magic != CLOUD_BACKUP_MAGIC && magic != LEGACY_CLOUD_BACKUP_MAGIC {
+        return Err("云端文件不是有效的织章完整备份包".to_string());
     }
     let file_count = u64::from_le_bytes(read_bundle_number::<8>(&mut *bundle, "文件数量")?);
     if file_count > 1_000_000 {
@@ -368,7 +377,7 @@ fn list_baidu_backups(remote_path: String) -> Result<Value, String> {
             .or_else(|| entry.get("name").and_then(Value::as_str))
             .or_else(|| path.rsplit('/').next())
             .unwrap_or_default();
-        if !path.starts_with(&prefix) || path[prefix.len()..].contains('/') || !name.to_ascii_lowercase().ends_with(".aswbackup") {
+        if !path.starts_with(&prefix) || path[prefix.len()..].contains('/') || !has_backup_extension(name) {
             return None;
         }
         let relative_path = format!("{remote_path}/{name}");
@@ -453,7 +462,7 @@ fn export_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .or_else(|_| app.path().document_dir())
         .or_else(|_| app_data_directory(app))
         .map_err(|error| format!("无法确定导出目录: {error}"))?
-        .join("ApiSaverWriter 导出");
+        .join("织章导出");
     fs::create_dir_all(&target).map_err(|error| format!("创建导出目录失败: {error}"))?;
     Ok(target)
 }
@@ -494,7 +503,7 @@ fn export_backup_bundle(app: tauri::AppHandle, client_state: Value) -> Result<Va
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("读取系统时间失败: {error}"))?
         .as_secs();
-    let bundle_path = export_directory(&app)?.join(format!("ApiSaverWriter-{stamp}.aswbackup"));
+    let bundle_path = export_directory(&app)?.join(format!("Zhizhang-{stamp}.zzbackup"));
     let size = write_cloud_backup_bundle(&export_root, &bundle_path);
     fs::remove_dir_all(&export_root).ok();
     let size = size?;
@@ -510,7 +519,7 @@ fn list_local_backups(app: tauri::AppHandle) -> Result<Value, String> {
     if let Ok(entries) = fs::read_dir(&directory) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("aswbackup") {
+            if !path.file_name().and_then(|value| value.to_str()).is_some_and(has_backup_extension) {
                 continue;
             }
             let metadata = match entry.metadata() {
@@ -543,7 +552,7 @@ fn restore_backup_bundle(app: tauri::AppHandle, file_name: String) -> Result<Val
         || trimmed.contains('/')
         || trimmed.contains('\\')
         || trimmed.contains("..")
-        || Path::new(trimmed).extension().and_then(|value| value.to_str()) != Some("aswbackup")
+        || !has_backup_extension(trimmed)
     {
         return Err("备份文件名无效".to_string());
     }
@@ -861,7 +870,7 @@ mod tests {
     #[test]
     fn github_project_repository_round_trip_uses_real_git() {
         let root = std::env::temp_dir().join(format!(
-            "apisaverwriter-git-test-{}-{}",
+            "zhizhang-git-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -873,8 +882,8 @@ mod tests {
         let checkout = clone_github_repository(&root, &bare_text, "write-cache").unwrap();
         validate_github_backup_destination(&checkout, 42, "测试小说").unwrap();
         let project = json!({ "id": 42, "title": "测试小说", "chapters": [{ "id": 1, "title": "第一章", "content": "正文" }] });
-        fs::write(checkout.join(".apisaverwriter-project.json"), serde_json::to_vec_pretty(&json!({
-            "kind": "apisaverwriter-project", "schemaVersion": 1, "projectId": 42, "title": "测试小说"
+        fs::write(checkout.join(".zhizhang-project.json"), serde_json::to_vec_pretty(&json!({
+            "kind": "zhizhang-project", "schemaVersion": 1, "projectId": 42, "title": "测试小说"
         })).unwrap()).unwrap();
         fs::write(checkout.join("project.json"), serde_json::to_vec_pretty(&project).unwrap()).unwrap();
         ensure_git_identity(&checkout).unwrap();
@@ -893,20 +902,20 @@ mod tests {
     fn selected_cloud_backup_must_stay_in_configured_directory() {
         assert_eq!(
             validate_cloud_backup_path(
-                "ApiSaverWriter/backup",
-                "/apps/bdpan/ApiSaverWriter/backup/ApiSaverWriter-backup-2026-08-18.aswbackup"
+                "Zhizhang/backup",
+                "/apps/bdpan/Zhizhang/backup/Zhizhang-backup-2026-08-18.zzbackup"
             ).unwrap(),
-            "ApiSaverWriter/backup/ApiSaverWriter-backup-2026-08-18.aswbackup"
+            "Zhizhang/backup/Zhizhang-backup-2026-08-18.zzbackup"
         );
-        assert!(validate_cloud_backup_path("ApiSaverWriter/backup", "ApiSaverWriter/other/backup.aswbackup").is_err());
-        assert!(validate_cloud_backup_path("ApiSaverWriter/backup", "ApiSaverWriter/backup/../secret.aswbackup").is_err());
-        assert!(validate_cloud_backup_path("ApiSaverWriter/backup", "ApiSaverWriter/backup/client-state.json").is_err());
+        assert!(validate_cloud_backup_path("Zhizhang/backup", "Zhizhang/other/backup.zzbackup").is_err());
+        assert!(validate_cloud_backup_path("Zhizhang/backup", "Zhizhang/backup/../secret.zzbackup").is_err());
+        assert!(validate_cloud_backup_path("Zhizhang/backup", "Zhizhang/backup/client-state.json").is_err());
     }
 
     #[test]
     fn cloud_backup_bundle_round_trip_supports_novel_paths() {
         let root = std::env::temp_dir().join(format!(
-            "apisaverwriter-backup-test-{}",
+            "zhizhang-backup-test-{}",
             std::process::id()
         ));
         let source = root.join("source");
@@ -931,7 +940,7 @@ mod tests {
     #[test]
     fn cloud_backup_restore_accepts_legacy_uncompressed_bundle() {
         let root = std::env::temp_dir().join(format!(
-            "apisaverwriter-legacy-backup-test-{}",
+            "zhizhang-legacy-backup-test-{}",
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();

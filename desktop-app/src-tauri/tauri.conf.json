@@ -1,7 +1,7 @@
 {
-  "productName": "ApiSaverWriter",
+  "productName": "Zhizhang",
   "version": "0.1.6",
-  "identifier": "com.apisaverwriter.app",
+  "identifier": "com.zhizhang.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run prepare:agent-runtime && npm run build",
@@ -26,7 +26,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "ApiSaverWriter - AI小说写作助手",
+        "title": "织章 · AI 小说写作工作台",
         "width": 1400,
         "height": 900,
         "minWidth": 360,

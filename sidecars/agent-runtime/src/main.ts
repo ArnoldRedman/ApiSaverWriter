@@ -13,7 +13,7 @@ import { registerModelHandlers } from "./rpc/model-handlers.js";
 import { registerLibraryHandlers } from "./rpc/library-handlers.js";
 import { registerContentHandlers } from "./rpc/content-handlers.js";
 import { registerTextHandlers } from "./rpc/text-handlers.js";
-import type { RpcResponse } from "@apisaverwriter/contracts";
+import type { RpcResponse } from "@zhizhang/contracts";
 
 async function handleLegacyRequest(req: RuntimeRpcRequest): Promise<RpcResponse> {
   try {

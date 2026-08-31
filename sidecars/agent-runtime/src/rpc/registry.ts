@@ -1,4 +1,4 @@
-import { isAgentRpcMethod, parseAgentRpcParams, type AgentRpcMethod, type RpcResponse } from "@apisaverwriter/contracts";
+import { isAgentRpcMethod, parseAgentRpcParams, type AgentRpcMethod, type RpcResponse } from "@zhizhang/contracts";
 
 export interface RuntimeRpcRequest {
   id: string | number;

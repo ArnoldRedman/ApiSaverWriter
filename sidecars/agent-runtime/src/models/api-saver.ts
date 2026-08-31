@@ -3,7 +3,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ProxyAgent } from "undici";
 import { fitMessagesToTokenBudget } from "../context/token-budget.js";
-import { anthropicText, anthropicThinkingBudget, authHeaders as protocolAuthHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from "@apisaverwriter/model-protocol";
+import { anthropicText, anthropicThinkingBudget, authHeaders as protocolAuthHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from "@zhizhang/model-protocol";
 
 export type ApiSaverProvider = "openai" | "claude";
 

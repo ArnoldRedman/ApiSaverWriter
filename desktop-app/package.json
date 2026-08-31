@@ -20,8 +20,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "@apisaverwriter/contracts": "file:../packages/contracts",
-    "@apisaverwriter/model-protocol": "file:../packages/model-protocol",
+    "@zhizhang/contracts": "file:../packages/contracts",
+    "@zhizhang/model-protocol": "file:../packages/model-protocol",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.2",
     "@tauri-apps/plugin-http": "^2.5.9",

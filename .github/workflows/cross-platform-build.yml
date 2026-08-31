@@ -1,4 +1,4 @@
-name: ApiSaverWriter Release
+name: 织章 Release
 
 on:
   push:
@@ -111,10 +111,10 @@ jobs:
           [ "${{ matrix.kind }}" = "macos-intel" ] && arch="Intel"
           dmg="$(find desktop-app/src-tauri/target -path '*/release/bundle/dmg/*.dmg' -print -quit)"
           test -n "$dmg"
-          cp "$dmg" "release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_macOS_${arch}.dmg"
+          cp "$dmg" "release-assets/Zhizhang_${{ inputs.release_tag || github.ref_name }}_macOS_${arch}.dmg"
           app="$(find desktop-app/src-tauri/target -path '*/release/bundle/macos/*.app' -print -quit)"
           test -n "$app"
-          tar -C "$(dirname "$app")" -czf "release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_macOS_${arch}.app.tar.gz" "$(basename "$app")"
+          tar -C "$(dirname "$app")" -czf "release-assets/Zhizhang_${{ inputs.release_tag || github.ref_name }}_macOS_${arch}.app.tar.gz" "$(basename "$app")"
       - name: Prepare Android SDK
         if: matrix.kind == 'android'
         run: |
@@ -136,17 +136,17 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
-            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/apisaverwriter-release.jks"
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/zhizhang-release.jks"
             echo "使用仓库固定 Android 发布签名密钥。"
           else
             echo "未配置 ANDROID_KEYSTORE_BASE64，生成本次构建签名密钥。配置固定密钥后可保持跨版本覆盖安装。"
             keytool -genkeypair -noprompt \
-              -keystore "$RUNNER_TEMP/apisaverwriter-release.jks" \
-              -storepass apisaverwriter-ci \
-              -keypass apisaverwriter-ci \
-              -alias apisaverwriter \
+              -keystore "$RUNNER_TEMP/zhizhang-release.jks" \
+              -storepass zhizhang-ci \
+              -keypass zhizhang-ci \
+              -alias zhizhang \
               -keyalg RSA -keysize 2048 -validity 3650 \
-              -dname "CN=ApiSaverWriter,O=ApiSaverWriter,C=CN"
+              -dname "CN=Zhizhang,O=Zhizhang,C=CN"
           fi
       - name: Sign and verify Android release assets
         if: matrix.kind == 'android'
@@ -154,15 +154,15 @@ jobs:
         env:
           ANDROID_BUILD_TOOLS_VERSION: 35.0.0
           ANDROID_VERSION_CODE: 14
-          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/apisaverwriter-release.jks
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/zhizhang-release.jks
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          : "${ANDROID_KEYSTORE_PASSWORD:=apisaverwriter-ci}"
-          : "${ANDROID_KEY_ALIAS:=apisaverwriter}"
-          : "${ANDROID_KEY_PASSWORD:=apisaverwriter-ci}"
+          : "${ANDROID_KEYSTORE_PASSWORD:=zhizhang-ci}"
+          : "${ANDROID_KEY_ALIAS:=zhizhang}"
+          : "${ANDROID_KEY_PASSWORD:=zhizhang-ci}"
           export ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD
           scripts/package-android-release.sh release-assets "${{ inputs.release_tag || github.ref_name }}"
       - name: Build unsigned iOS archive
@@ -182,8 +182,8 @@ jobs:
           app="$(find "$archive/Products/Applications" -maxdepth 1 -type d -name '*.app' -print -quit)"
           test -n "$app"
           cp -R "$app" ios-package/Payload/
-          (cd ios-package && zip -qry "../release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_iOS_unsigned.ipa" Payload)
-          tar -C "$(dirname "$archive")" -czf "release-assets/ApiSaverWriter_${{ inputs.release_tag || github.ref_name }}_iOS_unsigned.xcarchive.tar.gz" "$(basename "$archive")"
+          (cd ios-package && zip -qry "../release-assets/Zhizhang_${{ inputs.release_tag || github.ref_name }}_iOS_unsigned.ipa" Payload)
+          tar -C "$(dirname "$archive")" -czf "release-assets/Zhizhang_${{ inputs.release_tag || github.ref_name }}_iOS_unsigned.xcarchive.tar.gz" "$(basename "$archive")"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
@@ -205,34 +205,16 @@ jobs:
       - name: Publish install packages to public distribution repository
         env:
           GH_TOKEN: ${{ secrets.DISTRIBUTION_GITHUB_TOKEN }}
-          DISTRIBUTION_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian' }}
+          DISTRIBUTION_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY }}
           RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
         run: |
           set -euo pipefail
-          if [ -z "$GH_TOKEN" ]; then
-            echo "DISTRIBUTION_GITHUB_TOKEN 未配置，跳过公开分发仓库发布。"
+          if [ -z "$GH_TOKEN" ] || [ -z "$DISTRIBUTION_REPOSITORY" ]; then
+            echo "DISTRIBUTION_GITHUB_TOKEN 或 DISTRIBUTION_REPOSITORY 未配置，跳过公开分发仓库发布。"
             exit 0
           fi
           gh release view "$RELEASE_TAG" --repo "$DISTRIBUTION_REPOSITORY" >/dev/null 2>&1 || \
             gh release create "$RELEASE_TAG" --repo "$DISTRIBUTION_REPOSITORY" \
               --title "$RELEASE_TAG" \
-              --notes "AI写小说软件 $RELEASE_TAG 安装包。本仓库只提供安装包，不包含源代码。"
+              --notes "织章 $RELEASE_TAG 安装包。本仓库只提供安装包，不包含源代码。"
           gh release upload "$RELEASE_TAG" --repo "$DISTRIBUTION_REPOSITORY" release-assets/* --clobber
-      - name: Sync release notes to Feishu
-        env:
-          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
-          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
-          FEISHU_DOC_URL: ${{ secrets.FEISHU_DOC_URL || 'https://my.feishu.cn/wiki/TQKNwxbzUitID3kWxOicv58vnqa' }}
-          FEISHU_AS: bot
-          RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          DOWNLOAD_REPOSITORY: ${{ vars.DISTRIBUTION_REPOSITORY || 'Vaxue/AI-xiaoshuo-xiezuo-ruanjian' }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -z "$FEISHU_APP_ID" ] || [ -z "$FEISHU_APP_SECRET" ]; then
-            echo "飞书应用密钥未配置，跳过版本文档同步。"
-            exit 0
-          fi
-          npm install -g @larksuite/cli@1.0.89
-          printf '%s' "$FEISHU_APP_SECRET" | lark-cli profile add --name apisaverwriter-release --app-id "$FEISHU_APP_ID" --app-secret-stdin
-          npm run sync:feishu-release

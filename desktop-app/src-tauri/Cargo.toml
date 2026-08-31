@@ -1,14 +1,14 @@
 [package]
-name = "apisaverwriter"
+name = "zhizhang"
 version = "0.1.6"
 description = "AI Novel Writing Assistant - 用最少的API写出最火的小说"
 authors = ["you"]
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/Vaxue/ApiSaverWriter"
+repository = "https://github.com/ArnoldRedman/Zhizhang"
 edition = "2021"
 
 [lib]
-name = "apisaverwriter_lib"
+name = "zhizhang_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

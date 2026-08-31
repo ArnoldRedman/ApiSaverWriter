@@ -1,8 +1,8 @@
 #!/bin/bash
 
-APP_PATH="./src-tauri/target/release/bundle/macos/ApiSaverWriter.app"
+APP_PATH="./src-tauri/target/release/bundle/macos/Zhizhang.app"
 
-echo "Testing ApiSaverWriter launch..."
+echo "Testing Zhizhang launch..."
 
 if [ ! -d "$APP_PATH" ]; then
     echo "Error: App not found at $APP_PATH"
@@ -10,7 +10,7 @@ if [ ! -d "$APP_PATH" ]; then
 fi
 
 echo "Starting app in background..."
-"$APP_PATH/Contents/MacOS/apisaverwriter" > /tmp/apisaverwriter-test.log 2>&1 &
+"$APP_PATH/Contents/MacOS/zhizhang" > /tmp/zhizhang-test.log 2>&1 &
 APP_PID=$!
 
 echo "App started with PID: $APP_PID"
@@ -26,6 +26,6 @@ if kill -0 $APP_PID 2>/dev/null; then
 else
     echo "❌ App crashed or exited"
     echo "Log output:"
-    cat /tmp/apisaverwriter-test.log
+    cat /tmp/zhizhang-test.log
     exit 1
 fi

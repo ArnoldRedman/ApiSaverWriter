@@ -51,7 +51,7 @@ fn node_executable() -> Result<PathBuf, String> {
     if let Some(path) = bundled_agent_resource("node.exe") {
         candidates.push(path);
     }
-    if let Ok(value) = std::env::var("APISAVERWRITER_NODE") {
+    if let Ok(value) = std::env::var("ZHIZHANG_NODE") {
         if !value.trim().is_empty() {
             candidates.push(PathBuf::from(value));
         }
@@ -86,7 +86,7 @@ fn node_executable() -> Result<PathBuf, String> {
             return Ok(candidate);
         }
     }
-    Err(format!("找不到可用的 Node.js 运行时（已检查 {}）。可设置 APISAVERWRITER_NODE 指向 node 可执行文件。", attempted.join("、")))
+    Err(format!("找不到可用的 Node.js 运行时（已检查 {}）。可设置 ZHIZHANG_NODE 指向 node 可执行文件。", attempted.join("、")))
 }
 
 #[tauri::command]

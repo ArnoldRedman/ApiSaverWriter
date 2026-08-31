@@ -102,10 +102,10 @@ try {
         Write-Host '已跳过测试（-SkipTests）' -ForegroundColor Yellow
     } else {
         Write-Step '运行 Agent Runtime 类型检查'
-        Invoke-Checked $npmCommand @('--workspace', '@apisaverwriter/agent-runtime', 'run', 'typecheck')
+        Invoke-Checked $npmCommand @('--workspace', '@zhizhang/agent-runtime', 'run', 'typecheck')
 
         Write-Step '运行项目 Agent 回归测试'
-        Invoke-Checked $npmCommand @('--workspace', '@apisaverwriter/agent-runtime', 'test', '--', '--run', 'tests/project-agent.test.ts')
+        Invoke-Checked $npmCommand @('--workspace', '@zhizhang/agent-runtime', 'test', '--', '--run', 'tests/project-agent.test.ts')
 
         Write-Step '运行 Rust 测试'
         Invoke-Checked $cargoCommand @('test', '--manifest-path', 'desktop-app/src-tauri/Cargo.toml')
@@ -116,8 +116,8 @@ try {
 
     $version = Get-AppVersion
     $outputs = @(
-        (Join-Path $releaseRoot "bundle\nsis\ApiSaverWriter_${version}_x64-setup.exe"),
-        (Join-Path $releaseRoot "bundle\msi\ApiSaverWriter_${version}_x64_en-US.msi")
+        (Join-Path $releaseRoot "bundle\nsis\Zhizhang_${version}_x64-setup.exe"),
+        (Join-Path $releaseRoot "bundle\msi\Zhizhang_${version}_x64_en-US.msi")
     )
 
     Write-Step '核对构建产物'
@@ -132,7 +132,7 @@ try {
         Write-Host "  SHA256：$hash"
     }
 
-    Write-Host "`n构建完成：ApiSaverWriter v$version" -ForegroundColor Green
+    Write-Host "`n构建完成：织章 v$version" -ForegroundColor Green
     Write-Host "安装包目录：$(Join-Path $releaseRoot 'bundle')" -ForegroundColor Green
     exit 0
 } catch {

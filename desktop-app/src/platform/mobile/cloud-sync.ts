@@ -24,8 +24,13 @@ const httpFetch = async (): Promise<typeof globalThis.fetch> => {
 
 const baiduTokenKey = 'writer-baidu-access-token';
 const baiduClientId = 'zF5kkNsCvckX4aIpRdHxpFkcSMxnGZky';
-const baiduBackupName = 'ApiSaverWriter-backup.aswbackup';
-const backupMagic = new TextEncoder().encode('ASWBACKUP\x01');
+const baiduBackupName = 'Zhizhang-backup.zzbackup';
+const backupMagic = new TextEncoder().encode('ZZBACKUP\x01');
+/** 改名前写出的备份包标识，只用于读取 */
+const legacyBackupMagic = new TextEncoder().encode('ASWBACKUP\x01');
+/** 两种扩展名都要能恢复，否则改名当天用户手上的备份全部作废 */
+const backupExtensions = ['.zzbackup', '.aswbackup'];
+const hasBackupExtension = (name: string) => backupExtensions.some(extension => name.toLowerCase().endsWith(extension));
 
 const emitCloudProgress = (message: string) => window.dispatchEvent(new CustomEvent('cloud-sync-progress', { detail: { message } }));
 
@@ -197,7 +202,10 @@ const readMobileBackupBundle = async (bytes: Uint8Array) => {
   emitCloudProgress(`解压完成（${(raw.byteLength / 1_048_576).toFixed(1)} MB），正在校验备份内容...`);
   const decoder = new TextDecoder();
   let offset = backupMagic.byteLength;
-  if (decoder.decode(raw.slice(0, offset)) !== decoder.decode(backupMagic)) throw new Error('云端文件不是有效的 ApiSaverWriter 完整备份包。');
+  const header = decoder.decode(raw.slice(0, offset));
+  if (header !== decoder.decode(backupMagic) && header !== decoder.decode(legacyBackupMagic)) {
+    throw new Error('云端文件不是有效的织章完整备份包。');
+  }
   const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   const count = Number(view.getBigUint64(offset, true)); offset += 8;
   if (!Number.isSafeInteger(count) || count > 10000) throw new Error('云端备份包文件数量异常。');
@@ -291,8 +299,8 @@ const mobileCloudBackupPath = (remotePath: string, backupPath: string) => {
   const { path, directory } = mobileCloudDirectory(remotePath);
   const normalized = backupPath.trim().replace(/\\/gu, '/').replace(/^\/+|\/+$/gu, '');
   const relative = normalized.startsWith('apps/bdpan/') ? normalized.slice('apps/bdpan/'.length) : normalized;
-  if (!relative || relative.includes('..') || !relative.toLowerCase().endsWith('.aswbackup')) {
-    throw new Error('所选云端文件不是有效的 ApiSaverWriter 备份包。');
+  if (!relative || relative.includes('..') || !hasBackupExtension(relative)) {
+    throw new Error('所选云端文件不是有效的织章备份包。');
   }
   const expectedPrefix = `${path}/`;
   if (!relative.startsWith(expectedPrefix) || relative.slice(expectedPrefix.length).includes('/')) {
@@ -419,7 +427,7 @@ const mobileBaiduListBackups = async (remotePath: string): Promise<{ files: Clou
   const files = (data.list || []).flatMap((item): CloudBackupFile[] => {
     const name = stringValue(item.server_filename) || stringValue(item.path).split('/').pop() || '';
     const itemPath = stringValue(item.path);
-    if (!name.toLowerCase().endsWith('.aswbackup') || Boolean(item.isdir) || !itemPath.startsWith(`${directory}/`)) return [];
+    if (!hasBackupExtension(name) || Boolean(item.isdir) || !itemPath.startsWith(`${directory}/`)) return [];
     const rawTime = item.server_mtime ?? item.local_mtime;
     const numericTime = Number(rawTime);
     const modifiedAt = typeof rawTime === 'string' && /[T:-]/u.test(rawTime)

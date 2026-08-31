@@ -1,4 +1,4 @@
--- ApiSaverWriter 小说写作数据库结构
+-- 织章小说写作数据库结构
 
 -- 用户配置表
 CREATE TABLE IF NOT EXISTS user_config (
