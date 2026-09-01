@@ -17,6 +17,7 @@ import { readerFonts, themes, appearanceStorageKey, loadAppearance, applyAppeara
 import { usePaneSizes } from './features/editor/use-pane-sizes';
 import { PaneResizer } from './features/editor/pane-resizer';
 import { PlumBranch } from './features/editor/plum-branch';
+import { Icon } from './components/icon';
 import './App.css';
 import { countNovelCharacters } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
@@ -3342,9 +3343,9 @@ function App() {
     return <section className="search-panel document-search-panel" aria-label={`${label}搜索与替换`}>
       <div className="search-panel-row">
         <input ref={searchInputRef} className="input" value={searchQuery} placeholder={`搜索${label}内容`} onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); setBookSearchMatchIndex(0); }} />
-        <button className="editor-tool-button" onClick={() => moveDocumentSearchMatch(content, label, -1)} disabled={!searchQuery}>上一个</button>
-        <button className="editor-tool-button" onClick={() => moveDocumentSearchMatch(content, label, 1)} disabled={!searchQuery}>下一个</button>
-        <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}>×</button>
+        <button className="editor-tool-button" title="上一处匹配" aria-label="上一处匹配" onClick={() => moveDocumentSearchMatch(content, label, -1)} disabled={!searchQuery}><Icon name="chevron-up" size={13} /></button>
+        <button className="editor-tool-button" title="下一处匹配" aria-label="下一处匹配" onClick={() => moveDocumentSearchMatch(content, label, 1)} disabled={!searchQuery}><Icon name="chevron-down" size={13} /></button>
+        <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}><Icon name="x" size={14} /></button>
       </div>
       <div className="search-panel-row replace-row">
         <input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} />
@@ -5682,7 +5683,7 @@ function App() {
   if (!startupReady) {
     return (
       <div className="startup-screen" role="status" aria-live="polite">
-        <div className="startup-mark" aria-hidden="true">文</div>
+        <div className="startup-mark" aria-hidden="true"><img src="/zhizhang-brand.png" alt="" /></div>
         <h1>织章</h1>
         <p>{deviceStorageReady ? '正在载入本地写作资料…' : '正在启动本地数据服务…'}</p>
         <span className="startup-spinner" aria-hidden="true" />
@@ -5697,19 +5698,19 @@ function App() {
       {editingProject ? (
         <div className="editor-view">
           <header className="editor-header">
-            <button className="btn-back" onClick={handleCloseEditor}>← 返回</button>
+            <button className="btn-back" onClick={handleCloseEditor}><Icon name="arrow-left" size={16} />返回</button>
             <h2>{editingProject.title}</h2>
-            <button className={`editor-tool-button project-agent-toggle ${showProjectAgent ? 'active' : ''}`} title="打开项目 Agent 对话" onClick={() => setShowProjectAgent(current => !current)}><span aria-hidden="true">✦</span> 项目 Agent{projectAgentPendingChanges.length ? ` ${projectAgentPendingChanges.length}` : ''}</button>
+            <button className={`editor-tool-button project-agent-toggle ${showProjectAgent ? 'active' : ''}`} title="打开项目 Agent 对话" onClick={() => setShowProjectAgent(current => !current)}><Icon name="sparkles" size={15} />项目 Agent{projectAgentPendingChanges.length ? ` ${projectAgentPendingChanges.length}` : ''}</button>
             {!outlineMode && !cardMode && !styleMode && editorSidebarTab !== 'search' && <>
-              <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}>搜索</button>
-              <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}>标记</button>
-              <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}>禁词</button>
-              <button className="editor-tool-button" title="历史版本与回滚（Ctrl/⌘ H）" disabled={!activeChapter} onClick={() => setShowChapterHistory(true)}>历史{activeChapter?.snapshots?.length ? ` ${activeChapter.snapshots.length}` : ''}</button>
-              <button className="editor-tool-button" title="通读当前章（Ctrl/⌘ P）" disabled={!activeChapter} onClick={() => setReadingMode(true)}>阅读</button>
-              <button className="editor-tool-button" title="写作统计（Ctrl/⌘ J）" onClick={() => setShowWritingStats(true)}>统计</button>
-              <button className="editor-tool-button" title="导出小说（Ctrl/⌘ E）" onClick={() => setShowExportModal(true)}>导出</button>
-              <button className="editor-tool-button" title="快捷键（Ctrl/⌘ /）" onClick={() => setShowShortcuts(true)}>?</button>
-              <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}>{chapterSaving ? '保存中...' : '保存章节'}</button>
+              <button className="editor-tool-button" title="搜索当前章节" onClick={() => { setShowSearchPanel(true); setSearchScope('chapter'); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Icon name="search" size={14} />搜索</button>
+              <button className={`editor-tool-button ${writingMarksEnabled ? 'active' : ''}`} title="人物名称与禁词标记" onClick={() => setWritingMarksEnabled(current => !current)}><Icon name="highlighter" size={14} />标记</button>
+              <button className="editor-tool-button" title="编辑禁词列表" onClick={() => { setBannedWordsDraft(bannedWords.join('\n')); setShowBannedWords(true); }}><Icon name="ban" size={14} />禁词</button>
+              <button className="editor-tool-button" title="历史版本与回滚（Ctrl/⌘ H）" disabled={!activeChapter} onClick={() => setShowChapterHistory(true)}><Icon name="history" size={14} />历史{activeChapter?.snapshots?.length ? ` ${activeChapter.snapshots.length}` : ''}</button>
+              <button className="editor-tool-button" title="通读当前章（Ctrl/⌘ P）" disabled={!activeChapter} onClick={() => setReadingMode(true)}><Icon name="book-open" size={14} />阅读</button>
+              <button className="editor-tool-button" title="写作统计（Ctrl/⌘ J）" onClick={() => setShowWritingStats(true)}><Icon name="bar-chart" size={14} />统计</button>
+              <button className="editor-tool-button" title="导出小说（Ctrl/⌘ E）" onClick={() => setShowExportModal(true)}><Icon name="download" size={14} />导出</button>
+              <button className="editor-tool-button" title="快捷键（Ctrl/⌘ /）" onClick={() => setShowShortcuts(true)}><Icon name="keyboard" size={14} /></button>
+              <button className="btn-primary editor-save-button" disabled={!activeChapter || chapterSaving} onClick={persistCurrentChapter}><Icon name="save" size={14} />{chapterSaving ? '保存中...' : '保存章节'}</button>
               <div className="editor-stats">
                 <span>{autoSaveStatus === 'saving' ? '自动保存中' : autoSaveStatus === 'saved' ? '已自动保存' : autoSaveStatus === 'error' ? '保存失败' : '本地写作'}</span>
                 <span>{editingProject.chapters.length} 章</span>
@@ -5724,7 +5725,7 @@ function App() {
             <PaneResizer name="projectAgent" axis="x" label="拖动调整对话抽屉宽度，双击复位" invert controller={panes} />
             <header className="project-agent-header">
               <div><strong>项目 Agent</strong><small>仅操作《{editingProject.title}》</small></div>
-              <div className="project-agent-header-actions"><button className="icon-button" title="新建会话" disabled={projectAgentRunning} onClick={startNewProjectAgentSession}>＋</button><button className="icon-button" title="关闭" onClick={() => setShowProjectAgent(false)}>×</button></div>
+              <div className="project-agent-header-actions"><button className="icon-button" title="新建会话" disabled={projectAgentRunning} onClick={startNewProjectAgentSession}><Icon name="plus" size={15} /></button><button className="icon-button" title="关闭" onClick={() => setShowProjectAgent(false)}><Icon name="x" size={15} /></button></div>
             </header>
             <div className="project-agent-mode" role="tablist" aria-label="项目 Agent 模式"><button className={projectAgentSession?.mode === 'discuss' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'discuss' } : current)}>讨论</button><button className={projectAgentSession?.mode === 'execute' ? 'active' : ''} disabled={!projectAgentSession || projectAgentRunning} onClick={() => setProjectAgentSession(current => current ? { ...current, mode: 'execute' } : current)}>执行</button></div>
             <div
@@ -5749,13 +5750,13 @@ function App() {
                 <strong>{notice.title}</strong>
                 <span>{notice.content}</span>
               </div>
-              <button className="editor-notice-close" aria-label="关闭提示" onClick={() => setNotice(null)}>×</button>
+              <button className="editor-notice-close" aria-label="关闭提示" onClick={() => setNotice(null)}><Icon name="x" size={15} /></button>
             </div>
           )}
 
           {showBannedWords && (
             <div className="editor-popover" role="dialog" aria-modal="true" aria-label="自定义禁词列表">
-              <div className="editor-popover-header"><strong>禁词提示</strong><button className="icon-delete" title="关闭" onClick={() => setShowBannedWords(false)}>×</button></div>
+              <div className="editor-popover-header"><strong>禁词提示</strong><button className="icon-delete" title="关闭" onClick={() => setShowBannedWords(false)}><Icon name="x" size={14} /></button></div>
               <p>每行一个，或用逗号分隔。写作时会以红色波浪线标记。</p>
               <textarea value={bannedWordsDraft} onChange={event => setBannedWordsDraft(event.target.value)} placeholder="输入需要提示的禁词" />
               <div><button className="btn-ghost" onClick={() => setShowBannedWords(false)}>取消</button><button className="btn-primary" onClick={saveBannedWords}>保存列表</button></div>
@@ -5772,49 +5773,49 @@ function App() {
                   className={editorSidebarTab === 'chapters' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('chapters')}
                 >
-                  章节
+                  <Icon name="library" size={14} />章节
                 </button>
                 <button
                   className={editorSidebarTab === 'search' ? 'active' : ''}
                   onClick={openProjectSearch}
                 >
-                  剧情搜索
+                  <Icon name="search" size={14} />剧情搜索
                 </button>
                 <button
                   className={editorSidebarTab === 'outline' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('outline')}
                 >
-                  大纲
+                  <Icon name="pen" size={14} />大纲
                 </button>
                 <button
                   className={editorSidebarTab === 'knowledge-graph' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('knowledge-graph')}
                 >
-                  知识图谱 <small>{editingProject.graphEdges.length}</small>
+                  <Icon name="network" size={14} />知识图谱 <small>{editingProject.graphEdges.length}</small>
                 </button>
                 <button
                   className={editorSidebarTab === 'cards' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('cards')}
                 >
-                  卡片
+                  <Icon name="cards" size={14} />卡片
                 </button>
                 <button
                   className={editorSidebarTab === 'style' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('style')}
                 >
-                  文风
+                  <Icon name="highlighter" size={14} />文风
                 </button>
                 <button
                   className={editorSidebarTab === 'knowledge' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('knowledge')}
                 >
-                  记忆中心
+                  <Icon name="memory" size={14} />记忆中心
                 </button>
                 <button
                   className={editorSidebarTab === 'ai-detect' ? 'active' : ''}
                   onClick={() => setEditorSidebarTab('ai-detect')}
                 >
-                  AI 检测
+                  <Icon name="scan" size={14} />AI 检测
                 </button>
               </div>
               <PaneResizer
@@ -5875,13 +5876,13 @@ function App() {
                   {/* 排序、插入、定位、删除统一放在列表上方，只作用于当前选中章节；
                       挤在列表项里会把标题压成每行三个字，长篇几乎看不到目录 */}
                   <div className="chapter-toolbar" role="toolbar" aria-label="章节操作">
-                    <button type="button" title="在末尾新建章节" onClick={handleAddChapter}>＋ 新建</button>
-                    <button type="button" title={selected ? `上移《${selected.title}》` : '先选中章节'} aria-label="上移当前章节" disabled={activeIndex <= 0} onClick={() => { if (selected) void moveActiveChapter(selected.id, -1); }}>↑</button>
-                    <button type="button" title={selected ? `下移《${selected.title}》` : '先选中章节'} aria-label="下移当前章节" disabled={activeIndex < 0 || activeIndex === chapters.length - 1} onClick={() => { if (selected) void moveActiveChapter(selected.id, 1); }}>↓</button>
-                    <button type="button" title={selected ? `在《${selected.title}》后插入新章` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void insertChapterBelow(selected.id); }}>插入</button>
-                    <button type="button" title={selected ? `打开《${selected.title}》文件所在位置` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void handleOpenChapterLocation(selected); }}>定位</button>
-                    <button type="button" className="chapter-toolbar-danger" title={selected ? `删除《${selected.title}》` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) setChapterPendingDeletion(selected); }}>删除</button>
-                    {recycled > 0 && <button type="button" className="chapter-toolbar-recycle" title="查看已删除章节" onClick={() => setShowRecycleBin(true)}>回收站 {recycled}</button>}
+                    <button type="button" title="在末尾新建章节" onClick={handleAddChapter}><Icon name="file-plus" size={13} />新建</button>
+                    <button type="button" title={selected ? `上移《${selected.title}》` : '先选中章节'} aria-label="上移当前章节" disabled={activeIndex <= 0} onClick={() => { if (selected) void moveActiveChapter(selected.id, -1); }}><Icon name="chevron-up" size={13} /></button>
+                    <button type="button" title={selected ? `下移《${selected.title}》` : '先选中章节'} aria-label="下移当前章节" disabled={activeIndex < 0 || activeIndex === chapters.length - 1} onClick={() => { if (selected) void moveActiveChapter(selected.id, 1); }}><Icon name="chevron-down" size={13} /></button>
+                    <button type="button" title={selected ? `在《${selected.title}》后插入新章` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void insertChapterBelow(selected.id); }}><Icon name="plus" size={13} />插入</button>
+                    <button type="button" title={selected ? `打开《${selected.title}》文件所在位置` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) void handleOpenChapterLocation(selected); }}><Icon name="folder-open" size={13} />定位</button>
+                    <button type="button" className="chapter-toolbar-danger" title={selected ? `删除《${selected.title}》` : '先选中章节'} disabled={!selected} onClick={() => { if (selected) setChapterPendingDeletion(selected); }}><Icon name="trash" size={13} />删除</button>
+                    {recycled > 0 && <button type="button" className="chapter-toolbar-recycle" title="查看已删除章节" onClick={() => setShowRecycleBin(true)}><Icon name="archive" size={13} />回收站 {recycled}</button>}
                   </div>
                   <div className="chapters-list" ref={chaptersListRef}>
                     {chapters.map(chapter => (
@@ -5916,7 +5917,7 @@ function App() {
                     {editingProject.outlines.map(outline => (
                       <div key={outline.id} className={`outline-document-item ${activeOutlineId === outline.id ? 'active' : ''}`} onClick={() => setActiveOutlineId(outline.id)}>
                         <div><strong>{outline.kind}</strong><small>{outline.title}{outline.kind === '章纲' && outline.chapterId ? ` · ${editingProject.chapters.find(chapter => chapter.id === outline.chapterId)?.title || '未关联章节'}` : ''}</small></div>
-                        <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}>×</button>
+                        <button className="icon-delete" title="删除大纲" onClick={(event) => { event.stopPropagation(); handleDeleteOutline(outline.id); }}><Icon name="trash" size={14} /></button>
                       </div>
                     ))}
                   </div>
@@ -5946,7 +5947,7 @@ function App() {
                         <div><strong>{card.title}</strong><small>{card.type} · {card.currentState ? card.currentState.slice(0, 80) : '状态未更新'}</small></div>
                         <button className="chapter-location-button" title="打开卡片文件所在位置" aria-label={`打开${card.title}文件所在位置`} onClick={(event) => { event.stopPropagation(); handleOpenCardLocation(card); }}>打开位置</button>
                         <button className="link-button" title="全文检索并更新卡片状态" onClick={(event) => { event.stopPropagation(); editCard(card); void updateCardStatesFromBook(card.id); }}>更新状态</button>
-                        <button className="icon-delete" title="删除卡片" onClick={(event) => { event.stopPropagation(); deleteCard(card.id); }}>×</button>
+                        <button className="icon-delete" title="删除卡片" onClick={(event) => { event.stopPropagation(); deleteCard(card.id); }}><Icon name="trash" size={14} /></button>
                       </div>
                     ))}
                   </div>
@@ -6011,7 +6012,7 @@ function App() {
                 </div>
               )}
               <div className="editor-sidebar-footer">
-                <button className="settings-button" onClick={openSettings}>⚙ 设置</button>
+                <button className="settings-button" onClick={openSettings}><Icon name="settings" size={15} />设置</button>
               </div>
             </aside>
 
@@ -6029,7 +6030,7 @@ function App() {
                     <small>{editingProject.chapters.length} 章 · {editingProject.wordCount.toLocaleString()} 字</small>
                   </header>
                   <div className="project-search-input-row">
-                    <span aria-hidden="true">⌕</span>
+                    <span className="search-hero-icon"><Icon name="search" size={26} /></span>
                     <input
                       ref={searchInputRef}
                       className="input"
@@ -6038,7 +6039,7 @@ function App() {
                       onChange={event => { setSearchQuery(event.target.value); setBookSearchMatchIndex(0); }}
                       onKeyDown={event => { if (event.key === 'Enter' && bookSearchMatches.length) focusBookSearchMatch(bookSearchMatchIndex); }}
                     />
-                    {searchQuery && <button className="project-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setSearchQuery('')}>×</button>}
+                    {searchQuery && <button className="project-search-clear" title="清除搜索" aria-label="清除搜索" onClick={() => setSearchQuery('')}><Icon name="x" size={14} /></button>}
                   </div>
                   <div className="project-search-tabs" role="tablist" aria-label="检索方式">
                     <button className="active" type="button">关键词</button>
@@ -6049,14 +6050,14 @@ function App() {
                     <button className="btn-secondary" disabled={!searchQuery.trim() || !bookSearchMatches.length} onClick={() => void replaceAllInBook()}>全书替换 {bookSearchMatches.length || ''}</button>
                     <small>每章覆盖前自动存一条历史版本，可在“历史”里逐章回滚。</small>
                   </div>
-                  {!searchQuery.trim() ? <div className="project-search-empty"><b>⌕</b><strong>输入关键词后按回车搜索</strong><span>可检索人物、事件、地点、线索与伏笔。</span><PlumBranch /></div>
+                  {!searchQuery.trim() ? <div className="project-search-empty"><b><Icon name="search" size={42} /></b><strong>输入关键词后按回车搜索</strong><span>可检索人物、事件、地点、线索与伏笔。</span><PlumBranch /></div>
                     : bookSearchResults.length ? <div className="project-search-results">
                       <div className="project-search-summary"><strong>找到 {bookSearchMatches.length} 处匹配</strong><span>分布在 {bookSearchResults.length} 个章节</span><div><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex - 1)} disabled={!bookSearchMatches.length}>上一个</button><button className="editor-tool-button" onClick={() => focusBookSearchMatch(bookSearchMatchIndex + 1)} disabled={!bookSearchMatches.length}>下一个</button></div></div>
                       {bookSearchResults.map(({ chapter, count, snippets }) => <article className="project-search-result" key={chapter.id}>
                         <button className="project-search-result-heading" onClick={() => openBookSearchChapter(chapter, snippets[0]?.position)}><div><strong>{chapter.title}</strong><small>{count} 处匹配 · {chapter.wordCount.toLocaleString()} 字</small></div><span>打开章节 ›</span></button>
                         {snippets.map(snippet => <button className="project-search-snippet" key={`${chapter.id}-${snippet.position}`} onClick={() => openBookSearchChapter(chapter, snippet.position)}>{snippet.text}</button>)}
                       </article>)}
-                    </div> : <div className="project-search-empty"><b>⌕</b><strong>没有找到“{searchQuery}”</strong><span>试试人物全名、事件关键词或地点名称。</span></div>}
+                    </div> : <div className="project-search-empty"><b><Icon name="search" size={42} /></b><strong>没有找到“{searchQuery}”</strong><span>试试人物全名、事件关键词或地点名称。</span></div>}
                 </section>
               ) : editorSidebarTab === 'outline' ? (
                 <section className="outline-workspace">
@@ -6194,8 +6195,8 @@ function App() {
                     <section className="search-panel" aria-label="搜索与替换">
                       <div className="search-panel-row">
                         <input ref={searchInputRef} className="input" value={searchQuery} placeholder="搜索本章内容" onChange={event => { setSearchQuery(event.target.value); setSearchMatchIndex(0); }} />
-                        <button className="editor-tool-button" onClick={() => focusSearchMatch(-1)} disabled={!searchQuery}>上一个</button><button className="editor-tool-button" onClick={() => focusSearchMatch(1)} disabled={!searchQuery}>下一个</button>
-                        <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}>×</button>
+                        <button className="editor-tool-button" title="上一处匹配" aria-label="上一处匹配" onClick={() => focusSearchMatch(-1)} disabled={!searchQuery}><Icon name="chevron-up" size={13} /></button><button className="editor-tool-button" title="下一处匹配" aria-label="下一处匹配" onClick={() => focusSearchMatch(1)} disabled={!searchQuery}><Icon name="chevron-down" size={13} /></button>
+                        <button className="icon-delete" title="关闭搜索" onClick={() => setShowSearchPanel(false)}><Icon name="x" size={14} /></button>
                       </div>
                       <div className="search-panel-row replace-row"><input className="input" value={replaceQuery} placeholder="替换为" onChange={event => setReplaceQuery(event.target.value)} /><button className="editor-tool-button" onClick={replaceCurrentMatch} disabled={!searchQuery}>替换</button><button className="editor-tool-button" onClick={replaceAllMatches} disabled={!searchQuery}>全部替换</button><small>{currentSearchMatches ? `${Math.min(searchMatchIndex + 1, currentSearchMatches)} / ${currentSearchMatches}` : '无匹配'}</small></div>
                     </section>
@@ -6420,7 +6421,7 @@ function App() {
         <>
       <aside className="sidebar" style={{ ['--pane-app-sidebar' as string]: `${panes.sizes.appSidebar}px` }}>
         <div className="logo">
-          <span className="logo-seal" aria-hidden="true">织</span>
+          <span className="logo-seal" aria-hidden="true"><img src="/zhizhang-brand.png" alt="" /></span>
           <div className="logo-copy">
             <h1>织章</h1>
             <p>长篇小说写作台</p>
@@ -6429,37 +6430,37 @@ function App() {
 
         <nav className="nav">
           <button aria-label="小说管理" className={activeTab === 'projects' ? 'active' : ''} onClick={() => setActiveTab('projects')}>
-            <span className="nav-icon" aria-hidden="true">▣</span><span className="nav-label">小说</span>
+            <span className="nav-icon"><Icon name="book-open" size={17} /></span><span className="nav-label">小说</span>
           </button>
           <button className={activeTab === 'books' ? 'active' : ''} onClick={() => setActiveTab('books')}>
-            <span className="nav-icon" aria-hidden="true">▤</span><span className="nav-label">书籍</span><small>{libraryBooks.length}</small>
+            <span className="nav-icon"><Icon name="library" size={17} /></span><span className="nav-label">书籍</span><small>{libraryBooks.length}</small>
           </button>
           <button
             className={activeTab === 'dismantles' ? 'active' : ''}
             onClick={() => { setActiveTab('dismantles'); if (!activeDismantleBookId && dismantleBooks[0]) { setActiveDismantleBookId(dismantleBooks[0].id); setActiveDismantleChapterId(dismantleBooks[0].chapters[0]?.id || null); } }}
           >
-            <span className="nav-icon" aria-hidden="true">⌘</span><span className="nav-label">拆书</span><small>{dismantleBooks.length}</small>
+            <span className="nav-icon"><Icon name="scissors" size={17} /></span><span className="nav-label">拆书</span><small>{dismantleBooks.length}</small>
           </button>
           <button className={activeTab === 'rankings' ? 'active' : ''} onClick={() => setActiveTab('rankings')}>
-            <span className="nav-icon" aria-hidden="true">↗</span><span className="nav-label">扫榜</span><small>{rankingBooks.length}</small>
+            <span className="nav-icon"><Icon name="chart" size={17} /></span><span className="nav-label">扫榜</span><small>{rankingBooks.length}</small>
           </button>
           <button className={activeTab === 'skills' ? 'active' : ''} onClick={() => setActiveTab('skills')}>
-            <span className="nav-icon" aria-hidden="true">✦</span><span className="nav-label">技能</span><small>{skills.length}</small>
+            <span className="nav-icon"><Icon name="sparkles" size={17} /></span><span className="nav-label">技能</span><small>{skills.length}</small>
           </button>
           <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); }}>
-            <span className="nav-icon" aria-hidden="true">◈</span><span className="nav-label">文风</span><small>{writingStyles.length}</small>
+            <span className="nav-icon"><Icon name="pen" size={17} /></span><span className="nav-label">文风</span><small>{writingStyles.length}</small>
           </button>
           <button className="mobile-more-button" aria-expanded={showMobileMore} onClick={() => setShowMobileMore(current => !current)}>
-            <span className="nav-icon" aria-hidden="true">•••</span><span className="nav-label">更多</span>
+            <span className="nav-icon"><Icon name="more" size={17} /></span><span className="nav-label">更多</span>
           </button>
         </nav>
         <div className={`mobile-more-menu ${showMobileMore ? 'open' : ''}`}>
-          <button className={activeTab === 'skills' ? 'active' : ''} onClick={() => { setActiveTab('skills'); setShowMobileMore(false); }}>✦ 技能管理 <small>{skills.length}</small></button>
-          <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); setShowMobileMore(false); }}>◈ 文风管理 <small>{writingStyles.length}</small></button>
+          <button className={activeTab === 'skills' ? 'active' : ''} onClick={() => { setActiveTab('skills'); setShowMobileMore(false); }}><Icon name="sparkles" size={15} />技能管理 <small>{skills.length}</small></button>
+          <button className={activeTab === 'styles' ? 'active' : ''} onClick={() => { setActiveTab('styles'); setStyleDraft(current => current || writingStyles[0] || null); setShowMobileMore(false); }}><Icon name="pen" size={15} />文风管理 <small>{writingStyles.length}</small></button>
         </div>
         <div className="sidebar-footer">
           <PlumBranch size="sm" flip />
-          <button className="settings-button" onClick={openSettings}><span aria-hidden="true">⚙</span><b>设置</b></button>
+          <button className="settings-button" onClick={openSettings}><Icon name="settings" size={17} /><b>设置</b></button>
         </div>
       </aside>
 
@@ -6474,7 +6475,7 @@ function App() {
                   <span className="empty-project-eyebrow"><i aria-hidden="true" />新作 · 第一卷</span>
                   <h2>从一页空白，<br />写出一个世界</h2>
                   <p>故事尚未落笔。先为它起一个名字。</p>
-                  <button className="btn-primary empty-project-cta" onClick={openNewProjectModal}><span aria-hidden="true">＋</span> 新建小说</button>
+                  <button className="btn-primary empty-project-cta" onClick={openNewProjectModal}><Icon name="file-plus" size={16} />新建小说</button>
                 </div>
                 <div className="empty-project-folio" aria-hidden="true"><small>ZHIZHANG</small><b>壹</b><span>本地创作空间</span></div>
                 <PlumBranch size="lg" />
@@ -6483,7 +6484,7 @@ function App() {
               <>
                 <header className="page-header">
                   <div><span className="page-eyebrow">本地创作空间</span><h2>小说管理</h2></div>
-                  <button className="btn-primary" onClick={openNewProjectModal}>+ 新建小说</button>
+                  <button className="btn-primary" onClick={openNewProjectModal}><Icon name="file-plus" size={15} />新建小说</button>
                 </header>
                 <div className="project-grid">
                   {projects.map((project) => (
@@ -6499,10 +6500,10 @@ function App() {
                         <span>更新于 {new Date(project.updatedAt).toLocaleDateString()}</span>
                       </div>
                       <div className="project-actions">
-                        <button className="btn-primary" onClick={() => handleEditProject(project.id)}>进入</button>
-                        <button className="btn-secondary" onClick={() => openProjectEdit(project)}>编辑</button>
-                        <button className="btn-secondary" onClick={() => handleOpenProjectLocation(project)}>打开位置</button>
-                        <button className="btn-danger" onClick={() => setProjectPendingDeletion(project)}>删除</button>
+                        <button className="btn-primary" onClick={() => handleEditProject(project.id)}><Icon name="arrow-right" size={14} />进入</button>
+                        <button className="btn-secondary" onClick={() => openProjectEdit(project)}><Icon name="pencil" size={14} />编辑</button>
+                        <button className="btn-secondary" onClick={() => handleOpenProjectLocation(project)}><Icon name="folder-open" size={14} />打开位置</button>
+                        <button className="btn-danger" onClick={() => setProjectPendingDeletion(project)}><Icon name="trash" size={14} />删除</button>
                       </div>
                     </div>
                   ))}
@@ -6598,7 +6599,7 @@ function App() {
             <strong>{notice.title}</strong>
             <span>{notice.content}</span>
           </div>
-          <button className="app-notice-close" aria-label="关闭提示" onClick={() => setNotice(null)}>×</button>
+          <button className="app-notice-close" aria-label="关闭提示" onClick={() => setNotice(null)}><Icon name="x" size={15} /></button>
         </div>
       )}
       {showNewSkillModal && (
@@ -6606,7 +6607,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="skill-modal-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="skill-modal-title">{skillEditingId === null ? '新建技能' : '编辑技能'}</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowNewSkillModal(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowNewSkillModal(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body">
               <div className="form-group"><label>技能名称 *</label><input type="text" className="input" placeholder="例如：场景切换" value={newSkill.name} onChange={(event) => setNewSkill({ ...newSkill, name: event.target.value })} /></div>
@@ -6628,7 +6629,7 @@ function App() {
           <div className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="settings-title">设置</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowSettingsModal(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowSettingsModal(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="settings-layout">
               <nav className="settings-sidebar" aria-label="设置分类">
@@ -6724,7 +6725,7 @@ function App() {
                   <div className="form-group model-management">
                     <label>模型标签 <small>可多选 · 当前模型：{settingsDraft.model || '未选择'}</small></label>
                     <div className="settings-model-tags">
-                      {settingsModels.map(model => <button key={model} className={`settings-model-tag ${settingsDraft.model === model ? 'active' : ''}`} onClick={() => setCurrentSettingsModel(model)} title="点击设为当前模型"><span>{model}</span><b aria-label={`移除 ${model}`} onClick={(event) => { event.stopPropagation(); toggleSettingsModel(model); }}>×</b></button>)}
+                      {settingsModels.map(model => <button key={model} className={`settings-model-tag ${settingsDraft.model === model ? 'active' : ''}`} onClick={() => setCurrentSettingsModel(model)} title="点击设为当前模型"><span>{model}</span><b aria-label={`移除 ${model}`} onClick={(event) => { event.stopPropagation(); toggleSettingsModel(model); }}><Icon name="x" size={11} /></b></button>)}
                       {!settingsModels.length && <span className="settings-model-empty">暂无启用模型</span>}
                     </div>
                     <div className="settings-model-selection" aria-label="启用模型列表">
@@ -6735,7 +6736,7 @@ function App() {
                       <input className="input" value={customModelName} placeholder="输入模型 ID，回车添加" onChange={(event) => setCustomModelName(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); addCustomModel(); } }} />
                       <button className="btn-secondary" onClick={addCustomModel}>添加</button>
                     </div>
-                    {fetchedModels.length > 0 && <div className="settings-fetched-models"><span>接口返回模型</span><div>{fetchedModels.map(model => <button key={model} className={settingsModels.includes(model) ? 'added' : ''} disabled={settingsModels.includes(model)} onClick={() => addSettingsModel(model)}>{settingsModels.includes(model) ? '✓ ' : '+ '}{model}</button>)}</div></div>}
+                    {fetchedModels.length > 0 && <div className="settings-fetched-models"><span>接口返回模型</span><div>{fetchedModels.map(model => <button key={model} className={settingsModels.includes(model) ? 'added' : ''} disabled={settingsModels.includes(model)} onClick={() => addSettingsModel(model)}><Icon name={settingsModels.includes(model) ? 'check' : 'plus'} size={12} />{model}</button>)}</div></div>}
                     <div className="settings-model-actions">
                       <button className="btn-secondary" onClick={pullModels} disabled={modelsLoading}>{modelsLoading ? '拉取中...' : '拉取模型'}</button>
                       <button className="btn-secondary" onClick={testSelectedModel} disabled={modelsTesting || !settingsDraft.model.trim()}>{modelsTesting ? '测试中...' : '测试模型'}</button>
@@ -6749,7 +6750,7 @@ function App() {
                         <button type="button" className="link-button" onClick={() => setSettingsDiagnostics(null)}>关闭</button>
                       </div>
                       {settingsDiagnostics.checks.map(check => <div key={check.id} className={`settings-diagnostic-row ${check.status}`}>
-                        <span aria-hidden="true">{diagnosticStatusIcon[check.status]}</span>
+                        <span><Icon name={diagnosticStatusIcon[check.status]} size={14} /></span>
                         <b>{check.label}</b>
                         <p>{check.detail}</p>
                       </div>)}
@@ -6918,7 +6919,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="local-backup-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header">
               <div><h3 id="local-backup-title">选择本地备份</h3><small className="cloud-backup-picker-subtitle">{localBackups.directory}</small></div>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowLocalBackupPicker(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowLocalBackupPicker(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body history-body">
               {!localBackups.files.length ? <p className="empty-hint">导出目录里还没有 .aswbackup 备份包。先点“导出备份包到本地”生成一份。</p>
@@ -6939,7 +6940,7 @@ function App() {
           <div className="modal cloud-backup-picker" role="dialog" aria-modal="true" aria-labelledby="cloud-backup-picker-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <div><h3 id="cloud-backup-picker-title">选择云端备份</h3><small className="cloud-backup-picker-subtitle">从百度网盘备份目录中选择一个版本恢复</small></div>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowCloudBackupPicker(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowCloudBackupPicker(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body cloud-backup-picker-body">
               <div className="cloud-backup-breadcrumb"><span>百度网盘</span><b>/</b><span>{cloudRemotePath.trim()}</span></div>
@@ -6952,7 +6953,7 @@ function App() {
                   const sizeText = file.size > 0 ? `${(file.size / 1_048_576).toFixed(file.size >= 1_048_576 ? 1 : 2)} MB` : '大小未知';
                   return <label key={`${file.path}-${file.fsId || ''}`} className={`cloud-backup-option${selected ? ' active' : ''}`}>
                     <input type="radio" name="cloud-backup" checked={selected} onChange={() => setSelectedCloudBackup(file)} />
-                    <span className="cloud-backup-file-icon" aria-hidden="true">ASW</span>
+                    <span className="cloud-backup-file-icon" aria-hidden="true">ZZ</span>
                     <span className="cloud-backup-option-main"><strong>{file.name}</strong><small>{file.isBundle ? '完整应用备份' : '备份文件'}</small><em className="cloud-backup-mobile-meta">{dateText} · {sizeText}</em></span>
                     <span className="cloud-backup-option-date">{dateText}</span>
                     <span className="cloud-backup-option-size">{sizeText}</span>
@@ -6974,7 +6975,7 @@ function App() {
       {githubRestoreConflict && (
         <div className="modal-overlay" onClick={() => setGithubRestoreConflict(null)}>
           <div className="modal github-restore-modal" role="dialog" aria-modal="true" aria-labelledby="github-restore-title" onClick={event => event.stopPropagation()}>
-            <div className="modal-header"><h3 id="github-restore-title">本地已存在这本小说</h3><button className="modal-close" aria-label="关闭" onClick={() => setGithubRestoreConflict(null)}>×</button></div>
+            <div className="modal-header"><h3 id="github-restore-title">本地已存在这本小说</h3><button className="modal-close" aria-label="关闭" onClick={() => setGithubRestoreConflict(null)}><Icon name="x" size={16} /></button></div>
             <div className="modal-body github-restore-body"><p>GitHub 仓库中的《{githubRestoreConflict.project.title}》与本地《{githubRestoreConflict.localProject.title}》匹配。</p><div><strong>更新本地小说</strong><small>以 GitHub 版本替换本地小说内容，并保留本地小说 ID。</small></div><div><strong>新建一本小说</strong><small>保留当前本地小说，创建一个不绑定原仓库的恢复副本。</small></div></div>
             <div className="modal-footer"><button className="btn-secondary" disabled={cloudSyncRunning} onClick={() => void completeGithubRestore('copy')}>新建一本小说</button><button className="btn-primary" disabled={cloudSyncRunning} onClick={() => void completeGithubRestore('update')}>更新本地小说</button></div>
           </div>
@@ -6986,7 +6987,7 @@ function App() {
           <div className="modal outline-type-modal" role="dialog" aria-modal="true" aria-labelledby="outline-type-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="outline-type-title">新建大纲</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowOutlineTypeModal(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowOutlineTypeModal(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body outline-type-options">
               <p>请选择要创建的大纲类型</p>
@@ -7002,7 +7003,7 @@ function App() {
           <div className="modal new-project-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h3>{projectFormMode === 'edit' ? '编辑小说' : '新建小说'}</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowNewProjectModal(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowNewProjectModal(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body create-project-body">
               <aside className="cover-column">
@@ -7128,7 +7129,7 @@ function App() {
           <div className="modal work-tags-modal" role="dialog" aria-modal="true" aria-labelledby="work-tags-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="work-tags-title">作品标签</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowTagPicker(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowTagPicker(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="work-tags-body">
               <nav className="tag-tabs work-tag-tabs">
@@ -7146,7 +7147,7 @@ function App() {
                     <button key={tag.name} className={`tag-option ${selected ? 'selected' : ''}`} onClick={() => handleProjectTagToggle(tag.name)}>
                       <span className={`tag-option-icon ${tag.tone}`}>{tag.icon}</span>
                       <span className="tag-option-copy"><strong>{tag.name}</strong>{tag.description && <small>{tag.description}</small>}</span>
-                      <span className="tag-check">{selected ? '✓' : ''}</span>
+                      <span className="tag-check">{selected ? <Icon name="check" size={14} /> : null}</span>
                     </button>
                   );
                 })}
@@ -7165,7 +7166,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="delete-chapter-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="delete-chapter-title">删除章节</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setChapterPendingDeletion(null)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setChapterPendingDeletion(null)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body">
               <p>确定删除《{chapterPendingDeletion.title}》吗？当前 {chapterPendingDeletion.wordCount.toLocaleString()} 字。</p>
@@ -7184,7 +7185,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="delete-project-title" onClick={(event) => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="delete-project-title">删除小说</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setProjectPendingDeletion(null)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setProjectPendingDeletion(null)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body">
               <p>确定删除《{projectPendingDeletion.title}》吗？</p>
@@ -7204,7 +7205,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="export-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="export-title">导出小说</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowExportModal(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowExportModal(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body export-body">
               <div className="export-option-row" role="radiogroup" aria-label="导出范围">
@@ -7235,7 +7236,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="history-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="history-title">历史版本·{activeChapter.title}</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowChapterHistory(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowChapterHistory(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body history-body">
               {!activeChapter.snapshots?.length ? <p className="empty-hint">本章还没有历史版本。AI 润色、去 AI 味、续写、Agent 修订和全书替换覆盖正文前，都会自动存一条。</p> : <>
@@ -7257,7 +7258,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="recycle-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="recycle-title">章节回收站</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowRecycleBin(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowRecycleBin(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body history-body">
               {!editingProject.deletedChapters?.length ? <p className="empty-hint">回收站是空的。</p> : <>
@@ -7282,7 +7283,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="stats-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="stats-title">写作统计</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowWritingStats(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowWritingStats(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body stats-body">
               <div className="stats-cards">
@@ -7312,7 +7313,7 @@ function App() {
           <div className="modal" role="dialog" aria-modal="true" aria-labelledby="shortcuts-title" onClick={event => event.stopPropagation()}>
             <div className="modal-header">
               <h3 id="shortcuts-title">快捷键</h3>
-              <button className="modal-close" aria-label="关闭" onClick={() => setShowShortcuts(false)}>×</button>
+              <button className="modal-close" aria-label="关闭" onClick={() => setShowShortcuts(false)}><Icon name="x" size={16} /></button>
             </div>
             <div className="modal-body shortcut-body">
               {[

@@ -1,3 +1,5 @@
+import type { IconName } from '../../components/icon';
+
 export type ApiMode = 'openai' | 'anthropic';
 export type ReasoningMode = 'auto' | 'off' | 'low' | 'medium' | 'high' | 'max';
 
@@ -157,7 +159,7 @@ export interface DiagnosticReport {
   chatEndpoint: string;
   checks: DiagnosticCheck[];
 }
-export const diagnosticStatusIcon: Record<DiagnosticCheck['status'], string> = { pass: '✓', warn: '!', fail: '×' };
+export const diagnosticStatusIcon: Record<DiagnosticCheck['status'], IconName> = { pass: 'check', warn: 'alert', fail: 'x' };
 export const agentNetworkParams = (config: AgentConfig) => ({
   proxyEnabled: config.proxyEnabled,
   proxyURL: config.proxyURL.trim(),

@@ -1,33 +1,23 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# 创建一个简单的 512x512 PNG
-cat > icon.png.base64 << 'PNGEOF'
-iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAABHNCSVQICAgIfAhkiAAAAAlwSFlzAAALEgAACxIB0t1+/AAAABx0RVh0U29mdHdhcmUAQWRvYmUgRmlyZXdvcmtzIENTNui8sowAAAAVdEVYdENyZWF0aW9uIFRpbWUAMy8xNC8yNP2xtVsAAAMCSURBVHic7cExAQAAAMKg9U9tCF8gAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4GsDGD4AAUrg8ooAAAAASUVORK5CYII=
-PNGEOF
+# 织章全套图标的唯一生成入口。品牌母图是 branding/zhizhang-brand.png（1024×1024），
+# 打包图标、favicon 和界面里的品牌标识都由它派生，改品牌图后重跑本脚本即可全部对齐。
+# 依赖 @tauri-apps/cli，需要先在 desktop-app 下装好依赖。
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
 
-base64 -d icon.png.base64 > icon.png
-rm icon.png.base64
+# 生成桌面、Windows 磁贴、Android、iOS 全套尺寸；iOS 不支持透明底，补上书页主题的面板色。
+npx tauri icon branding/zhizhang-brand.png \
+  -o src-tauri/icons \
+  --ios-color '#F4F5F2'
 
-# 使用 sips 创建其他尺寸
-sips -z 32 32 icon.png --out 32x32.png
-sips -z 128 128 icon.png --out 128x128.png  
-sips -z 256 256 icon.png --out 256x256.png
-sips -z 512 512 icon.png --out icon@2x.png
+# Tauri 约定的应用图标源图
+cp branding/zhizhang-brand.png app-icon.png
 
-# 创建 icns
-mkdir icon.iconset
-sips -z 16 16 icon.png --out icon.iconset/icon_16x16.png
-sips -z 32 32 icon.png --out icon.iconset/icon_16x16@2x.png
-sips -z 32 32 icon.png --out icon.iconset/icon_32x32.png
-sips -z 64 64 icon.png --out icon.iconset/icon_32x32@2x.png
-sips -z 128 128 icon.png --out icon.iconset/icon_128x128.png
-sips -z 256 256 icon.png --out icon.iconset/icon_128x128@2x.png
-sips -z 256 256 icon.png --out icon.iconset/icon_256x256.png
-sips -z 512 512 icon.png --out icon.iconset/icon_256x256@2x.png
-sips -z 512 512 icon.png --out icon.iconset/icon_512x512.png
-cp icon.png icon.iconset/icon_512x512@2x.png
+# 界面里的品牌标识最大只显示到 64px（启动页），256px 足够覆盖 4 倍屏，
+# 直接搬 1024 的母图会白白给安装包压进 1.7MB。
+cp src-tauri/icons/128x128@2x.png public/zhizhang-brand.png
+cp src-tauri/icons/128x128.png public/favicon.png
 
-iconutil -c icns icon.iconset -o icon.icns
-rm -rf icon.iconset
-
-echo "Icons created successfully"
+printf '已从 branding/zhizhang-brand.png 生成织章全套图标\n'
