@@ -5,7 +5,7 @@ export type ReaderFontId = 'system' | 'serif' | 'mono' | 'kai' | 'hei' | 'custom
 export type ThemeId = 'paper' | 'ink' | 'auto';
 
 export const themes: Array<{ id: ThemeId; label: string; hint: string }> = [
-  { id: 'paper', label: '书页', hint: '书页黄与雪白底，墨色字，白天写作' },
+  { id: 'paper', label: '书页', hint: '雾灰绿界面与暖白稿纸，适合白天写作' },
   { id: 'ink', label: '墨夜', hint: '暖墨底色，夜里长时间写作不刺眼' },
   { id: 'auto', label: '跟随系统', hint: '按系统的浅色/深色偏好自动切换' },
 ];

@@ -6420,8 +6420,11 @@ function App() {
         <>
       <aside className="sidebar" style={{ ['--pane-app-sidebar' as string]: `${panes.sizes.appSidebar}px` }}>
         <div className="logo">
-          <h1>织章</h1>
-          <p>AI 小说写作助手</p>
+          <span className="logo-seal" aria-hidden="true">织</span>
+          <div className="logo-copy">
+            <h1>织章</h1>
+            <p>长篇小说写作台</p>
+          </div>
         </div>
 
         <nav className="nav">
@@ -6467,17 +6470,19 @@ function App() {
           <div className="projects">
             {projects.length === 0 ? (
               <div className="empty-project-home">
-                <div className="empty-project-mark">文</div>
-                <span className="empty-project-eyebrow">AI 小说写作空间</span>
-                <h2>开始你的第一部小说</h2>
-                <p>创建一个本地写作项目，章节、大纲、卡片和记忆都会保存在你的设备上。</p>
-                <button className="btn-primary empty-project-cta" onClick={openNewProjectModal}>+ 新建小说</button>
+                <div className="empty-project-copy">
+                  <span className="empty-project-eyebrow"><i aria-hidden="true" />新作 · 第一卷</span>
+                  <h2>从一页空白，<br />写出一个世界</h2>
+                  <p>故事尚未落笔。先为它起一个名字。</p>
+                  <button className="btn-primary empty-project-cta" onClick={openNewProjectModal}><span aria-hidden="true">＋</span> 新建小说</button>
+                </div>
+                <div className="empty-project-folio" aria-hidden="true"><small>ZHIZHANG</small><b>壹</b><span>本地创作空间</span></div>
                 <PlumBranch size="lg" />
               </div>
             ) : (
               <>
                 <header className="page-header">
-                  <h2>小说管理</h2>
+                  <div><span className="page-eyebrow">本地创作空间</span><h2>小说管理</h2></div>
                   <button className="btn-primary" onClick={openNewProjectModal}>+ 新建小说</button>
                 </header>
                 <div className="project-grid">
@@ -6494,7 +6499,7 @@ function App() {
                         <span>更新于 {new Date(project.updatedAt).toLocaleDateString()}</span>
                       </div>
                       <div className="project-actions">
-                        <button className="btn-secondary" onClick={() => handleEditProject(project.id)}>进入</button>
+                        <button className="btn-primary" onClick={() => handleEditProject(project.id)}>进入</button>
                         <button className="btn-secondary" onClick={() => openProjectEdit(project)}>编辑</button>
                         <button className="btn-secondary" onClick={() => handleOpenProjectLocation(project)}>打开位置</button>
                         <button className="btn-danger" onClick={() => setProjectPendingDeletion(project)}>删除</button>
@@ -7008,7 +7013,8 @@ function App() {
                     <>
                       <span className="cover-book-name">{newProject.title || '书本名称'}</span>
                       <span className="cover-decoration">文</span>
-                      <small>织章</small>
+                      <small>织章 · ZHIZHANG</small>
+                      <PlumBranch size="sm" flip />
                     </>
                   )}
                 </div>
