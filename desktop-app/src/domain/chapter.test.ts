@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit } from './chapter.ts';
+import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSegmentsMatch } from './chapter.ts';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions } from './export.ts';
 import type { Chapter, Project } from './project.ts';
 
@@ -163,4 +163,20 @@ test('单章导出只含该章，文件名去掉非法字符', () => {
   const risky = { ...project, title: '城南/夜雨:一' } as Project;
   assert.equal(exportFileName(risky, defaultExportOptions), '城南_夜雨_一.txt');
   assert.equal(exportFileName(project, { ...defaultExportOptions, format: 'md' }), '城南夜雨.md');
+});
+
+test('AI 检测分段：正文没变时仍然对得上，章节头和首尾空白不影响判定', () => {
+  const segments = [
+    { order: 1, text: '上半段。\n\n', confidence: 0, label: '人工' as const },
+    { order: 2, text: '下半段。', confidence: 0, label: '人工' as const },
+  ];
+  assert.equal(aiDetectionSegmentsMatch(segments, '上半段。\n\n下半段。'), true);
+  assert.equal(aiDetectionSegmentsMatch(segments, '【第1章 起】上半段。\n\n下半段。（本章完）\n'), true);
+});
+
+test('AI 检测分段：正文改过之后判定为失配，高亮层退回纯文本', () => {
+  const segments = [{ order: 1, text: '旧正文。', confidence: 0, label: '人工' as const }];
+  assert.equal(aiDetectionSegmentsMatch(segments, '旧正文。AI 续写补上的一段。'), false);
+  assert.equal(aiDetectionSegmentsMatch([], '任何正文'), false);
+  assert.equal(aiDetectionSegmentsMatch(undefined, '任何正文'), false);
 });

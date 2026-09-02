@@ -7,8 +7,9 @@ import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionChapter, AIDetectionLabel, AIDetectionSegment, AIDetectionReport, MemoryDocumentKind, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
 import { defaultKnowledgeGraphWeight, normalizeKnowledgeGraphWeight, normalizeKnowledgeGraphEdges, upsertKnowledgeGraphEdge, graphNodeTypeLabel, graphNodeGroup, graphNodeRelativePath, graphNodeProfile, createGraphNodeProfile } from './domain/knowledge-graph';
-import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit } from './domain/chapter';
+import { removeChapterFromProject, restoreDeletedChapter, pushChapterSnapshot, restoreChapterSnapshot, replaceChapterInProject, moveChapterInProject, reorderChapterInProject, insertChapterAfter, chapterSnapshotLimit, aiDetectionSource, aiDetectionSegmentsMatch } from './domain/chapter';
 import { buildProjectExport, buildChapterExport, exportFileName, defaultExportOptions, type ExportOptions } from './domain/export';
+import { mergeGithubProject, githubMergeChanged, type GithubMergeResult } from './domain/github-merge';
 import type { DismantleChapter, DismantleBook, LibraryBookChapter, LibraryBook, RankingPlatform, RankingType, FanqieSection, RankingCategoryOption, RankingBook, WritingStyle } from './domain/library';
 import { localResourceId, splitTxtIntoDismantleChapters, readLocalTxtFile, normalizeDismantleChapter, normalizeDismantleBook, normalizeLibraryBookChapter, normalizeLibraryBook, normalizeRankingBook, trustedRankingCache, normalizeWritingStyle } from './features/library/model';
 import { projectAgentSessionId, createProjectAgentSession, normalizeProjectAgentChange, normalizeProjectAgentSession, type ProjectAgentRawChange, type ProjectAgentChange, type ProjectAgentMessage, type ProjectAgentSession, type ProjectAgentResponse } from './features/project-agent/model';
@@ -479,7 +480,7 @@ const splitAIDetectionSegments = (text: string, chapterScore: number): AIDetecti
 };
 
 const analyzeAIChapter = (chapter: Chapter): AIDetectionChapter => {
-  const text = chapter.content.replace(/^【第\d+章[^】]*】\s*/u, '').replace(/（本章完）\s*$/u, '').trim();
+  const text = aiDetectionSource(chapter.content);
   const sentences = text.split(/[。！？\n]/u).map(item => item.trim()).filter(Boolean);
   const lengths = sentences.map(item => item.length);
   const average = lengths.length ? lengths.reduce((sum, length) => sum + length, 0) / lengths.length : 0;
@@ -4652,6 +4653,39 @@ function App() {
     setGithubRepositoryUrl(project?.githubRepositoryUrl || '');
   };
 
+  const describeGithubMerge = (merge: GithubMergeResult) => {
+    const names = (titles: string[]) => `${titles.slice(0, 3).join('、')}${titles.length > 3 ? ' 等' : ''}`;
+    return [
+      merge.addedChapters.length ? `补回 ${merge.addedChapters.length} 章（${names(merge.addedChapters)}）` : '',
+      merge.updatedChapters.length ? `采用远端 ${merge.updatedChapters.length} 章（${names(merge.updatedChapters)}）` : '',
+      merge.conflictChapters.length ? `${merge.conflictChapters.length} 章两边都改过，已保留本地正文，远端版本在该章“历史版本”里（${names(merge.conflictChapters)}）` : '',
+      merge.otherUpdates ? `补回大纲/卡片/记忆/图谱 ${merge.otherUpdates} 条` : '',
+    ].filter(Boolean).join('；');
+  };
+
+  /**
+   * 备份前先把远端已有内容合并进本地。备份本身是“清空托管目录再拷本地”，
+   * 两台电脑写同一本书时不合并就会把另一端的章节和记忆整段覆盖掉。
+   * ponytail: 这里会多克隆一次仓库（合并一次、后端备份再一次）；等仓库大到拖慢备份，再把合并挪进 Rust 侧复用同一个 checkout
+   */
+  const mergeGithubBeforeBackup = async (local: Project, repositoryUrl: string): Promise<GithubMergeResult | null> => {
+    let remote: GitHubProjectResult;
+    try {
+      remote = await invoke<GitHubProjectResult>('load_project_from_github', { repositoryUrl });
+    } catch {
+      // 空仓库、首次备份、仓库里还不是规范备份都会走到这里；真的连不上时后面的备份同样会失败，不会静默覆盖
+      return null;
+    }
+    const incoming = normalizeStoredProject(remote.project);
+    // 仓库里换成了另一本书时不合并，交给后端的绑定校验拦下来
+    if (incoming.id !== local.id && incoming.title.trim() !== local.title.trim()) return null;
+    const merge = mergeGithubProject(local, incoming);
+    // 记忆文档是从 memories 生成的，本地没生成过记忆时是一份"暂无已保存章节记忆"的空壳，
+    // 而空壳的时间戳往往比远端真内容还新；合并补回 memories 后按同一套模板重新生成才不会被空壳盖掉
+    merge.project = { ...merge.project, memoryDocuments: buildMemoryDocuments(merge.project.memories, merge.project.memoryDocuments) };
+    return githubMergeChanged(merge) ? merge : null;
+  };
+
   const backupProjectToGithub = async () => {
     const repositoryUrl = githubRepositoryUrl.trim();
     const selected = projects.find(project => project.id === githubProjectId);
@@ -4659,11 +4693,22 @@ function App() {
     if (!repositoryUrl) { setCloudSyncMessage('请先指定 GitHub 仓库链接。'); return; }
     if (isMobileRuntime()) { setCloudSyncMessage('GitHub Git 同步目前仅支持安装了 Git 的桌面端。'); return; }
     setCloudSyncRunning(true);
-    setCloudSyncMessage(`正在保存《${selected.title}》并准备 Git 提交...`);
+    setCloudSyncMessage(`正在比对 GitHub 上已有的《${selected.title}》...`);
     try {
-      const snapshot = editingProject?.id === selected.id ? editingProject : selected;
+      const local = editingProject?.id === selected.id ? editingProject : selected;
+      const merge = await mergeGithubBeforeBackup(local, repositoryUrl);
+      const snapshot = merge ? merge.project : local;
       const currentProjects = projects.map(project => project.id === snapshot.id ? snapshot : project);
       await nativeClient.saveProjects(currentProjects);
+      if (merge) {
+        // 合并结果要立刻回写界面，否则编辑中的旧副本会在下一次本地保存时把合并覆盖掉
+        setProjects(currentProjects);
+        if (editingProject?.id === snapshot.id) {
+          setEditingProject(snapshot);
+          setActiveChapter(current => current ? snapshot.chapters.find(chapter => chapter.id === current.id) || current : current);
+        }
+      }
+      setCloudSyncMessage(`正在保存《${snapshot.title}》并准备 Git 提交...`);
       const result = await invoke<{ repositoryUrl: string; branch: string; commit: string; changed: boolean; commitTitle?: string }>('backup_project_to_github', {
         repositoryUrl,
         project: snapshot,
@@ -4683,9 +4728,10 @@ function App() {
       setProjects(linkedProjects);
       if (editingProject?.id === linkedProject.id) setEditingProject(linkedProject);
       setGithubRepositoryUrl(result.repositoryUrl);
+      const mergeNote = merge ? `｜已合并远端：${describeGithubMerge(merge)}` : '';
       setCloudSyncMessage(result.changed
-        ? `GitHub 备份完成：${result.branch}@${result.commit}${result.commitTitle ? ` · ${result.commitTitle}` : ''}`
-        : `GitHub 已是最新版本：${result.branch}@${result.commit}`);
+        ? `GitHub 备份完成：${result.branch}@${result.commit}${result.commitTitle ? ` · ${result.commitTitle}` : ''}${mergeNote}`
+        : `GitHub 已是最新版本：${result.branch}@${result.commit}${mergeNote}`);
     } catch (error) {
       setCloudSyncMessage(String(error));
     } finally {
@@ -5461,7 +5507,8 @@ function App() {
   const activeAIDetection = editingProject?.aiDetection?.chapters.find(item => item.chapterId === activeChapter?.id);
   const renderMarkedContent = (content: string) => {
     if (!content) return '\u200b';
-    const hasDetectionSegments = Boolean(activeAIDetection?.segments?.length);
+    // 分段和当前正文对不上就退回纯文本，否则高亮层会一直铺检测时那份旧正文
+    const hasDetectionSegments = aiDetectionSegmentsMatch(activeAIDetection?.segments, content);
     const detectionSegments = hasDetectionSegments ? activeAIDetection!.segments : [{ order: 1, text: content, confidence: 0, label: '人工' as AIDetectionLabel }];
     return detectionSegments.map((segment, segmentIndex) => {
       const detectionClass = hasDetectionSegments ? `ai-detection-mark ${segment.label === '人工' ? 'human' : segment.label === '疑似 AI' ? 'suspected' : 'ai'}` : '';

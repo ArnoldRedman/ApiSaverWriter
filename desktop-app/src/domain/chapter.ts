@@ -1,4 +1,4 @@
-import type { Chapter, DeletedChapter, Project } from './project';
+import type { AIDetectionSegment, Chapter, DeletedChapter, Project } from './project';
 
 /** 覆盖正文前保留的历史版本数量 */
 export const chapterSnapshotLimit = 3;
@@ -131,3 +131,17 @@ export const restoreDeletedChapter = (project: Project, chapterId: number): { pr
     chapter: entry.chapter,
   };
 };
+
+/** 检测分析用的正文：去掉章节头和（本章完）再去空白。判定分段是否还对得上必须用同一套规则 */
+export const aiDetectionSource = (content: string) => content
+  .replace(/^【第\d+章[^】]*】\s*/u, '')
+  .replace(/（本章完）\s*$/u, '')
+  .trim();
+
+/**
+ * 检测报告里的分段是否还对应当前正文。
+ * 编辑器的高亮层铺的是分段文字、上面那层透明 textarea 铺的是真正文；正文改过之后旧分段就废了，
+ * 不判定的话屏幕会停在旧正文，滚动条却按新正文的长度走——看起来就是"改了但没刷新"
+ */
+export const aiDetectionSegmentsMatch = (segments: AIDetectionSegment[] | undefined, content: string) =>
+  !!segments?.length && segments.map(segment => segment.text).join('') === aiDetectionSource(content);

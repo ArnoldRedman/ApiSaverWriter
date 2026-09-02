@@ -86,20 +86,27 @@ pub fn clone_github_repository(app_data: &Path, repository_url: &str, cache_name
     Ok(checkout)
 }
 
-pub fn read_github_project(checkout: &Path) -> Result<Value, String> {
-    let project_path = checkout.join(GITHUB_PROJECT_DATA);
-    let regular_file = |path: &Path| fs::symlink_metadata(path)
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
         .map(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        .unwrap_or(false);
-    // 改名前建的备份仓库用的是旧标记名，恢复时两种都认
-    let marker_path = [GITHUB_PROJECT_MARKER, LEGACY_GITHUB_PROJECT_MARKER]
+        .unwrap_or(false)
+}
+
+/// 改名前建的备份仓库只有旧标记名，两种都要认。备份校验和恢复必须共用这一份判定，
+/// 否则旧仓库在恢复时被认出、在备份时却被当成陌生仓库整个拒掉
+pub fn find_github_project_marker(checkout: &Path) -> Option<PathBuf> {
+    [GITHUB_PROJECT_MARKER, LEGACY_GITHUB_PROJECT_MARKER]
         .into_iter()
         .map(|name| checkout.join(name))
-        .find(|path| regular_file(path));
-    let Some(marker_path) = marker_path else {
+        .find(|path| is_regular_file(path))
+}
+
+pub fn read_github_project(checkout: &Path) -> Result<Value, String> {
+    let project_path = checkout.join(GITHUB_PROJECT_DATA);
+    let Some(marker_path) = find_github_project_marker(checkout) else {
         return Err("该仓库不是规范的织章小说备份仓库".to_string());
     };
-    if !regular_file(&project_path) {
+    if !is_regular_file(&project_path) {
         return Err("该仓库不是规范的织章小说备份仓库".to_string());
     }
     let marker: Value = serde_json::from_str(&fs::read_to_string(marker_path)
@@ -133,7 +140,7 @@ pub fn read_github_project(checkout: &Path) -> Result<Value, String> {
 }
 
 pub fn validate_github_backup_destination(checkout: &Path, project_id: i64, project_title: &str) -> Result<(), String> {
-    if checkout.join(GITHUB_PROJECT_MARKER).exists() {
+    if find_github_project_marker(checkout).is_some() {
         let existing = read_github_project(checkout)?;
         let same_id = existing.get("id").and_then(Value::as_i64) == Some(project_id);
         let same_title = existing.get("title").and_then(Value::as_str) == Some(project_title);
@@ -403,6 +410,22 @@ mod change_tests {
         assert!(title.contains("新增 1 章"));
         assert!(body.contains("修改章节：第一章"));
         assert!(body.contains("删除章节：第二章"));
+    }
+
+    #[test]
+    fn legacy_marker_repository_still_accepts_backup() {
+        let root = std::env::temp_dir().join(format!("zhizhang-marker-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let project = serde_json::json!({ "id": 7, "title": "旧仓库", "chapters": [] });
+        fs::write(root.join(GITHUB_PROJECT_DATA), serde_json::to_vec_pretty(&project).unwrap()).unwrap();
+        let marker = serde_json::json!({ "kind": LEGACY_GITHUB_PROJECT_KIND, "schemaVersion": 1, "projectId": 7, "title": "旧仓库" });
+        fs::write(root.join(LEGACY_GITHUB_PROJECT_MARKER), serde_json::to_vec_pretty(&marker).unwrap()).unwrap();
+        // 改名前的仓库里还会有正文目录和自述文件，认不出旧标记就会被当成陌生仓库整个拒掉
+        fs::write(root.join("README.md"), "x").unwrap();
+        fs::create_dir_all(root.join("章节")).unwrap();
+        assert!(validate_github_backup_destination(&root, 7, "旧仓库").is_ok());
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
