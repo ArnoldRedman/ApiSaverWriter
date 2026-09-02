@@ -773,9 +773,9 @@ main {
 .agent-intent-result b { padding: 3px 6px; border: 1px solid var(--accent-line); border-radius: var(--r-sm); background: rgba(8, 145, 178, .14); color: var(--accent-2-fg); font-weight: 500; }
 .agent-context-report { display: flex; flex-wrap: wrap; gap: 6px 12px; margin: 8px 0; color: var(--text-4); font-size: 10px; }
 .agent-context-report span:first-child { color: var(--ok-line); }
-.agent-chapter-plan { margin: 8px 0 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: rgba(15, 23, 42, .72); }
+.agent-chapter-plan { margin: 8px 0 10px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-sunken); }
 .agent-chapter-plan summary { cursor: pointer; padding: 8px 10px; color: var(--accent-2-fg); font-size: 12px; font-weight: 600; }
-.agent-plan-content { max-height: 300px; overflow: auto; padding: 0 10px 10px; color: var(--text-3); font-size: 12px; line-height: 1.72; }
+.agent-plan-content { max-height: 300px; overflow: auto; padding: 0 10px 10px; color: var(--text); font-size: 12px; line-height: 1.72; }
 .agent-plan-content p { margin: 0 0 10px; white-space: pre-wrap; }
 .agent-plan-content p:last-child { margin-bottom: 0; }
 .agent-plan-meta { padding: 0 10px 6px; color: var(--text-5); font-size: 10px; }

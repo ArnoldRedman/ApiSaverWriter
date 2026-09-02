@@ -332,4 +332,31 @@ describe("project agent", () => {
     expect(result.changes.map(change => change.type)).toEqual(["memory.document.upsert", "chapter.delete"]);
     expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(0);
   });
+
+  it("批量修订的预算随章节数扩展，不再固定 20 分钟", async () => {
+    // 回归：单章修订 5 分钟以上很常见，固定 20 分钟会在第 4~5 章撞满预算整轮断掉；
+    // 10 章批量必须给足 10×20 = 200 分钟，而不是在 20 分钟处停手
+    vi.useFakeTimers();
+    try {
+      const chat = vi.fn().mockResolvedValue({
+        content: JSON.stringify({ action: "finish", message: "批量修订。", changes: Array.from({ length: 10 }, (_, index) => ({
+          type: "chapter.revise", summary: `修订 ${index + 1}`, targetId: index + 1, instruction: "统一结尾",
+        })) }),
+        model: "test",
+      });
+      const chapterRevise = vi.fn().mockImplementation((request: { summary: string; targetId: number }) =>
+        new Promise(resolve => setTimeout(() => resolve({ type: "chapter.update", summary: request.summary, targetId: request.targetId, content: "修订后正文。" }), 6 * 60_000)));
+
+      const pending = runProjectAgent({
+        mode: "execute", instruction: "把第 150 到 159 章的结尾都改掉", project,
+      }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+      await vi.advanceTimersByTimeAsync(61 * 60_000);
+
+      const result = await pending;
+      expect(chapterRevise).toHaveBeenCalledTimes(10);
+      expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

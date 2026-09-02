@@ -318,9 +318,17 @@ const REVISE_LIMIT = 10;
  * 每个委派内部的 fetch 各自有超时（最长 300 秒 × 重试），但一轮 changes 最多 16 项，
  * 串行跑下来仍可能几十分钟不返回，前端只看到项目 Agent 一直转。
  * 超预算后剩余委派如实报出来，让作者再说一次继续。
- * ponytail: 固定预算，需要按模型实际速度自适应时再做成设置项
+ * ponytail: 基础值 + 每项固定额度，需要按模型实际速度自适应时再做成设置项
  */
 const DELEGATE_BUDGET_MS = 20 * 60_000;
+
+/**
+ * 每项委派的额外预算
+ * 一次修订要跑完整的正文重写，单章 5 分钟以上很常见，重试多时能到 15 分钟；
+ * 固定 20 分钟撑不满单轮 10 章的修订上限，批量改到第 4~5 章就会撞满预算整轮断掉。
+ * 预算必须跟着委派数量扩展：10 章修订就是 200 分钟，小任务仍是 20 分钟兑底。
+ */
+const PER_DELEGATE_BUDGET_MS = 20 * 60_000;
 
 function boundedMessages(messages: AgentMessage[]): AgentMessage[] {
   const size = (list: AgentMessage[]) => list.reduce((sum, message) => sum + byteLength(message.content), 0);
@@ -427,7 +435,14 @@ export async function runProjectAgent(
   if (input.mode === "discuss") return { message: plan.message, changes: [], toolEvents };
 
   const changes: ProjectAgentChange[] = [];
-  const budgetMs = Math.max(0, Number(input.delegateBudgetMs) || DELEGATE_BUDGET_MS);
+  // 预算跟着活儿走：先数出本轮有多少项委派，再按基础值 + 每项额度取总预算，
+  // 否则批量修订会在固定 20 分钟处断掉，和单轮 10 章的修订上限矛盾
+  const delegateTypes = new Set(["chapter.draft_next", "chapter.revise", "outline.write", "card.write"]);
+  const delegateCount = plan.changes.reduce((total: number, raw) => {
+    const type = raw && typeof raw === "object" ? String((raw as Record<string, unknown>).type || "") : "";
+    return delegateTypes.has(type) ? total + 1 : total;
+  }, 0);
+  const budgetMs = Math.max(0, Number(input.delegateBudgetMs) || Math.max(DELEGATE_BUDGET_MS, delegateCount * PER_DELEGATE_BUDGET_MS));
   const deadline = Date.now() + budgetMs;
   let revisedCount = 0;
   for (const raw of plan.changes) {

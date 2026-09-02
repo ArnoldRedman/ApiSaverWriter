@@ -298,6 +298,43 @@ describe("model client configuration", () => {
     expect(body).not.toHaveProperty("reasoning");
   });
 
+  it("流中断但已有部分内容时，带着已有内容非流式续写补齐而不是报错丢内容", async () => {
+    // 模拟中转在输出一半时连接断掉：前两段内容正常流出，第三个 read 报错
+    const frames = [
+      new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "第一段完整" }, finish_reason: null }] })}\n`),
+      new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "第二段开" }, finish_reason: null }] })}\n`),
+    ];
+    let frameIndex = 0;
+    const brokenStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (frameIndex < frames.length) {
+          const frame = frames[frameIndex];
+          frameIndex += 1;
+          controller.enqueue(frame);
+          return;
+        }
+        controller.error(new Error("socket hang up"));
+      },
+    });
+    const streamFetch = new Response(brokenStream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    const resumeFetch = new Response(JSON.stringify({ model: "gpt-test", choices: [{ message: { content: "头被掐断的部分。" } }] }), { status: 200 });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(streamFetch)
+      .mockResolvedValue(resumeFetch);
+
+    const chunks: string[] = [];
+    const result = await new ModelApiClient({ apiKey: "k", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
+      .chatStream([{ role: "user", content: "写一章" }], {}, chunk => chunks.push(chunk));
+
+    // 已流出的内容不能丢，续写内容无缝接上，UI 拿到完整正文
+    expect(result.content).toBe("第一段完整第二段开头被掐断的部分。");
+    expect(chunks).toEqual(["第一段完整", "第二段开", "头被掐断的部分。"]);
+    // 续写请求必须携带已有内容，避免模型从零重写
+    const resumeBody = JSON.parse(String(fetchMock.mock.calls[1][1]?.body)) as { messages: Array<Record<string, unknown>> };
+    expect(String(resumeBody.messages.at(-2)?.content)).toContain("第一段完整");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("surfaces the upstream error message instead of a bare status code", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
       JSON.stringify({ error: { type: "invalid_request_error", message: "model: claude-x not found" } }),

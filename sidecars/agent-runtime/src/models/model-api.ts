@@ -870,7 +870,7 @@ export class ModelApiClient {
       headers: { "Content-Type": "application/json", ...this.authHeaders(apiKey) },
       body: streamBody,
       ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit, 120_000);
+    } as RequestInit, 300_000);
     const responseBody = streamResponse.ok ? streamResponse.body : null;
     if (!responseBody) {
       const detail = await streamResponse.text();
@@ -881,6 +881,8 @@ export class ModelApiClient {
       }), streamResponse.status);
     }
     const reader = responseBody.getReader(); const decoder = new TextDecoder(); let buffer = ""; let content = ""; let usage: ApiUsage | undefined;
+    // 正常完成后也必须取消 reader，否则中转不关连接时 socket 会挂在连接池里，拖累后续请求
+    const finishStream = async () => { try { await reader.cancel(); } catch { /* 已关闭则忽略 */ } };
     try {
       streamLoop: while (true) {
         // 每次 read 单独计时，并在胜出后立即清除定时器，避免累积悬空计时器拖住进程
@@ -888,7 +890,8 @@ export class ModelApiClient {
         const next = await Promise.race([
           reader.read(),
           new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error(content ? "SSE 后续内容超时" : "SSE 首个响应超时")), content ? 45000 : 30000);
+            // 推理型中转在思考段常有 2~3 分钟静默，45 秒会误杀正在正常生成的长章
+            timer = setTimeout(() => reject(new Error(content ? "SSE 后续内容超时" : "SSE 首个响应超时")), content ? 180_000 : 60_000);
           }),
         ]).finally(() => { if (timer) clearTimeout(timer); }); if (next.done) break;
         buffer += decoder.decode(next.value, { stream: true });
@@ -932,15 +935,31 @@ export class ModelApiClient {
           }
         }
       }
+      await finishStream();
     } catch (error) {
       // 连接异常后必须主动释放读取器，否则底层 socket 不会关闭，后续请求会受连接池耗尽影响
-      void reader.cancel().catch(() => undefined);
+      try { await reader.cancel(); } catch { /* 已关闭则忽略 */ }
+      // 已收到部分内容时流中断：不再丢掉几千字重头再来，带着已有内容非流式续写补齐；
+      // 纯头部失败（content 为空）仍走原有回退
       if (!content) {
         const fallback = await this.chat(messages, options);
         onChunk?.(fallback.content);
         return fallback;
       }
-      throw new Error(`API Saver 流式连接中断：${error instanceof Error ? error.message : String(error)}`);
+      if (isQuotaExceeded(String(error instanceof Error ? error.message : String(error)))) throw error;
+      try {
+        const continuation = await this.chat([
+          ...messages,
+          { role: "assistant", content: `【已生成的前半段，请从断点无缝继续，不要重复已有内容】\n${content}` },
+          { role: "user", content: "继续输出，从中断处直接接上，不要重复、不要解释、不要重新开头" },
+        ], { ...options, max_tokens: undefined });
+        const resumed = `${content}${continuation.content}`;
+        onChunk?.(continuation.content);
+        return { content: resumed, model, usage: usage ?? continuation.usage };
+      } catch (resumeError) {
+        // 续写也失败时如实报告中断位置，已有内容不丢，但流式确实无法完成
+        throw new Error(`API Saver 流式连接中断：${error instanceof Error ? error.message : String(error)}；续写失败：${resumeError instanceof Error ? resumeError.message : String(resumeError)}`);
+      }
     }
     recordRuntimeUsage(usage);
     // Some OpenAI-compatible gateways accept stream=true but answer with one

@@ -123,6 +123,23 @@ interface AgentDraftResult {
  * time. Keep the JSON transport out of the writer-facing preview while still
  * allowing ordinary (non-JSON) provider fallbacks to render immediately.
  */
+/** 章节标题属于标题栏；正文开头的 # 标题行（含重复多行）在接受写入前剥掉，存进去的就是纯正文 */
+const stripChapterTitleLine = (value: string): string => {
+  let text = value.trim();
+  for (let round = 0; round < 3; round += 1) {
+    const match = /^#{1,3}\s*([^\n]{1,40})\n+/u.exec(text);
+    if (!match) break;
+    const titleLine = match[1].trim();
+    // 只有看起来像章节名才剥（含“第 x 章”或较短且无标点的标题）；避免误伤正文里合法的 Markdown 小节
+    const looksLikeChapterTitle = /第[\s\d零一二三四五六七八九十百千两]+章/u.test(titleLine)
+      || (titleLine.length > 0 && !/[，。！？；：、“”…—]/u.test(titleLine) && titleLine.length <= 20);
+    const rest = text.slice(match[0].length).trim();
+    if (!looksLikeChapterTitle || !rest) break;
+    text = rest;
+  }
+  return text;
+};
+
 const chapterDraftFromStream = (raw: string, depth = 0): string => {
   if (depth > 4) return raw.trim();
   const trimmed = raw.trimStart();
@@ -4521,7 +4538,7 @@ function App() {
         });
       // The completed RPC result is the source of truth. It must replace the
       // streaming buffer because JSON envelopes can be split across SSE frames.
-      const draftContent = chapterDraftFromStream(result.draftContent || '');
+      const draftContent = stripChapterTitleLine(chapterDraftFromStream(result.draftContent || ''));
       const normalizedResult = { ...result, draftContent };
       setAgentDraft(normalizedResult);
       setAgentDisplayContent(draftContent);
@@ -4554,11 +4571,13 @@ function App() {
     if (!agentDraft?.draftContent) return;
     if (editingProject && activeChapter) {
       const now = new Date().toISOString();
+      // 写入前再剥一次标题行：预览框可手改，手改后同样不该把 # 标题存进正文
+      const chapterContent = stripChapterTitleLine(agentDraft.draftContent);
       const updatedChapter: Chapter = {
         // 采用草稿会覆盖现有正文，先存快照
         ...pushChapterSnapshot(activeChapter, 'Agent 草稿'),
-        content: agentDraft.draftContent,
-        wordCount: countNovelCharacters(agentDraft.draftContent),
+        content: chapterContent,
+        wordCount: countNovelCharacters(chapterContent),
         updatedAt: now,
       };
       const selectedCards = editingProject.cards.filter(card => selectedCardIds.includes(card.id));

@@ -48,20 +48,47 @@ const chapterAgentSystemPrompt = `你是专业长篇网络小说创作 Agent。�
 4. 正文使用自然的中文网文叙事，段落有节奏，结尾停在可继续发展的行动、发现或风险上。
 5. 严格执行最后一条消息指定的阶段任务与输出格式，不输出隐藏思考。`;
 
-const chapterWriterTaskPrompt = `你正在执行“章节正文”阶段。返回严格 JSON 对象，不要代码围栏或额外说明：{"content":"章节正文 Markdown","summary":"200 字以内章节摘要"}。`;
+const chapterWriterTaskPrompt = `你正在执行“章节正文”阶段。返回严格 JSON 对象，不要代码围栏或额外说明：{"content":"章节正文 Markdown","summary":"200 字以内章节摘要"}。content 只能是小说正文本身，绝不能是计划确认、写作思路、意向声明或对任务的回应。`; 
 
 /** JSON 传输信封绝不能成为展示给作者的章节正文。 */
 function unwrapChapterDraft(value: unknown, depth = 0): string {
   if (typeof value !== "string") return "";
   const text = value.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
-  if (depth >= 4 || !text.startsWith("{")) return value.trim();
+  if (depth >= 4 || !text.startsWith("{")) return stripPreambleAffirmation(value.trim());
   try {
     const parsed = JSON.parse(text) as Record<string, unknown>;
     const nested = typeof parsed.draftContent === "string" ? parsed.draftContent : typeof parsed.content === "string" ? parsed.content : "";
-    return nested ? unwrapChapterDraft(nested, depth + 1) : value.trim();
+    return nested ? unwrapChapterDraft(nested, depth + 1) : stripPreambleAffirmation(value.trim());
   } catch {
-    return value.trim();
+    return stripPreambleAffirmation(value.trim());
   }
+}
+
+/** 模型偶尔把“我会严格沿着计划写”这类确认语当正文返回；开头不是叙述就是承诺，整段丢掉只保留真正文 */
+function stripPreambleAffirmation(text: string): string {
+  const trimmed = text.trim();
+  const match = /^(?:我会|我将|我计划|接下来会|本文将|这一章将|本章将|将严格)[^\n。！？]{0,80}[。！？]\s*/u.exec(trimmed);
+  if (!match) return trimmed;
+  const rest = trimmed.slice(match[0].length);
+  // 只丢开头一句承诺语，后面必须还有真正文；全句都是承诺说明整段都是任务回应，直接报错让作者重试
+  return rest.trim() ? rest.trim() : "";
+}
+
+/** 章节标题属于标题栏，不属于正文；模型爱在正文开头补一道 # 标题，存入前剥掉（含重复多行） */
+function stripChapterTitleHeading(value: string): string {
+  let text = value.trim();
+  for (let round = 0; round < 3; round += 1) {
+    const match = /^#{1,3}\s*([^\n]{1,40})\n+/u.exec(text);
+    if (!match) break;
+    const titleLine = match[1].trim();
+    // 只有看起来像章节名才剥（含“第 x 章”或较短且无标点的标题）；避免误伤正文里合法的 Markdown 小节
+    const looksLikeChapterTitle = /第[\s\d零一二三四五六七八九十百千两]+章/u.test(titleLine)
+      || (titleLine.length > 0 && !/[，。！？；：、“”…—]/u.test(titleLine) && titleLine.length <= 20);
+    const rest = text.slice(match[0].length).trim();
+    if (!looksLikeChapterTitle || !rest) break;
+    text = rest;
+  }
+  return text;
 }
 
 function chapterSummaryFromEnvelope(value: unknown, depth = 0): string {
@@ -447,7 +474,7 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       const continuityInstruction = hasPreviousChapter
         ? "先承接上一章最后的动作、位置和情绪，再推进计划中的事件"
         : "这是第一章，没有上一章正文；先依据世界观、章纲和作者指令建立场景、人物与初始冲突";
-      const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：${continuityInstruction}；不要复述计划或解释过程。`;
+      const taskPrompt = `${chapterWriterTaskPrompt}\n\n## 本章任务\n${state.instruction}\n\n请严格按照“下一章计划”创作 2000-3000 字左右正文：${continuityInstruction}；不要复述计划或解释过程；content 直接从正文第一句开始，不要以“我会”“我将”“接下来会”等承诺性语句开头。`;
       const draftInputBytes = byteLength(chapterAgentSystemPrompt) + byteLength(stablePacket) + byteLength(dynamicPacket) + byteLength(taskPrompt);
       const contextReport = state.contextReport ? { ...state.contextReport, draftInputBytes } : undefined;
       if (contextReport?.cache === "hit") emitter?.context("draft", "命中本地资料指纹缓存", { source: "持久化上下文缓存", status: "cached", bytes: draftInputBytes });
@@ -466,7 +493,8 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       emitter?.progress("draft", 70, "章节生成完成");
 
       return {
-        draftContent: unwrapChapterDraft(response.content),
+        // 标题行在产出时就剥掉，避免模型补的 # 章节标题混进正文；承诺语由 unwrapChapterDraft 内部处理
+        draftContent: stripChapterTitleHeading(unwrapChapterDraft(response.content)),
         summary: chapterSummaryFromEnvelope(response.content),
         contextReport,
         upstreamUsage: addUsage(state.upstreamUsage, response.usage),

@@ -5,6 +5,68 @@ import { StoryStore } from "../src/storage/story-store.js";
 describe("chapter continuity context", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  // 正文体应该被模型包装成 {content, summary}，但模型有时直接回纯文本或带承诺语/标题；
+  // 图内部已解析，但为了断言“写入前的清洗”行为，直接构造最小图状态验证 draft 产出
+  it("剥掉正文开头的章节标题行，不把标题写进正文", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+      const messages = JSON.stringify(body.messages || "");
+      const content = messages.includes("待审查章节")
+        ? JSON.stringify({ consistent: true, issues: [], suggestions: [] })
+        : messages.includes("五段写作任务书")
+          ? JSON.stringify({ plan: "1. 开篇承接：承接敲门。", handoff: "门锁转动。" })
+          // 模型真实 bug：正文开头补了两行重复标题
+          : JSON.stringify({ content: "# 第 151 章 黑暗中的后退\n# 第 151 章 黑暗中的后退\n\n林砚僵在门前。", summary: "承接。" });
+      return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "strip-title-project", title: "剥标题测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "strip-title-project",
+      chapterId: "151",
+      instruction: "继续写本章",
+      previousChapters: [{ id: "150", title: "第 150 章", content: "门外传来三声敲门。" }],
+    });
+
+    expect(result.draftContent).toBe("林砚僵在门前。");
+    store.close();
+  });
+
+  it("正文只回一句写作承诺时如实返回空，不用承诺语冒充正文", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+      const messages = JSON.stringify(body.messages || "");
+      const content = messages.includes("待审查章节")
+        ? JSON.stringify({ consistent: true, issues: [], suggestions: [] })
+        : messages.includes("五段写作任务书")
+          ? JSON.stringify({ plan: "1. 开篇承接：承接敲门。", handoff: "门锁转动。" })
+          // 模型真实 bug：content 是一句“我会……”的计划确认语，不是正文
+          : JSON.stringify({ content: "我会严格沿着十点整的门前对峙继续，保留三声敲击的节奏，只推进到值班室门被推开。", summary: "计划确认。" });
+      return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "affirmation-project", title: "承诺语测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "affirmation-project",
+      chapterId: "1",
+      instruction: "继续写本章",
+    });
+
+    // 全段都是承诺语时返回空串，让上层报“没有生成正文”而不是把承诺语当正文展示
+    expect(result.draftContent).toBe("");
+    store.close();
+  });
+
   it("puts the immediate previous chapter ending ahead of ordinary context", async () => {
     const requests: Array<Record<string, unknown>> = [];
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
