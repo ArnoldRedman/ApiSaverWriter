@@ -553,3 +553,66 @@ describe("project agent", () => {
     expect(seen.at(-1)).toBe("complete:2/2");
   });
 });
+
+  it("长大纲回复超过 message 上限时截断保留而不是整轮拒绝", async () => {
+    // 线上真实事故：作者让项目 Agent 写大纲，模型把整份大纲写进 message，
+    // 超过 5000 字后 zod 整轮拒绝，兜底话术还在教"一次只处理三五章"，驴唇不对马嘴
+    const outline = Array.from({ length: 300 }, (_, i) => `第${i + 1}节：林舟在城南追查旧书档案，线索指向码头仓库，他决定夜访。`).join("\n");
+    const client = clientWith(JSON.stringify({ action: "finish", message: outline, changes: [] }));
+
+    const result = await runProjectAgent(
+      { mode: "discuss", instruction: "你把大纲写一下吧", project, contextWindowKTokens: 64 },
+      client as unknown as ModelApiClient,
+      delegates(),
+    );
+
+    expect(result.message).toContain("林舟在城南追查旧书档案");
+    expect(result.message).toContain("后文过长已截断");
+    expect(result.message.length).toBeLessThanOrEqual(5000);
+  });
+
+  it("回包被 max_tokens 截断掉末尾括号时本地补齐，不烧修复轮", async () => {
+    const finishJson = `{"action":"finish","message":"林舟已确认旧书来自码头仓库，下一步核对借阅记录。","changes":[{"type":"project.update","summary":"更新设定","patch":{"synopsis":"林舟追查码头仓库的旧书来源。"}}]`;
+    const client = clientWith(finishJson);
+
+    const result = await runProjectAgent(
+      { mode: "execute", instruction: "整理当前线索并更新简介", project, contextWindowKTokens: 64 },
+      client as unknown as ModelApiClient,
+      delegates(),
+    );
+
+    expect(result.message).toContain("码头仓库");
+    expect(result.changes).toHaveLength(1);
+    // 本地抢救成功，不应再调第二次模型修格式
+    expect((client as unknown as { chat: ReturnType<typeof vi.fn> }).chat).toHaveBeenCalledTimes(1);
+  });
+
+  it("散文包着 JSON 的回包能剥出动作", async () => {
+    const client = clientWith(`好的，以下是整理后的动作：\n\n{"action":"finish","message":"林舟下一步前往旧仓库核对档案。","changes":[]}\n\n希望对你有帮助。`);
+
+    const result = await runProjectAgent(
+      { mode: "discuss", instruction: "下一步林舟该做什么", project, contextWindowKTokens: 64 },
+      client as unknown as ModelApiClient,
+      delegates(),
+    );
+
+    expect(result.message).toContain("旧仓库核对档案");
+  });
+
+  it("两轮都解析不出动作时，够长的散文回复直接当内容收尾", async () => {
+    // 模型直接把大纲写成散文，连 JSON 都没包：丢掉的话作者就白等了
+    const prose = `关于这本书的主线：${"林舟在城南整理旧书档案，逐步揭开码头仓库背后三十年前的旧案。".repeat(12)}`;
+    const chat = vi.fn()
+      .mockResolvedValueOnce({ content: prose, model: "test" })
+      .mockResolvedValue({ content: "还是解析不了", model: "test" });
+    const client = { chat } as unknown as ModelApiClient;
+
+    const result = await runProjectAgent(
+      { mode: "discuss", instruction: "这书到底讲的是什么", project, contextWindowKTokens: 64 },
+      client,
+      delegates(),
+    );
+
+    expect(result.message).toContain("码头仓库背后");
+    expect(result.changes).toEqual([]);
+  });

@@ -230,6 +230,7 @@ const OPEN_TOTAL_BUDGET = 26_000;
 const LIST_PAGE_LIMIT = 60;
 
 // Agent 每一轮只返回一个动作：继续检索、按序号翻目录、打开资料，或收尾给出回复与变更提案
+// message 上限只是防失控：写大纲这类长回复会被模型写进 message，超长时截断保留而不是整轮拒绝
 const agentTurnSchema = z.union([
   z.object({ action: z.literal("search"), query: z.string().min(1).max(200) }),
   // 按序号翻目录：长篇的章节表不可能整表进提示词，作者又常按“第几章”说话
@@ -247,25 +248,76 @@ const changeTypeNames = new Set<string>([
   "chapter.revise", "chapter.retitle", "chapter.split", "chapter.delete",
 ]);
 
-function parseAgentTurn(value: string): ProjectAgentTurn {
-  const cleaned = value.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "").trim();
-  const parsed = JSON.parse(cleaned) as Record<string, unknown>;
+/**
+ * 从可能被散文包裹/截断的模型回包里抠出 JSON 对象
+ * max_tokens 截断会把末尾的 } 砍掉，有的模型还爱在 JSON 前后写一句“好的，以下是……”：
+ * 先剥围栏和前后缀，再补齐括号；都不行才把整段当散文（返回 null），交给模型修复轮
+ */
+function extractJsonObject(value: string): Record<string, unknown> | null {
+  const candidates: string[] = [];
+  const stripped = value.trim().replace(/^```(?:json)?\s*/iu, "").replace(/\s*```$/u, "").trim();
+  candidates.push(stripped);
+  // 前后缀散文：第一个 { 到最后一个 }
+  const first = stripped.indexOf("{");
+  const last = stripped.lastIndexOf("}");
+  if (first >= 0 && last > first) candidates.push(stripped.slice(first, last + 1));
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+  }
+  // 补齐被截断的括号：从 { 到最后一个完整字符串后，逐层补 }
+  if (first >= 0) {
+    const tail = stripped.slice(first);
+    for (let close = 1; close <= 8; close += 1) {
+      try {
+        return JSON.parse(`${tail}${"}".repeat(close)}`) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+    }
+  }
+  return null;
+}
+
+/** finish 的 message 超长时截断保留前半，别因为模型话多就把整轮丢掉 */
+function clampFinishTurn(parsed: Record<string, unknown>): Record<string, unknown> | null {
   const action = typeof parsed.action === "string" ? parsed.action : "";
-  // 模型经常把变更的 type 直接填进 action，或者干脆只回一个变更对象；都归一成"带一条变更的收尾"
-  if (changeTypeNames.has(action) || (!action && changeTypeNames.has(String(parsed.type || "")))) {
-    const { action: _discarded, ...rest } = parsed;
-    const change = { ...rest, type: changeTypeNames.has(action) ? action : parsed.type };
+  const looksFinish = action === "finish"
+    || (!action && (typeof parsed.message === "string" || changeTypeNames.has(String(parsed.type || ""))));
+  if (!looksFinish) return null;
+  const message = typeof parsed.message === "string" ? parsed.message : "";
+  const changes = Array.isArray(parsed.changes) ? parsed.changes : [];
+  if (message.length <= 5000) {
+    return { ...parsed, action: "finish", message: message || "已生成待确认变更。", changes };
+  }
+  return { ...parsed, action: "finish", message: `${message.slice(0, 4800)}\n\n（后文过长已截断，如需完整内容请说一次继续）`, changes };
+}
+
+function parseAgentTurn(value: string): ProjectAgentTurn {
+  const parsed = extractJsonObject(value);
+  if (!parsed) throw new Error("回包里找不到 JSON 对象");
+  // 先把超长 finish 归一成合法形状，长大纲回复就不会在 zod 校验时被整轮拒绝
+  const clamped = clampFinishTurn(parsed);
+  const source = clamped ?? parsed;
+  const action = typeof source.action === "string" ? source.action : "";
+  // 模型经常把变更的 type 直接填进 action，或者干脆只回一个变更对象；都归一成“带一条变更的收尾”
+  if (changeTypeNames.has(action) || (!action && changeTypeNames.has(String(source.type || "")))) {
+    const { action: _discarded, ...rest } = source;
+    const change = { ...rest, type: changeTypeNames.has(action) ? action : source.type };
     return agentTurnSchema.parse({
       action: "finish",
-      message: typeof parsed.summary === "string" && parsed.summary ? parsed.summary : "已生成待确认变更。",
+      message: typeof source.summary === "string" && source.summary ? source.summary : "已生成待确认变更。",
       changes: [change],
     });
   }
   // 兼容只回 {message, changes} 的旧格式
-  if (!action && typeof parsed.message === "string") {
-    return agentTurnSchema.parse({ action: "finish", message: parsed.message, changes: parsed.changes ?? [] });
+  if (!action && typeof source.message === "string") {
+    return agentTurnSchema.parse({ action: "finish", message: source.message, changes: source.changes ?? [] });
   }
-  return agentTurnSchema.parse(parsed);
+  return agentTurnSchema.parse(source);
 }
 
 // 全量文档表：search 只回标题和片段，正文要等 open 才完整取出，避免一次把整本书塞进提示词
@@ -564,19 +616,26 @@ export async function runProjectAgent(
     let turn: ProjectAgentTurn;
     try {
       turn = parseAgentTurn(response.content);
-    } catch {
-      // 只修格式不补事实；修不好就把原文当成纯文本回复收尾，不让一次格式抖动毁掉整轮
-      const repaired = await client.chat([
-        { role: "system", content: systemPrompt },
-        { role: "user", content: `请把以下内容整理成约定的 JSON 动作，只调整格式：\n${compactText(response.content, 6000)}` },
-      ], { response_format: { type: "json_object" }, temperature: 0, max_tokens: 12_000, retryAttempts: 1 });
+    } catch (rawError) {
+      const rawErrorText = rawError instanceof Error ? rawError.message : String(rawError);
+      // 先试模型修复轮：只修格式不补事实；修不好就把原文当成纯文本回复收尾，不让一次格式抖动毁掉整轮
+      let repaired: Awaited<ReturnType<typeof client.chat>> | null = null;
       try {
+        repaired = await client.chat([
+          { role: "system", content: systemPrompt },
+          { role: "user", content: `请把以下内容整理成约定的 JSON 动作，只调整格式：\n${compactText(response.content, 6000)}` },
+        ], { response_format: { type: "json_object" }, temperature: 0, max_tokens: 12_000, retryAttempts: 1 });
         turn = parseAgentTurn(repaired.content);
       } catch {
-        // 两轮都没修好就如实说明，不要把原始 JSON 当成回复扔给作者。
-        // 最常见的原因是模型把整章正文塞进了 changes，JSON 还没写完就被 max_tokens 截断，
-        // 所以这里要给出能自己解决问题的下一步，而不是让作者原样再说一遍
-        turn = { action: "finish", message: "模型这轮没有按约定格式回复，多半是想把正文直接写进变更里、JSON 被截断了。请把范围说得更小一些（比如一次只处理三五章），或者明确说“交给章节智能体处理”再试一次。", changes: [] };
+        // 两轮都没解析成动作时，看原文里有没有正文可用：纯散文回复（比如直接写出来的大纲）
+        // 当成 finish 的 message 收尾，别把已经写好的内容丢掉；只剩错误信息才走引导重试的兑底话
+        const prose = response.content.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "").trim();
+        const usableProse = prose.length >= 40 ? compactText(prose, 4800) : "";
+        turn = {
+          action: "finish",
+          message: usableProse || `这轮回复没能解析成可执行的变更（${compactText(rawErrorText, 160)}）。多半是内容太长被截断：把范围说小一些，或明确说“交给章节智能体处理”再试一次。`,
+          changes: [],
+        };
       }
     }
 
