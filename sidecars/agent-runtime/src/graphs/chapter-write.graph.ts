@@ -5,6 +5,8 @@ import { ModelApiClient, type ApiUsage, type ApiWireMode } from "../models/model
 import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, type ContextReport } from "../context/context-optimizer.js";
+// 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
+import { applyDraftChapterTitle, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
 export interface SkillDefinition {
   name: string;
@@ -72,23 +74,6 @@ function stripPreambleAffirmation(text: string): string {
   const rest = trimmed.slice(match[0].length);
   // 只丢开头一句承诺语，后面必须还有真正文；全句都是承诺说明整段都是任务回应，直接报错让作者重试
   return rest.trim() ? rest.trim() : "";
-}
-
-/** 章节标题属于标题栏，不属于正文；模型爱在正文开头补一道 # 标题，存入前剥掉（含重复多行） */
-function stripChapterTitleHeading(value: string): string {
-  let text = value.trim();
-  for (let round = 0; round < 3; round += 1) {
-    const match = /^#{1,3}\s*([^\n]{1,40})\n+/u.exec(text);
-    if (!match) break;
-    const titleLine = match[1].trim();
-    // 只有看起来像章节名才剥（含“第 x 章”或较短且无标点的标题）；避免误伤正文里合法的 Markdown 小节
-    const looksLikeChapterTitle = /第[\s\d零一二三四五六七八九十百千两]+章/u.test(titleLine)
-      || (titleLine.length > 0 && !/[，。！？；：、“”…—]/u.test(titleLine) && titleLine.length <= 20);
-    const rest = text.slice(match[0].length).trim();
-    if (!looksLikeChapterTitle || !rest) break;
-    text = rest;
-  }
-  return text;
 }
 
 function chapterSummaryFromEnvelope(value: unknown, depth = 0): string {
@@ -247,6 +232,8 @@ export const ChapterState = Annotation.Root({
   prewriteCheck: Annotation<{ blockers: string[]; warnings: string[]; summary: string } | undefined>,
   chapterPlan: Annotation<string | undefined>,
   draftContent: Annotation<string | undefined>,
+  /** 模型写在正文开头的章节标题：从正文剥出来后交给桌面端填进标题栏 */
+  chapterTitle: Annotation<string | undefined>,
   summary: Annotation<string | undefined>,
   contextReport: Annotation<ContextReport | undefined>,
   sessionContext: Annotation<string | undefined>,
@@ -492,9 +479,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
       ], { response_format: { type: "json_object" } }, chunk => emitter?.chunk(chunk));
       emitter?.progress("draft", 70, "章节生成完成");
 
+      // 标题行在产出时就从正文里拆走，避免模型补的 # 章节标题混进正文；承诺语由 unwrapChapterDraft 内部处理
+      const draft = splitChapterTitleHeading(unwrapChapterDraft(response.content));
       return {
-        // 标题行在产出时就剥掉，避免模型补的 # 章节标题混进正文；承诺语由 unwrapChapterDraft 内部处理
-        draftContent: stripChapterTitleHeading(unwrapChapterDraft(response.content)),
+        draftContent: draft.content,
+        chapterTitle: draft.title,
         summary: chapterSummaryFromEnvelope(response.content),
         contextReport,
         upstreamUsage: addUsage(state.upstreamUsage, response.usage),

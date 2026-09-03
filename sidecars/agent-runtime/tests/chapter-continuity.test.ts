@@ -34,6 +34,8 @@ describe("chapter continuity context", () => {
     });
 
     expect(result.draftContent).toBe("林砚僵在门前。");
+    // 标题不能只是被丢掉：剥下来的标题行要带出图外，否则标题栏永远停在“第 N 章”占位
+    expect(result.chapterTitle).toBe("第 151 章 黑暗中的后退");
     store.close();
   });
 

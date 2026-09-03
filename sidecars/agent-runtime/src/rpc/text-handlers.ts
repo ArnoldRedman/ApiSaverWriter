@@ -3,6 +3,16 @@ import type { RpcRegistry } from "./registry.js";
 
 const textModes = new Set(["polish", "de-ai", "continue", "revise"]);
 
+/**
+ * 整章改写的输出上限
+ * 输出要和输入同量级，还得留出改写时自然变长的余量；中文一个字通常在 1 个 token 上下，
+ * 这里按 1.2 倍加固定余量估，再夹在 [4000, 16000] 之间兜底。
+ */
+function wholeChapterTokenBudget(content: string): number {
+  const characters = content.replace(/\s/gu, "").length;
+  return Math.min(16_000, Math.max(4000, Math.ceil(characters * 1.2) + 800));
+}
+
 export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => registry
   .register("text.transform", async params => {
     const { mode, instruction, content, previousChapter, maxWords, projectTitle, chapterTitle } = params;
@@ -21,9 +31,13 @@ export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => regi
       : `你是长篇网络小说作者。请为《${String(projectTitle || "未命名小说")}》的${String(chapterTitle || "当前章节")}续写一段可直接插入正文的内容。\n\n要求：只输出续写正文，不复述已有内容，不加标题、注释或 Markdown 标记；承接已有的叙事视角、人物状态、时间线和文风；推进一个明确动作或事件，并自然收束在可继续写作的位置；输出不得超过 ${numericLimit} 个非空白字符。${extraRequirement ? `\n作者续写要求：${extraRequirement}` : ""}\n\n上一章结尾（仅在当前章为空时优先承接）：\n${String(previousChapter || "无")}\n\n当前章节已有内容：\n${String(content || "（当前章为空，请承接上一章）")}`;
     const response = await client.chat([{ role: "user", content: prompt }], {
       temperature: mode === "continue" ? 0.75 : mode === "de-ai" ? 0.45 : mode === "revise" ? 0.6 : 0.35,
-      // 修订输出是整章正文，不能用润色的 5000 上限截掉结尾
-      max_tokens: mode === "continue" ? Math.min(7000, Math.max(500, Math.ceil(numericLimit * 1.6))) : mode === "revise" ? 12_000 : 5000,
-      retryAttempts: 2,
+      // 整章改写的输出长度和输入同量级：润色、去 AI 味、修订都会重写整章，
+      // 固定 5000 会把三千字以上的章节从中间截断，作者看到的是“后半章没了”
+      max_tokens: mode === "continue"
+        ? Math.min(7000, Math.max(500, Math.ceil(numericLimit * 1.6)))
+        : wholeChapterTokenBudget(String(content || "")),
+      // 整章改写单次要跑好几十秒，上游 429/5xx 抖动比短请求常见得多；只重试一次很容易整章白跑
+      retryAttempts: mode === "continue" ? 2 : 3,
     });
     let result = response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim();
     if (mode === "continue" && numericLimit > 0 && Array.from(result.replace(/\s/gu, "")).length > numericLimit) {

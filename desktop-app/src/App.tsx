@@ -20,7 +20,7 @@ import { PaneResizer } from './features/editor/pane-resizer';
 import { PlumBranch } from './features/editor/plum-branch';
 import { Icon } from './components/icon';
 import './App.css';
-import { countNovelCharacters } from './utils/text';
+import { countNovelCharacters, splitChapterTitleHeading, applyDraftChapterTitle } from './utils/text';
 import { builtinSkills } from './data/builtin-skills';
 
 
@@ -87,6 +87,8 @@ interface AgentReviewResult {
 
 interface AgentDraftResult {
   draftContent?: string;
+  /** 运行时从正文开头剥下来的章节标题，用于补全标题栏里的占位章号 */
+  chapterTitle?: string;
   summary?: string;
   chapterPlan?: string;
   prewriteCheck?: { blockers: string[]; warnings: string[]; summary: string };
@@ -123,23 +125,6 @@ interface AgentDraftResult {
  * time. Keep the JSON transport out of the writer-facing preview while still
  * allowing ordinary (non-JSON) provider fallbacks to render immediately.
  */
-/** 章节标题属于标题栏；正文开头的 # 标题行（含重复多行）在接受写入前剥掉，存进去的就是纯正文 */
-const stripChapterTitleLine = (value: string): string => {
-  let text = value.trim();
-  for (let round = 0; round < 3; round += 1) {
-    const match = /^#{1,3}\s*([^\n]{1,40})\n+/u.exec(text);
-    if (!match) break;
-    const titleLine = match[1].trim();
-    // 只有看起来像章节名才剥（含“第 x 章”或较短且无标点的标题）；避免误伤正文里合法的 Markdown 小节
-    const looksLikeChapterTitle = /第[\s\d零一二三四五六七八九十百千两]+章/u.test(titleLine)
-      || (titleLine.length > 0 && !/[，。！？；：、“”…—]/u.test(titleLine) && titleLine.length <= 20);
-    const rest = text.slice(match[0].length).trim();
-    if (!looksLikeChapterTitle || !rest) break;
-    text = rest;
-  }
-  return text;
-};
-
 const chapterDraftFromStream = (raw: string, depth = 0): string => {
   if (depth > 4) return raw.trim();
   const trimmed = raw.trimStart();
@@ -815,6 +800,8 @@ const projectAgentChangeTargetKey = (change: ProjectAgentChange) => {
   if (change.type === 'graph.edge.upsert') return `graph-edge:${change.targetId}`;
   // 修订和删除指向同一章时互斥：先应用的那条会让另一条失效
   if (change.type === 'chapter.update' || change.type === 'chapter.delete') return `chapter:${change.targetId}`;
+  // 批量标题只改标题栏，和逐章修订不冲突；同一批里再来一条批量标题才算互斥
+  if (change.type === 'chapter.titles') return 'chapter-titles';
   return `chapter:new:${change.title}`;
 };
 
@@ -842,8 +829,10 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
     'graph.edge.upsert': 5,
     'chapter.create': 6,
     'chapter.update': 7,
+    // 标题在正文之后：同一章既被修订又被补标题时，标题要落在修订后的正文上
+    'chapter.titles': 8,
     // 删除最后执行：否则同批次里针对该章的其他变更会找不到目标
-    'chapter.delete': 8,
+    'chapter.delete': 9,
   };
   const pending = changes.filter(change => change.status === 'pending').sort((left, right) => order[left.type] - order[right.type]);
   if (!pending.length) throw new Error('没有待应用的变更');
@@ -1000,6 +989,41 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
         chapters: next.chapters.map(item => item.id === updated.id ? updated : item),
         // 图谱节点标题跟随章节标题；正文变了但章节记忆仍是旧的，由作者重新保存时刷新
         graphNodes: next.graphNodes.map(node => node.id === `chapter:${updated.id}` ? { ...node, label: updated.title, updatedAt: now } : node),
+      };
+      continue;
+    }
+    if (change.type === 'chapter.titles') {
+      // 一条变更带几百章标题，逐章落地：只改标题栏，正文只在标题原本写在开头时才动
+      const byId = new Map(change.titles.map(item => [item.targetId, item]));
+      let touched = 0;
+      const chapters = next.chapters.map(chapter => {
+        const entry = byId.get(chapter.id);
+        if (!entry) return chapter;
+        touched += 1;
+        if (!entry.stripHeading) return { ...chapter, title: entry.title, updatedAt: now };
+        // 标题原本是正文开头的 # 标题行（旧版本遗留）：这里重新拆一遍当前正文，
+        // 而不是让运行时把几百章改写后的正文回传，那会把请求体和会话存档撑爆
+        const draft = splitChapterTitleHeading(chapter.content);
+        if (!draft.title) return { ...chapter, title: entry.title, updatedAt: now };
+        return {
+          ...pushChapterSnapshot(chapter, 'Agent 补标题'),
+          title: entry.title,
+          content: draft.content,
+          wordCount: countNovelCharacters(draft.content),
+          updatedAt: now,
+        };
+      });
+      if (!touched) throw new Error('批量标题里的章节都已经不存在了，请重新让项目 Agent 处理');
+      const titleById = new Map(chapters.map(chapter => [chapter.id, chapter.title]));
+      next = {
+        ...next,
+        chapters,
+        // 图谱节点标签跟着标题走，否则图谱里还挂着一堆“第 N 章”
+        graphNodes: next.graphNodes.map(node => {
+          const chapterId = node.id.startsWith('chapter:') ? Number(node.id.slice(8)) : 0;
+          const title = chapterId && byId.has(chapterId) ? titleById.get(chapterId) : undefined;
+          return title ? { ...node, label: title, updatedAt: now } : node;
+        }),
       };
       continue;
     }
@@ -4538,8 +4562,11 @@ function App() {
         });
       // The completed RPC result is the source of truth. It must replace the
       // streaming buffer because JSON envelopes can be split across SSE frames.
-      const draftContent = stripChapterTitleLine(chapterDraftFromStream(result.draftContent || ''));
-      const normalizedResult = { ...result, draftContent };
+      // 标题行属于标题栏、不属于正文：拆出来单独带走
+      // 运行时已经在图里拆过一次，这里再兜一次——非流式回退或模型二次补标题时也能拿到章节名
+      const draft = splitChapterTitleHeading(chapterDraftFromStream(result.draftContent || ''));
+      const draftContent = draft.content;
+      const normalizedResult = { ...result, draftContent, chapterTitle: draft.title || result.chapterTitle };
       setAgentDraft(normalizedResult);
       setAgentDisplayContent(draftContent);
       agentStreamRawContentRef.current = '';
@@ -4572,10 +4599,14 @@ function App() {
     if (editingProject && activeChapter) {
       const now = new Date().toISOString();
       // 写入前再剥一次标题行：预览框可手改，手改后同样不该把 # 标题存进正文
-      const chapterContent = stripChapterTitleLine(agentDraft.draftContent);
+      const draft = splitChapterTitleHeading(agentDraft.draftContent);
+      const chapterContent = draft.content;
+      // 手改过的预览框以框里的标题为准，否则用运行时剥下来的那一行；只补占位标题，作者起过名的不动
+      const draftTitle = draft.title || agentDraft.chapterTitle || '';
       const updatedChapter: Chapter = {
         // 采用草稿会覆盖现有正文，先存快照
         ...pushChapterSnapshot(activeChapter, 'Agent 草稿'),
+        title: applyDraftChapterTitle(activeChapter.title, draftTitle),
         content: chapterContent,
         wordCount: countNovelCharacters(chapterContent),
         updatedAt: now,
@@ -5635,6 +5666,7 @@ function App() {
       case 'graph.edge.upsert': return '更新图谱关系';
       case 'chapter.create': return '新建章节草稿';
       case 'chapter.update': return '修订章节正文';
+      case 'chapter.titles': return '批量补章节标题';
       case 'chapter.delete': return '删除章节';
     }
   };
@@ -5646,6 +5678,10 @@ function App() {
     if (change.type === 'graph.node.upsert') return `${change.nodeType} · ${change.label}`;
     if (change.type === 'graph.edge.upsert') return `${change.source} -[${change.label}]-> ${change.target}`;
     if (change.type === 'chapter.delete') return `${change.title || `章节 ${change.targetId}`} · 删除后不可恢复`;
+    if (change.type === 'chapter.titles') {
+      const stripped = change.titles.filter(item => item.stripHeading).length;
+      return `${change.titles.length} 章${stripped ? ` · 其中 ${stripped} 章同时把正文开头的标题行移走` : ''}`;
+    }
     if (change.type === 'chapter.update') {
       const target = editingProject?.chapters.find(item => item.id === change.targetId);
       return `${target?.title || `章节 ${change.targetId}`} · ${countNovelCharacters(change.content).toLocaleString()} 字${target ? `（原 ${target.wordCount.toLocaleString()} 字）` : ''}`;
@@ -5656,6 +5692,14 @@ function App() {
     if (change.type === 'project.update') return JSON.stringify(change.patch, null, 2);
     if (change.type === 'outline.upsert' || change.type === 'card.upsert' || change.type === 'memory.document.upsert' || change.type === 'chapter.create' || change.type === 'chapter.update') return change.content;
     if (change.type === 'graph.node.upsert') return change.content || change.nodeStatus || projectAgentChangeDetail(change);
+    if (change.type === 'chapter.titles') {
+      // 几百章一次提上来，作者必须能逐条核对新旧标题再决定要不要应用
+      return change.titles.map(item => {
+        const index = editingProject?.chapters.findIndex(chapter => chapter.id === item.targetId) ?? -1;
+        const current = index >= 0 ? editingProject?.chapters[index]?.title : '';
+        return `${index >= 0 ? `#${index + 1}` : `id ${item.targetId}`}　${current || '（无标题）'} → ${item.title}${item.stripHeading ? '　[同时移走正文标题行]' : ''}`;
+      }).join('\n');
+    }
     return projectAgentChangeDetail(change);
   };
   const visibleSkills = skills.filter(skill => {

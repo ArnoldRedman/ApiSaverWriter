@@ -1,14 +1,16 @@
 import { z } from "zod";
-import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@zhizhang/contracts";
+import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterTitles, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@zhizhang/contracts";
 export { ProjectAgentChangeSchema };
-export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@zhizhang/contracts";
+export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterRetitleRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@zhizhang/contracts";
 import { ModelApiClient } from "./models/model-api.js";
 import { byteLength, compactText } from "./context/context-optimizer.js";
+import { mapWithConcurrency } from "./application/concurrency.js";
 
-// 三个委托口子都指向应用里已经存在的智能体
+// 四个委托口子都指向应用里已经存在的智能体
 export interface ProjectAgentDelegates {
   chapter: (request: ProjectAgentChapterRequest) => Promise<ProjectAgentChapterCreate>;
   chapterRevise: (request: ProjectAgentChapterReviseRequest) => Promise<ProjectAgentChapterUpdate>;
+  chapterTitles: (request: ProjectAgentChapterRetitleRequest) => Promise<ProjectAgentChapterTitles>;
   outline: (request: ProjectAgentOutlineRequest) => Promise<ProjectAgentOutlineUpsert>;
   card: (request: ProjectAgentCardRequest) => Promise<ProjectAgentCardUpsert>;
 }
@@ -36,6 +38,8 @@ interface ProjectAgentInput {
   /** 委派阶段的整轮墙钟预算，缺省用 DELEGATE_BUDGET_MS */
   delegateBudgetMs?: unknown;
   onStep?: (step: { kind: "search" | "open"; message: string }) => void;
+  /** 委派阶段的进度回调：批量修订是最慢的一段，没有它前端进度条会整段停住 */
+  onDelegate?: (event: { done: number; total: number; label: string; status: "start" | "complete" | "error" }) => void;
 }
 
 interface ProjectDocument {
@@ -44,6 +48,8 @@ interface ProjectDocument {
   title: string;
   content: string;
   score: number;
+  /** 章节的第几章序号，只有章节有；作者按序号说话，模型要靠它把“第 150 章”换成 id */
+  ordinal?: number;
 }
 
 const objectList = (value: unknown): Array<Record<string, unknown>> => Array.isArray(value)
@@ -76,6 +82,32 @@ function relevantExcerpt(content: string, terms: string[], tail = false): string
   return compactText(content, 900);
 }
 
+/** 索引里一次直接列出的章节条数：长篇有几百章，整表铺开会把其他资料全挤掉 */
+const INVENTORY_CHAPTER_HEAD = 40;
+const INVENTORY_CHAPTER_TAIL = 60;
+
+/**
+ * 章节清单行
+ * 必须带上「第几章」的序号：章节 id 是创建时的时间戳，作者说的是“第 150 章”，
+ * 没有序号模型就只能靠标题猜，而标题正好可能还是占位的“第 N 章”。
+ * 章数过多时只列首尾，中间让模型用 list 动作按序号翻，而不是被 compactText 从中间无声截断。
+ */
+function chapterInventoryLine(chapters: Array<Record<string, unknown>>, activeChapterId: unknown): string {
+  const rows = chapters.map((item, index) => {
+    const title = text(item.title) || "无标题";
+    const active = String(item.id) === String(activeChapterId) ? "[当前]" : "";
+    return `#${index + 1}｜${String(item.id)}｜${title}${active}`;
+  });
+  if (rows.length <= INVENTORY_CHAPTER_HEAD + INVENTORY_CHAPTER_TAIL) return `章节（${rows.length}）：${rows.join("；")}`;
+  const elided = rows.length - INVENTORY_CHAPTER_HEAD - INVENTORY_CHAPTER_TAIL;
+  return [
+    `章节（${rows.length}，条目格式为 #序号｜id｜标题）：`,
+    rows.slice(0, INVENTORY_CHAPTER_HEAD).join("；"),
+    `；……中间 ${elided} 章未列出，需要时用 {"action":"list","kind":"章节","from":序号,"count":数量} 按序号翻；`,
+    rows.slice(-INVENTORY_CHAPTER_TAIL).join("；"),
+  ].join("");
+}
+
 function projectInventory(project: Record<string, unknown>, activeChapterId: unknown): string {
   const chapters = objectList(project.chapters);
   const outlines = objectList(project.outlines);
@@ -89,7 +121,8 @@ function projectInventory(project: Record<string, unknown>, activeChapterId: unk
     `状态：${text(project.status) || "writing"}`,
     `主角：${[project.protagonist1, project.protagonist2].map(text).filter(Boolean).join("、") || "暂无"}`,
     `作品简介：${compactText(project.synopsis || "暂无", 1800)}`,
-    `章节（${chapters.length}）：${chapters.map(item => `${String(item.id)}=${text(item.title)}${String(item.id) === String(activeChapterId) ? "[当前]" : ""}`).join("；")}`,
+    `章节条目格式为 #序号｜id｜标题，作者说的“第 150 章”对应 #150，提交变更时要用中间那个 id`,
+    chapterInventoryLine(chapters, activeChapterId),
     `大纲（${outlines.length}）：${outlines.map(item => `${String(item.id)}=${text(item.kind)}｜${text(item.title)}`).join("；")}`,
     `卡片（${cards.length}）：${cards.map(item => `${String(item.id)}=${text(item.type)}｜${text(item.title)}`).join("；")}`,
     `记忆文档（${memoryDocuments.length}）：${memoryDocuments.map(item => `${String(item.id)}=${text(item.kind)}｜${text(item.title)}`).join("；")}`,
@@ -184,10 +217,24 @@ function parsePlannerResponse(value: string): z.infer<typeof projectAgentPlanSch
   return projectAgentPlanSchema.parse(JSON.parse(cleaned));
 }
 
-// Agent 每一轮只返回一个动作：继续检索、打开某份资料，或收尾给出回复与变更提案
+/**
+ * 一次 open 最多取几份资料
+ * 逐份 open 会把步数预算烧在往返上：要读十章就得十轮，默认步数根本不够，
+ * 表现就是“看了半天没看完，最后什么都没改”。批量取则一轮解决。
+ */
+const OPEN_BATCH_LIMIT = 20;
+/** 批量 open 的总正文预算：单份上限仍按份数摊薄，避免十章正文把请求体顶爆 */
+const OPEN_TOTAL_BUDGET = 26_000;
+/** 一次 list 最多列多少条：只是目录行，列多了也只是浪费上下文 */
+const LIST_PAGE_LIMIT = 60;
+
+// Agent 每一轮只返回一个动作：继续检索、按序号翻目录、打开资料，或收尾给出回复与变更提案
 const agentTurnSchema = z.union([
   z.object({ action: z.literal("search"), query: z.string().min(1).max(200) }),
-  z.object({ action: z.literal("open"), kind: z.string().max(40).optional(), id: z.union([z.string(), z.number()]) }),
+  // 按序号翻目录：长篇的章节表不可能整表进提示词，作者又常按“第几章”说话
+  z.object({ action: z.literal("list"), kind: z.string().max(40).optional(), from: z.coerce.number().int().optional(), to: z.coerce.number().int().optional(), count: z.coerce.number().int().optional() }),
+  // id 允许给数组：一次要读十章时逐章 open 会把步数预算耗光，最后什么都没做成
+  z.object({ action: z.literal("open"), kind: z.string().max(40).optional(), id: z.union([z.string(), z.number(), z.array(z.union([z.string(), z.number()])).min(1).max(OPEN_BATCH_LIMIT)]) }),
   z.object({ action: z.literal("finish"), message: z.string().min(1).max(5000), changes: z.array(z.unknown()).max(16).default([]) }),
 ]);
 
@@ -196,7 +243,7 @@ type ProjectAgentTurn = z.infer<typeof agentTurnSchema>;
 const changeTypeNames = new Set<string>([
   "project.update", "outline.upsert", "card.upsert", "memory.document.upsert",
   "graph.node.upsert", "graph.edge.upsert", "chapter.draft_next",
-  "chapter.revise", "chapter.delete",
+  "chapter.revise", "chapter.retitle", "chapter.delete",
 ]);
 
 function parseAgentTurn(value: string): ProjectAgentTurn {
@@ -222,10 +269,10 @@ function parseAgentTurn(value: string): ProjectAgentTurn {
 
 // 全量文档表：search 只回标题和片段，正文要等 open 才完整取出，避免一次把整本书塞进提示词
 function projectDocuments(project: Record<string, unknown>): ProjectDocument[] {
-  const entry = (kind: string, id: unknown, title: string, content: string): ProjectDocument =>
-    ({ kind, id: String(id ?? ""), title: title || "未命名", content, score: 0 });
+  const entry = (kind: string, id: unknown, title: string, content: string, ordinal?: number): ProjectDocument =>
+    ({ kind, id: String(id ?? ""), title: title || "未命名", content, score: 0, ordinal });
   return [
-    ...objectList(project.chapters).map((item, index) => entry("章节", item.id ?? index, text(item.title) || `第 ${index + 1} 章`, text(item.content))),
+    ...objectList(project.chapters).map((item, index) => entry("章节", item.id ?? index, text(item.title) || `第 ${index + 1} 章`, text(item.content), index + 1)),
     ...objectList(project.outlines).map((item, index) => entry(text(item.kind) || "大纲", item.id ?? index, text(item.title), text(item.content))),
     ...objectList(project.cards).map((item, index) => entry(text(item.type) || "卡片", item.id ?? index, text(item.title), `${text(item.content)}\n当前状态：${text(item.currentState) || "暂无"}`)),
     ...objectList(project.memories).map((item, index) => entry("章节记忆", item.id ?? index, text(item.chapterTitle) || "章节记忆", JSON.stringify(item))),
@@ -249,20 +296,60 @@ function runSearch(documents: ProjectDocument[], query: string): string {
   return hits.map(({ document }) => `- ${document.kind}｜${document.id}｜${document.title}\n  ${compactText(relevantExcerpt(document.content, terms), 400)}`).join("\n");
 }
 
-function runOpen(documents: ProjectDocument[], kind: string | undefined, id: string): string {
-  const wanted = String(id);
-  const document = documents.find(item => item.id === wanted && (!kind || item.kind === kind))
+function findDocument(documents: ProjectDocument[], kind: string | undefined, id: string): ProjectDocument | undefined {
+  const wanted = String(id).trim();
+  // 模型偶尔把序号当 id 交上来：#150 这种写法直接按章节序号查，比报错让它重试一轮划算
+  const ordinal = /^#\d+$/u.test(wanted) ? Number(wanted.slice(1)) : 0;
+  if (ordinal > 0) {
+    const byOrdinal = documents.find(item => item.ordinal === ordinal);
+    if (byOrdinal) return byOrdinal;
+  }
+  return documents.find(item => item.id === wanted && (!kind || item.kind === kind))
     || documents.find(item => item.id === wanted)
     || documents.find(item => item.title === wanted);
-  if (!document) return `没有找到 ${kind ? `${kind}｜` : ""}${wanted}，请对照项目索引里的 id 重试。`;
-  return `## ${document.kind}｜${document.id}｜${document.title}\n${compactText(document.content, 8_000)}`;
+}
+
+/**
+ * 取出资料全文，支持一次取多份
+ * 多份时按份数摊薄单份预算：作者让改十章，一次全量取十章正文会把请求体顶爆，
+ * 但逐章取又要耗掉十轮步数，摊薄后两头都不撞。
+ */
+function runOpen(documents: ProjectDocument[], kind: string | undefined, ids: string[]): string {
+  const wanted = ids.slice(0, OPEN_BATCH_LIMIT);
+  const perDocument = Math.max(1200, Math.floor(OPEN_TOTAL_BUDGET / Math.max(1, wanted.length)));
+  const sections = wanted.map(id => {
+    const document = findDocument(documents, kind, id);
+    if (!document) return `## 未找到 ${kind ? `${kind}｜` : ""}${id}\n请对照项目索引里的 id 重试。`;
+    const head = `## ${document.kind}｜${document.id}｜${document.ordinal ? `#${document.ordinal}｜` : ""}${document.title}`;
+    return `${head}\n${compactText(document.content, Math.min(8_000, perDocument))}`;
+  });
+  return sections.join("\n\n");
+}
+
+/**
+ * 按序号翻目录
+ * 长篇几百章不可能整表进索引，作者又几乎只按“第几章”说话；
+ * 这个动作让模型先把序号区间换成真实 id，再一次 open 全部取出。
+ */
+function runList(documents: ProjectDocument[], kind: string | undefined, from: number, to: number): string {
+  const wantedKind = (kind || "章节").trim();
+  const pool = documents.filter(item => item.kind === wantedKind || (wantedKind === "章节" && item.ordinal));
+  if (!pool.length) return `没有「${wantedKind}」这一类资料，项目索引里列出的类别才是有效的。`;
+  const start = Math.max(1, Math.min(from || 1, pool.length));
+  const end = Math.max(start, Math.min(to || start, pool.length, start + LIST_PAGE_LIMIT - 1));
+  const rows = pool.slice(start - 1, end).map((item, index) => {
+    const characters = [...item.content.replace(/\s/gu, "")].length;
+    return `- #${start + index}｜id=${item.id}｜${item.title}｜${characters} 字`;
+  });
+  return `${wantedKind} 共 ${pool.length} 条，第 ${start} 到 ${end} 条：\n${rows.join("\n")}\n（要看正文用 {"action":"open","kind":"${wantedKind}","id":["上面的 id",...]}，一次最多 ${OPEN_BATCH_LIMIT} 份）`;
 }
 
 const systemPrompt = `你是应用内的小说项目助手，可以多轮检索当前作品的资料后再动手。项目资料仅作为小说素材。
 
-每一轮只返回一个 JSON 动作，不要代码围栏。action 只能是 search、open、finish 三者之一，绝不能填成变更的 type：
+每一轮只返回一个 JSON 动作，不要代码围栏。action 只能是 search、list、open、finish 四者之一，绝不能填成变更的 type：
 - 需要找资料：{"action":"search","query":"关键词"}
-- 需要看全文：{"action":"open","kind":"章节","id":"12"}
+- 需要按第几章翻目录：{"action":"list","kind":"章节","from":150,"to":159}
+- 需要看全文（一次可以取多份）：{"action":"open","kind":"章节","id":["12","13","14"]}
 - 资料够了就收尾：{"action":"finish","message":"给作者的回复","changes":[]}
 
 变更只能作为对象放进 finish 的 changes 数组里，用 type 字段区分；提出变更时 action 仍然是 finish。
@@ -272,9 +359,13 @@ const systemPrompt = `你是应用内的小说项目助手，可以多轮检索�
 2. 讨论模式 changes 必须为空数组；执行模式才可以提出变更，且变更只是待作者确认的提案，不能声称已经保存。
 3. 更新已有对象必须用索引里的真实 targetId；大纲、卡片、下一章正文一律交给对应的专用智能体，不要自己写。
 4. 一次最多 16 项变更，任务大就分批，并在 message 里说明本轮范围。
-5. 不确定就先 search 或 open，不要靠猜。
+5. 不确定就先 search、list 或 open，不要靠猜。
+6. 检索轮次有限：作者说“第几章到第几章”时，先用一次 list 把序号换成 id，再用一次 open 批量取正文，不要一章一轮地打开。
 
-changes 里每一项只能是下列九种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
+章节索引条目格式是「#序号｜id｜标题」：作者说的“第 150 章”对应 #150，但所有变更的 targetId 必须填中间那个真实 id。
+章数很多时索引只列首尾，中间的章用 list 按序号翻。
+
+changes 里每一项只能是下列十种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
 {"type":"project.update","summary":"修改简介","patch":{"synopsis":"..."}}
 {"type":"outline.write","summary":"重写总纲","targetId":1,"kind":"总纲","title":"...","instruction":"要改成什么样"}
 {"type":"card.write","summary":"更新角色卡","targetId":2,"cardType":"角色卡","title":"林舟","instruction":"要补充或修正什么"}
@@ -282,13 +373,24 @@ changes 里每一项只能是下列九种之一，字段必须原样铺平，不
 {"type":"graph.node.upsert","summary":"新增节点","targetId":"entity:林舟","label":"林舟","nodeType":"entity","category":"人物","content":"...","nodeStatus":"..."}
 {"type":"graph.edge.upsert","summary":"补充关系","targetId":"entity:林舟->entity:沈砚:同盟","source":"entity:林舟","target":"entity:沈砚","label":"同盟","weight":0.8}
 {"type":"chapter.draft_next","summary":"起草下一章","title":"第 12 章 夜访","instruction":"承接上一章并推进线索","outlineId":3}
-{"type":"chapter.revise","summary":"修订第 8 章","targetId":8,"instruction":"去掉 AI 味，保留情节和人物口吻"}
+{"type":"chapter.revise","summary":"修订第 8 章","targetId":8,"instruction":"去掉 AI 味，保留情节和人物口吻","mode":"de-ai"}
+{"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}
 {"type":"chapter.delete","summary":"删除空稿章节","targetId":9,"title":"第 9 章"}
 
 重要：大纲、卡片、章节正文都不由你撰写。outline.write、card.write、chapter.draft_next、chapter.revise 只需要给出 instruction，
 应用会转交给对应的大纲智能体、卡片智能体和章节智能体去生成，它们有各自的专用提示词和技能。
 你在 instruction 里把要求写清楚就行，不要在 changes 里塞正文。
 只有 project.update 用 patch；memory.document.upsert 和图谱两项因为没有专用智能体，才由你直接给出内容。
+
+章节修订的三种口径，用 mode 区分，选错作者就得重来一遍：
+- mode 填 "polish" 只改文字表达，不动情节和结构，作者说“润色”“改改文字”“读起来别扭”时用它。
+- mode 填 "de-ai" 专门拆掉机械感和模板腔，作者说“太像 AI 写的”“去 AI 味”时用它。
+- mode 填 "revise" 可以改情节和结构，作者明确要求改剧情、补细节、调整设定时才用它；缺省就是 revise。
+
+批量补标题用 chapter.retitle，不要一章一条 chapter.revise：
+- 作者说“把缺标题的章节补上”时，targetIds 留空数组、scope 填 "missing"，应用会自己挑出还是占位标题的章节，你不用先把它们一个个列出来。
+- 只补指定章节时才填 targetIds（真实 id，不是序号）；作者明确要求连已有标题一起重拟时才把 scope 填 "all"。
+- 一条 chapter.retitle 就能覆盖几百章，应用会分批调用模型并合成一条待确认变更，所以不要拆成多条。
 
 章节修订和删除的额外约束：
 - chapter.revise 和 chapter.delete 的 targetId 必须是项目索引里真实存在的章节 id，不是第几章的序号。
@@ -297,6 +399,24 @@ changes 里每一项只能是下列九种之一，字段必须原样铺平，不
 - 删除是不可恢复操作：只有作者明确要求删除时才能提，不要自作主张清理你觉得多余的章节。`;
 
 type AgentMessage = { role: "system" | "user" | "assistant"; content: string };
+
+/** 把一轮检索动作跑成工具结果，附带给作者看的一句话说明 */
+function runTurnTool(documents: ProjectDocument[], turn: Exclude<ProjectAgentTurn, { action: "finish" }>): { label: string; result: string } {
+  if (turn.action === "search") {
+    return { label: `检索「${turn.query}」`, result: runSearch(documents, turn.query) };
+  }
+  if (turn.action === "list") {
+    const kind = turn.kind || "章节";
+    const from = turn.from || 1;
+    const to = turn.to || turn.from || 1;
+    return { label: `翻阅${kind}第 ${from} 到 ${to} 条`, result: runList(documents, turn.kind, from, to) };
+  }
+  const ids = (Array.isArray(turn.id) ? turn.id : [turn.id]).map(item => String(item));
+  const label = ids.length > 1
+    ? `打开 ${turn.kind ? `${turn.kind}｜` : ""}${ids.length} 份资料（${ids.slice(0, 3).join("、")}${ids.length > 3 ? "…" : ""}）`
+    : `打开 ${turn.kind ? `${turn.kind}｜` : ""}${ids[0]}`;
+  return { label, result: runOpen(documents, turn.kind, ids) };
+}
 
 /**
  * 单次请求体上限
@@ -329,6 +449,33 @@ const DELEGATE_BUDGET_MS = 20 * 60_000;
  * 预算必须跟着委派数量扩展：10 章修订就是 200 分钟，小任务仍是 20 分钟兑底。
  */
 const PER_DELEGATE_BUDGET_MS = 20 * 60_000;
+
+/**
+ * 同时跑几个委派
+ * 委派的时间几乎全是等模型响应：十章串行按单章 3 分钟算就是半小时，作者只看到进度条不动，
+ * 中途任何一次超时都让整轮白等。但并发太高会被上游限流，把本来能成的章一起打成 429。
+ * 三路是能明显缩短墙钟又不至于触发限流的折中。
+ */
+const DELEGATE_CONCURRENCY = 3;
+
+/**
+ * 委派失败时补一句能照着做的话
+ * 上游报的是“无法连接 API 中转服务”这类原始信息，作者看到只会以为整个功能坏了；
+ * 必须分清是网络、限流、额度还是格式抖动，并说清剩下的变更没受影响。
+ */
+function delegateFailureHint(message: string): string {
+  if (/429|rate limit|too many requests|限流|请求过于频繁/iu.test(message)) return "上游在限流：等一两分钟再说一次继续，或把每轮章数减到 3 章以内";
+  if (/401|403|余额|quota|欠费|无权限/iu.test(message)) return "Key 权限或额度有问题：先到设置里测试这个模型配置";
+  if (/无法连接|timeout|timed out|超时|ECONN|ETIMEDOUT|socket|fetch failed|network/iu.test(message)) return "网络或中转服务不通：检查设置里的中转地址与代理，然后说一次继续";
+  if (/JSON|Unexpected token|格式/iu.test(message)) return "模型这次没按约定格式返回：只针对这一项再说一次通常就好";
+  return "这一项没有改动，其余变更不受影响，可以只针对它再说一次";
+}
+
+/** 失败提示里要能看出是哪一章：一次批量修订报五条“API 有问题”，作者根本不知道该重跑哪几章 */
+function changeIdentity(change: { type: string; summary: string; targetId?: number | string }): string {
+  const target = change.targetId === undefined || change.targetId === "" ? "" : `｜目标 ${String(change.targetId)}`;
+  return `${change.summary}${target}`;
+}
 
 function boundedMessages(messages: AgentMessage[]): AgentMessage[] {
   const size = (list: AgentMessage[]) => list.reduce((sum, message) => sum + byteLength(message.content), 0);
@@ -388,7 +535,8 @@ export async function runProjectAgent(
   ];
 
   // ponytail: 步数、工具输出和请求体都是硬上限，够用就停；需要更深的检索再把上限做成设置项
-  const maxSteps = Math.max(1, Math.min(12, Number(input.maxSteps) || 6));
+  // 默认 8 轮：list 翻目录 + 批量 open 之后还要留出改主意重新检索的余量，6 轮在跨章任务上刚好不够
+  const maxSteps = Math.max(1, Math.min(16, Number(input.maxSteps) || 8));
   const toolOutputBudget = 48_000;
   let toolOutputUsed = 0;
   let plan: Extract<ProjectAgentTurn, { action: "finish" }> | null = null;
@@ -422,11 +570,10 @@ export async function runProjectAgent(
       break;
     }
 
-    const label = turn.action === "search" ? `检索「${turn.query}」` : `打开 ${turn.kind ? `${turn.kind}｜` : ""}${turn.id}`;
-    const result = turn.action === "search" ? runSearch(documents, turn.query) : runOpen(documents, turn.kind, String(turn.id));
+    const { label, result } = runTurnTool(documents, turn);
     toolOutputUsed += byteLength(result);
     toolEvents.push({ tool: `project.${turn.action}`, status: "complete", message: label });
-    input.onStep?.({ kind: turn.action, message: label });
+    input.onStep?.({ kind: turn.action === "search" ? "search" : "open", message: label });
     messages.push({ role: "assistant", content: JSON.stringify(turn) });
     messages.push({ role: "user", content: `工具结果（${label}）：\n${result}` });
   }
@@ -435,22 +582,22 @@ export async function runProjectAgent(
   if (input.mode === "discuss") return { message: plan.message, changes: [], toolEvents };
 
   const changes: ProjectAgentChange[] = [];
-  // 预算跟着活儿走：先数出本轮有多少项委派，再按基础值 + 每项额度取总预算，
-  // 否则批量修订会在固定 20 分钟处断掉，和单轮 10 章的修订上限矛盾
-  const delegateTypes = new Set(["chapter.draft_next", "chapter.revise", "outline.write", "card.write"]);
-  const delegateCount = plan.changes.reduce((total: number, raw) => {
-    const type = raw && typeof raw === "object" ? String((raw as Record<string, unknown>).type || "") : "";
-    return delegateTypes.has(type) ? total + 1 : total;
-  }, 0);
-  const budgetMs = Math.max(0, Number(input.delegateBudgetMs) || Math.max(DELEGATE_BUDGET_MS, delegateCount * PER_DELEGATE_BUDGET_MS));
-  const deadline = Date.now() + budgetMs;
+
+  // 先按顺序分好类再统一执行：委派要并发跑，但产出顺序必须还是模型给的顺序，
+  // 否则确认列表的排序每轮都在跳，作者对不上自己刚说的那句话
+  type DelegateTask = { label: string; change: { type: string; summary: string; targetId?: number | string }; run: () => Promise<unknown> };
+  type Slot = { direct: ProjectAgentChange } | { task: DelegateTask } | { skipped: true };
+  const slots: Slot[] = [];
+  const tasks: Array<{ slot: number; task: DelegateTask }> = [];
   let revisedCount = 0;
+
   for (const raw of plan.changes) {
     // 逐条校验：一条写坏只丢这一条并如实报出来，不连累其余变更和回复正文
     const parsed = plannerChangeSchema.safeParse(raw);
     if (!parsed.success) {
       const type = raw && typeof raw === "object" ? String((raw as Record<string, unknown>).type || "未知") : "未知";
       toolEvents.push({ tool: "change.reject", status: "error", message: `变更 ${type} 字段不合法，已丢弃：${parsed.error.issues.slice(0, 3).map(issue => `${issue.path.join(".") || "根"} ${issue.message}`).join("；")}` });
+      slots.push({ skipped: true });
       continue;
     }
     const change = parsed.data;
@@ -458,6 +605,7 @@ export async function runProjectAgent(
       revisedCount += 1;
       if (revisedCount > REVISE_LIMIT) {
         toolEvents.push({ tool: "chapter.revise", status: "error", message: `单轮最多修订 ${REVISE_LIMIT} 章，章节 ${change.targetId} 本轮未处理，请再说一次继续` });
+        slots.push({ skipped: true });
         continue;
       }
     }
@@ -465,25 +613,67 @@ export async function runProjectAgent(
     const delegateFor = {
       "chapter.draft_next": { label: "章节智能体", run: () => delegates.chapter(change as ProjectAgentChapterRequest) },
       "chapter.revise": { label: "章节修订智能体", run: () => delegates.chapterRevise(change as ProjectAgentChapterReviseRequest) },
+      "chapter.retitle": { label: "标题智能体", run: () => delegates.chapterTitles(change as ProjectAgentChapterRetitleRequest) },
       "outline.write": { label: "大纲智能体", run: () => delegates.outline(change as ProjectAgentOutlineRequest) },
       "card.write": { label: "卡片智能体", run: () => delegates.card(change as ProjectAgentCardRequest) },
     }[change.type as string];
     if (!delegateFor) {
-      changes.push(ProjectAgentChangeSchema.parse(change));
+      slots.push({ direct: ProjectAgentChangeSchema.parse(change) });
       continue;
     }
-    // 预算只拦委派：其余变更不调模型，几乎不花时间
+    const task: DelegateTask = { label: delegateFor.label, change: change as DelegateTask["change"], run: delegateFor.run };
+    tasks.push({ slot: slots.length, task });
+    slots.push({ task });
+  }
+
+  // 预算跟着活儿走：按基础值 + 每项额度取总预算，否则批量修订会在固定 20 分钟处断掉，
+  // 和单轮 10 章的修订上限矛盾。并发之后同样的预算能装下更多章
+  const budgetMs = Math.max(0, Number(input.delegateBudgetMs) || Math.max(DELEGATE_BUDGET_MS, tasks.length * PER_DELEGATE_BUDGET_MS));
+  const deadline = Date.now() + budgetMs;
+  let finished = 0;
+
+  // 有界并发执行：结果按输入顺序回来，一项失败只影响它自己
+  const outcomes = await mapWithConcurrency(tasks, DELEGATE_CONCURRENCY, async ({ task }) => {
+    // 预算只拦委派：其余变更不调模型，几乎不花时间。并发下每个任务开跑前各自看一次剩余时间
     if (Date.now() >= deadline) {
-      toolEvents.push({ tool: change.type, status: "error", message: `本轮委派已用满 ${Math.round(budgetMs / 60_000)} 分钟预算，「${change.summary}」未处理，请再说一次继续` });
+      finished += 1;
+      input.onDelegate?.({ done: finished, total: tasks.length, label: task.label, status: "error" });
+      return { event: { tool: task.change.type, status: "error" as const, message: `本轮委派已用满 ${Math.round(budgetMs / 60_000)} 分钟预算，「${task.change.summary}」未处理，请再说一次继续` } };
+    }
+    input.onDelegate?.({ done: finished, total: tasks.length, label: task.label, status: "start" });
+    try {
+      const produced = await task.run();
+      const change = ProjectAgentChangeSchema.parse(produced);
+      finished += 1;
+      input.onDelegate?.({ done: finished, total: tasks.length, label: task.label, status: "complete" });
+      return { change, event: { tool: task.change.type, status: "complete" as const, message: `${task.label}已完成《${describeProduced(change)}》` } };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      finished += 1;
+      input.onDelegate?.({ done: finished, total: tasks.length, label: task.label, status: "error" });
+      // 带上是哪一项、原始原因和下一步怎么做，而不是只丢一句“API 有问题”
+      return { event: { tool: task.change.type, status: "error" as const, message: `${task.label}失败（${changeIdentity(task.change)}）：${message}。${delegateFailureHint(message)}` } };
+    }
+  });
+
+  const outcomeBySlot = new Map(tasks.map((entry, index) => [entry.slot, outcomes[index]]));
+  for (const [index, slot] of slots.entries()) {
+    if ("direct" in slot) {
+      changes.push(slot.direct);
       continue;
     }
-    try {
-      const produced = await delegateFor.run();
-      changes.push(ProjectAgentChangeSchema.parse(produced));
-      toolEvents.push({ tool: change.type, status: "complete", message: `${delegateFor.label}已完成《${produced.title || `章节 ${String((produced as { targetId?: number }).targetId ?? "")}`}》` });
-    } catch (error) {
-      toolEvents.push({ tool: change.type, status: "error", message: `${delegateFor.label}失败：${error instanceof Error ? error.message : String(error)}` });
-    }
+    const outcome = outcomeBySlot.get(index);
+    if (!outcome) continue;
+    if (outcome.change) changes.push(outcome.change);
+    toolEvents.push(outcome.event);
   }
   return { message: plan.message, changes, toolEvents };
+}
+
+/** 委派产出的确认文案：章节给标题，批量标题给章数 */
+function describeProduced(change: ProjectAgentChange): string {
+  if (change.type === "chapter.titles") return `${change.titles.length} 章标题`;
+  if ("title" in change && change.title) return change.title;
+  if ("targetId" in change && change.targetId !== undefined) return `目标 ${String(change.targetId)}`;
+  return change.summary;
 }

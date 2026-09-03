@@ -112,6 +112,18 @@ export const normalizeProjectAgentChange = (value: unknown, project: Project, in
     if (!targetId || !target || !content) return null;
     return { type, id, status, summary, targetId, title: projectAgentString(value.title, 160) || undefined, content, baseUpdatedAt: storedBase || target.updatedAt };
   }
+  if (type === 'chapter.titles') {
+    // 批量标题只保留真存在的章节；一次几百章，逐条做冲突快照没有意义，
+    // 应用时按章重新取当前标题和正文，落地阶段自然拿到最新状态
+    const titles = Array.isArray(value.titles) ? value.titles.filter(projectAgentRecord).flatMap(item => {
+      const targetId = projectAgentNumber(item.targetId);
+      const title = projectAgentString(item.title, 160);
+      if (!targetId || !title || !project.chapters.some(chapter => chapter.id === targetId)) return [];
+      return [{ targetId, title, stripHeading: item.stripHeading === true }];
+    }).slice(0, 400) : [];
+    if (!titles.length) return null;
+    return { type, id, status, summary, titles } as ProjectAgentChange;
+  }
   if (type === 'chapter.delete') {
     const targetId = projectAgentNumber(value.targetId);
     const target = targetId ? project.chapters.find(item => item.id === targetId) : undefined;

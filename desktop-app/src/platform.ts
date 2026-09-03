@@ -2,6 +2,7 @@ import { invoke as nativeInvoke } from '@tauri-apps/api/core';
 import type { AgentRpcCall } from '@zhizhang/contracts';
 import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@zhizhang/model-protocol';
 import { fitMessagesToTokenBudget } from './utils/token-budget';
+import { applyDraftChapterTitle, isPlaceholderChapterTitle, splitChapterTitleHeading } from './utils/text';
 import { mobileBaiduStatus, mobileBaiduLoginURL, mobileBaiduCompleteLogin, mobileBaiduBackup, mobileBaiduListBackups, mobileBaiduRestore } from './platform/mobile/cloud-sync';
 import { mobileFanqieSearch, mobileNovelCatchCategories, mobileRankingFetch, mobileQianyueSources, mobileSearchOneQianyueSource, mobileQianyueDownload, mobileQianyueDownloadChapter, mobileSearchAllQianyue } from './platform/mobile/book-sources';
 
@@ -523,12 +524,101 @@ const mobileProjectAgentContext = (params: MobileParams) => {
   };
 };
 
+/** 一次模型请求里塞多少章：与 agent-runtime 的 TITLE_BATCH_SIZE 保持一致 */
+const mobileTitleBatchSize = 20;
+/** 单次批量补标题最多处理多少章：手机端串行跑，章数过多会等到用户放弃 */
+const mobileTitleLimit = 200;
+/** 整章改写的三种口径，与 text.transform 的 mode 一致 */
+const mobileReviseModes: Record<string, string> = { revise: '修订', polish: '润色', 'de-ai': '去 AI 味' };
+
+const mobileTitleSystemPrompt = `你是中文长篇网文的责任编辑，正在为已经写好的章节补标题。
+
+要求：
+1. 每个标题只概括该章真正发生的事，不得使用别章的情节，不得凭空发明设定。
+2. 4 到 14 个汉字，不带“第几章”前缀，不带书名号、引号、句号和省略号。
+3. 同一批里的标题必须互不相同，不要都写成“危机”“转机”这类空词。
+4. 严格返回 JSON 对象：{"titles":[{"id":章节id,"title":"标题"}]}，不要代码围栏，不要解释。
+5. 给了几章就返回几条，id 必须原样抄回，不要新增或漏掉章节。`;
+
+/** 正文摘录：开头交代场景、结尾交代钩子，标题基本只靠这两段就能定 */
+const mobileTitleExcerpt = (content: string) => {
+  const text = content.trim().replace(/\s*\n\s*\n\s*/gu, '\n');
+  if (text.length <= 900) return text;
+  return `${text.slice(0, 620)}\n……\n${text.slice(-260)}`;
+};
+
+/**
+ * 移动端批量补章节标题
+ * 与 agent-runtime 同一套两段式：先把旧版本遗留在正文开头的 # 标题行直接捡回来（零模型调用），
+ * 剩下真的没有名字的章节再分批交给模型命名；一批失败只丢这一批，其余章节照常返回
+ */
+const mobileChapterTitles = async (params: MobileParams, request: Record<string, unknown>, chapters: unknown[], projectTitle: string, runId: string) => {
+  const rows = chapters.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>;
+  const wanted = (Array.isArray(request.targetIds) ? request.targetIds : []).map(Number).filter(value => Number.isInteger(value) && value > 0);
+  const picked = (wanted.length
+    ? rows.filter(row => wanted.includes(Number(row.id)))
+    : rows.filter(row => request.scope === 'all' || isPlaceholderChapterTitle(stringValue(row.title)))
+  ).slice(0, mobileTitleLimit);
+  if (!picked.length) throw new Error(wanted.length ? '指定的章节都不存在' : '没有需要补标题的章节，所有章节都已经有名字');
+  const entries: Array<{ targetId: number; title: string; stripHeading?: boolean }> = [];
+  const failures: string[] = [];
+  const pending: Array<Record<string, unknown>> = [];
+  for (const row of picked) {
+    const content = stringValue(row.content);
+    const draft = splitChapterTitleHeading(content);
+    if (draft.title) {
+      // 正文开头本来就写着标题：搬到标题栏并让应用把那一行移走，不需要问模型
+      entries.push({ targetId: Number(row.id), title: applyDraftChapterTitle(stringValue(row.title), draft.title).slice(0, 160), stripHeading: true });
+      continue;
+    }
+    if (content.trim()) pending.push(row);
+    else failures.push(`章节 ${Number(row.id)} 没有正文，无法起名`);
+  }
+  const recovered = entries.length;
+  const extra = stringValue(request.instruction).trim() ? `\n作者额外要求：${stringValue(request.instruction).trim()}` : '';
+  for (let index = 0; index < pending.length; index += mobileTitleBatchSize) {
+    const batch = pending.slice(index, index + mobileTitleBatchSize);
+    emitProgress(runId, { type: 'progress', data: { step: 'chapter-titles', progress: Math.min(72, 40 + Math.round(index / Math.max(1, pending.length) * 32)), message: `正在为 ${batch.length} 章生成标题（已完成 ${recovered + index} / ${picked.length}）` } });
+    try {
+      const listing = batch.map(row => `### id=${Number(row.id)}（当前：${stringValue(row.title).trim() || '无标题'}）\n${mobileTitleExcerpt(stringValue(row.content))}`).join('\n\n');
+      const response = await mobileChat({ ...params, runId: runId ? `${runId}:titles-${index}` : '', maxOutputTokens: 1300 }, [
+        { role: 'system', content: mobileTitleSystemPrompt },
+        { role: 'user', content: `《${projectTitle || '未命名小说'}》需要补标题的章节共 ${batch.length} 章。${extra}\n\n${listing}` },
+      ], undefined, true);
+      const parsed = parseJSON<{ titles?: unknown }>(response.content);
+      const produced = Array.isArray(parsed?.titles) ? parsed.titles : [];
+      const byId = new Map(batch.map(row => [String(Number(row.id)), row]));
+      let accepted = 0;
+      for (const row of produced) {
+        if (!row || typeof row !== 'object') continue;
+        const record = row as Record<string, unknown>;
+        const target = byId.get(String(Number(record.id ?? record.targetId ?? 0)));
+        const name = stringValue(record.title).trim();
+        if (!target || !name) continue;
+        const title = applyDraftChapterTitle(stringValue(target.title), name);
+        if (title.trim() === stringValue(target.title).trim()) continue;
+        entries.push({ targetId: Number(target.id), title: title.slice(0, 160) });
+        accepted += 1;
+      }
+      if (accepted < batch.length) failures.push(`有 ${batch.length - accepted} 章模型没给出可用标题，可以再说一次只处理这几章`);
+    } catch (error) {
+      failures.push(`一批 ${batch.length} 章命名失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  if (!entries.length) throw new Error(failures[0] || '没能生成任何标题');
+  const detail = [recovered ? `${recovered} 章从正文开头找回` : '', entries.length - recovered ? `${entries.length - recovered} 章由模型命名` : '', ...failures].filter(Boolean).join('；');
+  return {
+    change: { type: 'chapter.titles', summary: `${stringValue(request.summary, '批量补标题')}（${entries.length} 章：${detail}）`.slice(0, 200), titles: entries },
+    message: `已生成 ${entries.length} 章标题${detail ? `：${detail}` : ''}`,
+  };
+};
+
 const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const mode = params.mode === 'execute' ? 'execute' : 'discuss';
   const runId = stringValue(params.runId);
   emitProgress(runId, { type: 'progress', data: { step: 'project-search', progress: 8, message: '正在检索当前小说资料' } });
-  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next, chapter.revise, chapter.delete';
-  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样"}，单轮最多 3 章；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
+  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next, chapter.revise, chapter.retitle, chapter.delete';
+  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样","mode":"revise|polish|de-ai"}，只改文字用 polish，拆机械感用 de-ai，可以动情节用 revise，单轮最多 3 章；作者要成批补章节标题时使用 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}，targetIds 留空表示按 scope 自动挑（missing 只补占位标题的章节，all 重命名全部），这一项自己会处理几百章，不要再逐章提；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
   emitProgress(runId, { type: 'progress', data: { step: 'project-plan', progress: 22, message: '正在分析请求并制定操作计划' } });
   const response = await mobileChat({ ...params, maxOutputTokens: 6500 }, [
     { role: 'system', content: '保持小说资料一致，只返回约定 JSON；所有修改都只是待确认提案。' },
@@ -543,37 +633,50 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const outlines = Array.isArray(project.outlines) ? project.outlines : [];
   for (const item of planned) {
     const kind = item && typeof item === 'object' ? (item as Record<string, unknown>).type : '';
-    if (kind !== 'chapter.draft_next' && kind !== 'chapter.revise') {
+    if (kind !== 'chapter.draft_next' && kind !== 'chapter.revise' && kind !== 'chapter.retitle') {
       changes.push(item);
       continue;
     }
     const request = item as Record<string, unknown>;
     const { project: _project, history: _history, instruction: _projectInstruction, mode: _projectMode, ...modelParams } = params;
+    if (kind === 'chapter.retitle') {
+      // 批量补标题只回一条 chapter.titles 变更：几百章不能各自占一项，也不能把正文回传
+      try {
+        const result = await mobileChapterTitles(modelParams, request, chapters, stringValue(project.title), runId);
+        changes.push(result.change);
+        toolEvents.push({ tool: 'chapter.retitle', status: 'complete', message: result.message });
+      } catch (error) {
+        toolEvents.push({ tool: 'chapter.retitle', status: 'error', message: `批量补标题失败：${error instanceof Error ? error.message : String(error)}` });
+      }
+      continue;
+    }
     if (kind === 'chapter.revise') {
-      // 修订走 text.transform 的 revise 模式，与桌面端同一条路径
+      // 修订走 text.transform 的三种口径，与桌面端同一条路径
+      const reviseMode = mobileReviseModes[String(request.mode || 'revise')] ? String(request.mode || 'revise') : 'revise';
+      const reviseLabel = mobileReviseModes[reviseMode];
       const targetId = Number(request.targetId);
       const target = chapters.find(entry => entry && typeof entry === 'object' && Number((entry as Record<string, unknown>).id) === targetId) as Record<string, unknown> | undefined;
       try {
         if (!target) throw new Error(`找不到待修订的章节 ID ${targetId}`);
         const original = stringValue(target.content).trim();
         if (!original) throw new Error(`章节《${stringValue(target.title)}》没有正文可修订`);
-        emitProgress(runId, { type: 'progress', data: { step: 'chapter-revise', progress: 36, message: `正在修订《${stringValue(target.title, '章节')}》` } });
+        emitProgress(runId, { type: 'progress', data: { step: 'chapter-revise', progress: 36, message: `正在${reviseLabel}《${stringValue(target.title, '章节')}》` } });
         const revised = await mobileAgentRpc<Record<string, unknown>>('text.transform', {
           ...modelParams,
           runId: runId ? `${runId}:revise-${targetId}` : '',
           maxOutputTokens: 8000,
-          mode: 'revise',
+          mode: reviseMode,
           instruction: stringValue(request.instruction),
           content: original,
           projectTitle: project.title,
           chapterTitle: target.title,
         });
         const revisedContent = stringValue(revised.content).trim();
-        if (!revisedContent) throw new Error('修订智能体没有返回可用正文');
-        changes.push({ type: 'chapter.update', summary: stringValue(request.summary, '修订章节'), targetId, content: revisedContent });
-        toolEvents.push({ tool: 'chapter.revise', status: 'complete', message: `《${stringValue(target.title, '章节')}》已修订` });
+        if (!revisedContent) throw new Error(`${reviseLabel}智能体没有返回可用正文`);
+        changes.push({ type: 'chapter.update', summary: stringValue(request.summary, `${reviseLabel}章节`), targetId, content: revisedContent });
+        toolEvents.push({ tool: 'chapter.revise', status: 'complete', message: `《${stringValue(target.title, '章节')}》已${reviseLabel}` });
       } catch (error) {
-        toolEvents.push({ tool: 'chapter.revise', status: 'error', message: error instanceof Error ? error.message : String(error) });
+        toolEvents.push({ tool: 'chapter.revise', status: 'error', message: `${reviseLabel}失败（${stringValue(request.summary, '章节')}｜目标 ${targetId}）：${error instanceof Error ? error.message : String(error)}` });
       }
       continue;
     }
@@ -598,9 +701,14 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
         memoryDocuments: Array.isArray(project.memoryDocuments) ? project.memoryDocuments : [],
         knowledgeGraph: { nodes: project.graphNodes || [], edges: project.graphEdges || [] },
       });
-      const content = stringValue(drafted.draftContent || drafted.content).trim();
+      // 非 JSON 回退分支不会拆标题，这里再拆一次；拆分幂等，已拆过的正文原样返回
+      const draft = splitChapterTitleHeading(stringValue(drafted.draftContent || drafted.content));
+      const content = draft.content;
       if (!content) throw new Error('章节智能体没有返回可用正文');
-      changes.push({ type: 'chapter.create', summary: stringValue(request.summary, '起草下一章'), title: stringValue(request.title, `第 ${chapters.length + 1} 章`), content, chapterPlan: stringValue(drafted.chapterPlan), chapterSummary: stringValue(drafted.summary) });
+      // 项目 Agent 没给章节起名时，用模型写在正文开头的标题补上占位章号，别让标题栏停在“第 N 章”
+      const placeholderTitle = stringValue(request.title, `第 ${chapters.length + 1} 章`);
+      const title = applyDraftChapterTitle(placeholderTitle, draft.title || stringValue(drafted.chapterTitle)).slice(0, 160);
+      changes.push({ type: 'chapter.create', summary: stringValue(request.summary, '起草下一章'), title, content, chapterPlan: stringValue(drafted.chapterPlan), chapterSummary: stringValue(drafted.summary) });
       toolEvents.push({ tool: 'chapter.draft_next', status: 'complete', message: '章节草稿已生成' });
     } catch (error) {
       toolEvents.push({ tool: 'chapter.draft_next', status: 'error', message: error instanceof Error ? error.message : String(error) });
@@ -771,7 +879,9 @@ const mobileAgentRpc = async <T>(method: string, params: MobileParams): Promise<
   if (parsed) {
     if (method === 'memory.write') return normalizeMobileMemoryResult(parsed, stringValue(params.content)) as T;
     if (method === 'chapter.write') {
-      return { ...parsed, draftContent: stringValue(parsed.draftContent || parsed.content), summary: stringValue(parsed.summary) } as T;
+      // 章节标题属于标题栏：模型常在正文开头补一道 # 标题，拆出来放进 chapterTitle，正文只留纯文本
+      const draft = splitChapterTitleHeading(stringValue(parsed.draftContent || parsed.content));
+      return { ...parsed, draftContent: draft.content, chapterTitle: draft.title, summary: stringValue(parsed.summary) } as T;
     }
     return parsed as T;
   }

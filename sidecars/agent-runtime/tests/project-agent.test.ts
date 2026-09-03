@@ -18,7 +18,17 @@ const project = {
   graphEdges: [],
 };
 
-const delegates = () => ({ chapter: vi.fn(), chapterRevise: vi.fn(), outline: vi.fn(), card: vi.fn() });
+const delegates = () => ({ chapter: vi.fn(), chapterRevise: vi.fn(), chapterTitles: vi.fn(), outline: vi.fn(), card: vi.fn() });
+
+// 长篇：作者真实的书有一百多章，id 是创建时的时间戳，标题多半还是创建时的占位
+const bigProject = {
+  ...project,
+  chapters: Array.from({ length: 180 }, (_, index) => ({
+    id: 1_700_000_000_000 + index + 1,
+    title: `第 ${index + 1} 章`,
+    content: `第 ${index + 1} 章的正文：林舟继续核对码头仓库的档案，并记下新的疑点。`,
+  })),
+};
 
 const clientWith = (content: string) => ({
   chat: vi.fn().mockResolvedValue({ content, model: "test" }),
@@ -295,7 +305,7 @@ describe("project agent", () => {
   it("整轮委派超预算后停手，剩余变更如实报出", async () => {
     // 回归：一轮最多 16 项委派，每项都要跑完整的正文生成，串行下来可能几十分钟不返回
     const chat = vi.fn().mockResolvedValue({
-      content: JSON.stringify({ action: "finish", message: "开始批量起草。", changes: Array.from({ length: 4 }, (_, index) => ({
+      content: JSON.stringify({ action: "finish", message: "开始批量起草。", changes: Array.from({ length: 6 }, (_, index) => ({
         type: "chapter.draft_next", summary: `起草 ${index + 1}`, title: `第 ${index + 3} 章`, instruction: "承接上一章",
       })) }),
       model: "test",
@@ -308,9 +318,9 @@ describe("project agent", () => {
       mode: "execute", instruction: "一口气把后面几章都写了", project, delegateBudgetMs: 5,
     }, { chat } as unknown as ModelApiClient, { ...delegates(), chapter });
 
-    // 第一项在预算内开跑，跑完就超时，后面三项不再发请求
-    expect(chapter).toHaveBeenCalledOnce();
-    expect(result.changes).toHaveLength(1);
+    // 并发三路：开头三项在预算内同时开跑，跑完就超时，后面三项不再发请求
+    expect(chapter).toHaveBeenCalledTimes(3);
+    expect(result.changes).toHaveLength(3);
     const skipped = result.toolEvents.filter(event => event.tool === "chapter.draft_next" && event.status === "error");
     expect(skipped).toHaveLength(3);
     expect(skipped[0].message).toContain("未处理");
@@ -358,5 +368,161 @@ describe("project agent", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("章节索引带序号，作者说的“第 150 章”能对上真实 id", () => {
+    // 回归：索引只印 id=标题，而 id 是创建时的时间戳；作者说“第 150 章”时模型只能瞎猜
+    const context = buildProjectAgentContext({
+      mode: "discuss",
+      instruction: "看一下第 150 章讲了什么",
+      project: bigProject,
+      contextWindowKTokens: 128,
+    });
+
+    expect(context.packet).toContain("#150｜1700000000150｜第 150 章");
+    expect(context.packet).toContain("提交变更时要用中间那个 id");
+  });
+
+  it("长书索引从中间省略时给出翻页办法，而不是默默丢掉中段", () => {
+    const context = buildProjectAgentContext({
+      mode: "discuss",
+      instruction: "整本书的结构梳理一下",
+      project: bigProject,
+      contextWindowKTokens: 128,
+    });
+
+    // 首尾保留、中段明确说明省了多少，并指向 list
+    expect(context.packet).toContain("#1｜1700000000001");
+    expect(context.packet).toContain("#180｜1700000000180");
+    expect(context.packet).toMatch(/中间 \d+ 章未列出/u);
+    expect(context.packet).toContain("\"action\":\"list\"");
+  });
+
+  it("一次 list 翻到序号区间，一次 open 批量取回多章正文", async () => {
+    const turns = [
+      JSON.stringify({ action: "list", kind: "章节", from: 150, to: 152 }),
+      JSON.stringify({ action: "open", kind: "章节", id: ["1700000000150", "1700000000151", "1700000000152"] }),
+      JSON.stringify({ action: "finish", message: "三章都读过了。", changes: [] }),
+    ];
+    // messages 数组会被原地追加，mock.calls 事后看到的都是最终态，只能在调用当时抓下末条
+    const tails: string[] = [];
+    const chat = vi.fn().mockImplementation((messages: Array<{ content: string }>) => {
+      tails.push(messages.at(-1)?.content || "");
+      return Promise.resolve({ content: turns.shift(), model: "test" });
+    });
+
+    const result = await runProjectAgent({
+      mode: "discuss",
+      instruction: "把第 150 到 152 章读一遍",
+      project: bigProject,
+    }, { chat } as unknown as ModelApiClient, delegates());
+
+    expect(result.toolEvents.map(event => event.tool)).toEqual(["project.context", "project.list", "project.open"]);
+    // list 只回序号、id 和字数，不回正文
+    expect(tails[1]).toContain("#150｜id=1700000000150");
+    expect(tails[1]).not.toContain("第 150 章的正文");
+    // 一次 open 三章正文全部回灌，不需要三轮
+    for (const ordinal of [150, 151, 152]) {
+      expect(tails[2]).toContain(`第 ${ordinal} 章的正文`);
+    }
+  });
+
+  it("批量补标题交给标题智能体，只产出一条 chapter.titles", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "开始补标题。", changes: [
+        { type: "chapter.retitle", summary: "批量补标题", targetIds: [], scope: "missing", instruction: "标题贴合本章事件" },
+      ] }),
+      model: "test",
+    });
+    const chapterTitles = vi.fn().mockResolvedValue({
+      type: "chapter.titles",
+      summary: "批量补标题（2 章：2 章从正文开头找回）",
+      titles: [
+        { targetId: 1, title: "第 1 章 入城", stripHeading: true },
+        { targetId: 2, title: "第 2 章 夜雨", stripHeading: true },
+      ],
+    });
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "把之前缺的章节标题都补上", project,
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterTitles });
+
+    expect(chapterTitles).toHaveBeenCalledWith(expect.objectContaining({ type: "chapter.retitle", scope: "missing", targetIds: [] }));
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0].type).toBe("chapter.titles");
+    expect(result.toolEvents.some(event => event.tool === "chapter.retitle" && event.message.includes("2 章标题"))).toBe(true);
+  });
+
+  it("委派并发执行但产出顺序不变，一项失败不拖垮其余", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "批量润色。", changes: Array.from({ length: 6 }, (_, index) => ({
+        type: "chapter.revise", summary: `润色 ${index + 1}`, targetId: index + 1, instruction: "只改文字", mode: "polish",
+      })) }),
+      model: "test",
+    });
+    let running = 0;
+    let peak = 0;
+    const chapterRevise = vi.fn().mockImplementation(async (request: { summary: string; targetId: number }) => {
+      running += 1;
+      peak = Math.max(peak, running);
+      // 完成顺序与输入顺序刻意错开：后面的先回来
+      await new Promise(resolve => setTimeout(resolve, 30 - request.targetId * 4));
+      running -= 1;
+      if (request.targetId === 3) throw new Error("无法连接 API 中转服务，已自动重试 3 次：fetch failed");
+      return { type: "chapter.update", summary: request.summary, targetId: request.targetId, content: `第 ${request.targetId} 章润色后正文。` };
+    });
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "把这几章都润一遍", project,
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+
+    expect(peak).toBeGreaterThan(1);
+    expect(chapterRevise).toHaveBeenCalledTimes(6);
+    // 一项失败只掉这一项，其余五项仍按模型给的顺序排列
+    expect(result.changes.map(change => "targetId" in change ? change.targetId : 0)).toEqual([1, 2, 4, 5, 6]);
+    expect(result.toolEvents.filter(event => event.status === "error")).toHaveLength(1);
+  });
+
+  it("委派失败要说清是哪一章、什么原因、下一步怎么办", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "批量润色。", changes: [
+        { type: "chapter.revise", summary: "润色第二章", targetId: 2, instruction: "只改文字", mode: "polish" },
+      ] }),
+      model: "test",
+    });
+    const chapterRevise = vi.fn().mockRejectedValue(new Error("请求过于频繁（429）"));
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "润色第二章", project,
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+
+    const failure = result.toolEvents.find(event => event.tool === "chapter.revise" && event.status === "error");
+    expect(failure?.message).toContain("润色第二章｜目标 2");
+    expect(failure?.message).toContain("429");
+    // 限流要给出能照着做的下一步，而不是只说“API 有问题”
+    expect(failure?.message).toContain("等一两分钟再说一次继续");
+  });
+
+  it("委派阶段持续上报进度，前端进度条不会整段停住", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "批量润色。", changes: [
+        { type: "chapter.revise", summary: "润色第一章", targetId: 1, instruction: "只改文字", mode: "polish" },
+        { type: "chapter.revise", summary: "润色第二章", targetId: 2, instruction: "只改文字", mode: "polish" },
+      ] }),
+      model: "test",
+    });
+    const chapterRevise = vi.fn().mockImplementation((request: { summary: string; targetId: number }) =>
+      Promise.resolve({ type: "chapter.update", summary: request.summary, targetId: request.targetId, content: "润色后正文。" }));
+    const seen: string[] = [];
+
+    await runProjectAgent({
+      mode: "execute",
+      instruction: "润色前两章",
+      project,
+      onDelegate: event => seen.push(`${event.status}:${event.done}/${event.total}`),
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterRevise });
+
+    expect(seen.filter(item => item.startsWith("start"))).toHaveLength(2);
+    expect(seen.at(-1)).toBe("complete:2/2");
   });
 });

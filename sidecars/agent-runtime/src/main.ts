@@ -6,8 +6,9 @@ import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
-import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
+import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
+import { applyDraftChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
 import { registerLibraryHandlers } from "./rpc/library-handlers.js";
@@ -250,32 +251,81 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         return {
           type: "chapter.create" as const,
           summary: request.summary,
-          title,
+          // 章节智能体把标题写在正文开头、已被拆成 chapterTitle；项目 Agent 没起名时用它补上，别让标题栏停在占位章号
+          title: applyDraftChapterTitle(title, String(result.chapterTitle || "")).slice(0, 160),
           content,
           chapterPlan: typeof result.chapterPlan === "string" ? result.chapterPlan : undefined,
           chapterSummary: typeof result.summary === "string" ? result.summary : undefined,
         };
       };
-      // 修订已有章节：走 text.transform 的 revise 模式，不重跑整张章节写作图，也不会改动其他章节
+      // 修订已有章节：走 text.transform 的对应模式，不重跑整张章节写作图，也不会改动其他章节
+      // mode 由项目 Agent 判定：polish 只改文字、de-ai 拆机械感、revise 可动情节
+      const reviseModeLabels: Record<string, string> = { revise: "修订", polish: "润色", "de-ai": "去 AI 味" };
       const delegateChapterRevise = async (request: ProjectAgentChapterReviseRequest) => {
         const chapters = projectList("chapters");
         const target = chapters.find(item => Number(item.id) === request.targetId);
         if (!target) throw new Error(`找不到待修订的章节 ID ${request.targetId}`);
         const original = String(target.content || "").trim();
         if (!original) throw new Error(`章节《${String(target.title || "")}》没有正文可修订`);
-        emitProjectEvent({ type: "progress", data: { step: "chapter-revise", progress: 36, message: `已委托修订《${String(target.title || "章节")}》` } });
+        const mode = request.mode || "revise";
+        const label = reviseModeLabels[mode] || "修订";
+        emitProjectEvent({ type: "progress", data: { step: "chapter-revise", progress: 36, message: `已委托${label}《${String(target.title || "章节")}》` } });
         const result = await delegateResult(`revise-${request.targetId}`, "text.transform", {
           ...req.params,
           runId: runId ? `${runId}:revise-${request.targetId}` : "",
-          mode: "revise",
+          mode,
           instruction: request.instruction,
           content: original,
           projectTitle: String(projectRecord.title || "未命名小说"),
           chapterTitle: String(target.title || "当前章节"),
         });
         const content = String(result.content || "").trim();
-        if (!content) throw new Error("修订智能体没有返回可用正文");
+        if (!content) throw new Error(`${label}智能体没有返回可用正文`);
         return { type: "chapter.update" as const, summary: request.summary, targetId: request.targetId, content };
+      };
+
+      /**
+       * 批量补章节标题
+       * 大部分缺标题的章其实把标题写在了正文开头（旧版本遗留），这部分在 generateChapterTitles 里
+       * 直接拆出来，不花任何模型调用；真的没名字的章才分批交给模型命名。
+       * 产出合成一条 chapter.titles 变更，而不是几百条提案——否则确认列表根本没法看。
+       */
+      const delegateChapterTitles = async (request: ProjectAgentChapterRetitleRequest) => {
+        const chapters = projectList("chapters");
+        const wanted = new Set(request.targetIds.map(id => String(id)));
+        const picked = wanted.size
+          ? chapters.filter(item => wanted.has(String(item.id)))
+          : chapters.filter(item => request.scope === "all" || isPlaceholderChapterTitle(String(item.title || "")));
+        if (!picked.length) {
+          throw new Error(wanted.size ? "指定的章节都不存在" : "没有需要补标题的章节，所有章节都已经有名字");
+        }
+        emitProjectEvent({ type: "progress", data: { step: "chapter-retitle", progress: 40, message: `正在为 ${picked.length} 章补标题` } });
+        const result = await generateChapterTitles(client, picked.map(item => ({
+          targetId: Number(item.id),
+          currentTitle: String(item.title || ""),
+          content: String(item.content || ""),
+        })), {
+          instruction: request.instruction,
+          projectTitle: String(projectRecord.title || "未命名小说"),
+          // 命名要跑好几批，每批几十秒；不推进度作者会以为卡死了
+          onProgress: (done, total) => emitProjectEvent({
+            type: "progress",
+            data: { step: "chapter-retitle", progress: Math.min(72, 40 + Math.round(done / Math.max(1, total) * 32)), message: `已处理 ${done}/${total} 章标题` },
+          }),
+        });
+        if (!result.entries.length) {
+          throw new Error(result.failures[0] || "没能生成任何标题");
+        }
+        const detail = [
+          result.recovered ? `${result.recovered} 章从正文开头找回` : "",
+          result.named ? `${result.named} 章由模型命名` : "",
+          ...result.failures,
+        ].filter(Boolean).join("；");
+        return {
+          type: "chapter.titles" as const,
+          summary: `${request.summary}（${result.entries.length} 章：${detail}）`.slice(0, 200),
+          titles: result.entries,
+        };
       };
 
       emitProjectEvent({ type: "progress", data: { step: "project-plan", progress: 20, message: "正在分析请求并制定受控操作计划" } });
@@ -289,7 +339,24 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         maxSteps: req.params?.maxSteps,
         // 每次工具调用都推一条进度，让抽屉里能看到它在检索什么
         onStep: step => emitProjectEvent({ type: "progress", data: { step: `project-${step.kind}`, progress: 24, message: step.message } }),
-      }, client, { chapter: delegateChapter, chapterRevise: delegateChapterRevise, outline: delegateOutline, card: delegateCard });
+        // 委派阶段是整轮最慢的一段（批量修订能跑十几分钟）；不推进度，界面看起来就是卡死
+        onDelegate: event => emitProjectEvent({
+          type: "progress",
+          data: {
+            step: "project-delegate",
+            progress: Math.min(96, 48 + Math.round(event.done / Math.max(1, event.total) * 48)),
+            message: event.status === "start"
+              ? `${event.label}开始处理（${event.done + 1}/${event.total}）`
+              : `${event.label}${event.status === "complete" ? "完成" : "失败"}（${event.done}/${event.total}）`,
+          },
+        }),
+      }, client, {
+        chapter: delegateChapter,
+        chapterRevise: delegateChapterRevise,
+        chapterTitles: delegateChapterTitles,
+        outline: delegateOutline,
+        card: delegateCard,
+      });
       emitProjectEvent({ type: "complete", data: { message: result.changes.length ? `已生成 ${result.changes.length} 项待确认变更` : "项目 Agent 已完成回复" } });
       return { id: req.id, result };
     }
