@@ -613,12 +613,91 @@ const mobileChapterTitles = async (params: MobileParams, request: Record<string,
   };
 };
 
+/** 移动端一章最多切成几段，与运行时保持一致 */
+const mobileMaxParts = 12;
+/** 切出来的每段最少多少字，避免尾巴只剩几十字 */
+const mobileMinPartCharacters = 400;
+
+/**
+ * 移动端批量拆章
+ * 与运行时同一套判定：切点纯文本按段落算，正文一个字都不改也不回传，
+ * 只把段落序号和新标题合成一条 chapter.parts 变更。
+ */
+const mobileChapterSplit = async (params: MobileParams, request: Record<string, unknown>, chapters: unknown[], projectTitle: string, runId: string) => {
+  const rows = chapters.filter(item => item && typeof item === 'object') as Array<Record<string, unknown>>;
+  const wanted = (Array.isArray(request.targetIds) ? request.targetIds : []).map(Number).filter(value => Number.isInteger(value) && value > 0);
+  const picked = rows.filter(row => wanted.includes(Number(row.id))).slice(0, 40);
+  if (!picked.length) throw new Error('要拆分的章节都不存在');
+  const targetWords = Math.min(20_000, Math.max(600, Number(request.targetWords) || 2400));
+  const countCharacters = (value: string) => value.replace(/\s/gu, '').length;
+  const splits: Array<{ targetId: number; paragraphCount: number; breakAfter: number[]; titles: string[] }> = [];
+  const failures: string[] = [];
+
+  for (const [index, row] of picked.entries()) {
+    const title = stringValue(row.title);
+    const paragraphs = stringValue(row.content).replace(/\r\n/gu, '\n').split(/\n\s*\n/u).map(item => item.trim()).filter(Boolean);
+    const total = paragraphs.reduce((sum, item) => sum + countCharacters(item), 0);
+    if (paragraphs.length < 2 || total <= targetWords * 1.35) {
+      failures.push(`《${title || row.id}》${paragraphs.length < 2 ? '整章没有分段' : `只有 ${total} 字`}，没有拆分`);
+      continue;
+    }
+    const breakAfter: number[] = [];
+    let used = 0;
+    for (let cursor = 0; cursor < paragraphs.length - 1; cursor += 1) {
+      used += countCharacters(paragraphs[cursor]);
+      if (used < targetWords) continue;
+      const rest = paragraphs.slice(cursor + 1).reduce((sum, item) => sum + countCharacters(item), 0);
+      if (rest < mobileMinPartCharacters) break;
+      breakAfter.push(cursor + 1);
+      used = 0;
+      if (breakAfter.length >= mobileMaxParts - 1) break;
+    }
+    if (!breakAfter.length) {
+      failures.push(`《${title || row.id}》没有合适的段落切点`);
+      continue;
+    }
+    emitProgress(runId, { type: 'progress', data: { step: 'chapter-split', progress: Math.min(72, 40 + Math.round(index / picked.length * 32)), message: `已规划 ${index + 1}/${picked.length} 章` } });
+    // 只给切出来的后续段落命名，第一段留用原标题，作者的章号编排不被打乱
+    const bounds = [0, ...breakAfter, paragraphs.length];
+    const bodies = bounds.slice(1).map((end, order) => paragraphs.slice(bounds[order], end).join('\n\n'));
+    const base = title.replace(/^\s*第\s*[0-9０-９一二三四五六七八九十百千零两]+\s*[章节回卷]\s*[：:、.．·\-—]?\s*/u, '').trim();
+    let named: string[] = [];
+    try {
+      const answer = await mobileChat({ ...params, runId: runId ? `${runId}:split-${row.id}` : '', maxOutputTokens: 900 }, [
+        { role: 'system', content: mobileTitleSystemPrompt },
+        { role: 'user', content: `小说《${projectTitle || '未命名小说'}》的一章被拆成 ${bodies.length} 段，请给第 2 段起的每一段命名。\n${stringValue(request.instruction) ? `作者要求：${stringValue(request.instruction)}\n` : ''}${bodies.slice(1).map((body, order) => `id=${order + 1}\n${mobileTitleExcerpt(body)}`).join('\n\n')}` },
+      ], undefined, true);
+      const rowsOut = parseJSON<{ titles?: Array<{ id?: unknown; title?: unknown }> }>(answer.content)?.titles;
+      const byId = new Map((Array.isArray(rowsOut) ? rowsOut : []).map(entry => [Number(entry?.id), stringValue(entry?.title).trim()]));
+      named = bodies.slice(1).map((_, order) => byId.get(order + 1) || '');
+    } catch (error) {
+      // 命名失败不影响拆分本身：退回序号名，作者随时可以再用批量补标题重拟
+      failures.push(`《${title || row.id}》的新段落命名失败：${error instanceof Error ? error.message : String(error)}`);
+      named = bodies.slice(1).map(() => '');
+    }
+    splits.push({
+      targetId: Number(row.id),
+      paragraphCount: paragraphs.length,
+      breakAfter,
+      titles: [title || base || '第一段', ...named.map((entry, order) => (entry || `${base || title || '续'}（${order + 2}）`).slice(0, 160))],
+    });
+  }
+
+  if (!splits.length) throw new Error(failures[0] || '这些章节都不需要拆分');
+  const added = splits.reduce((sum, item) => sum + item.breakAfter.length, 0);
+  const detail = [`${splits.length} 章拆成 ${splits.length + added} 章`, ...failures].filter(Boolean).join('；');
+  return {
+    change: { type: 'chapter.parts', summary: `${stringValue(request.summary, '拆分超长章节')}（${detail}）`.slice(0, 200), splits },
+    message: `已规划拆分：${detail}`,
+  };
+};
+
 const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const mode = params.mode === 'execute' ? 'execute' : 'discuss';
   const runId = stringValue(params.runId);
   emitProgress(runId, { type: 'progress', data: { step: 'project-search', progress: 8, message: '正在检索当前小说资料' } });
-  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next, chapter.revise, chapter.retitle, chapter.delete';
-  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样","mode":"revise|polish|de-ai"}，只改文字用 polish，拆机械感用 de-ai，可以动情节用 revise，单轮最多 3 章；作者要成批补章节标题时使用 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}，targetIds 留空表示按 scope 自动挑（missing 只补占位标题的章节，all 重命名全部），这一项自己会处理几百章，不要再逐章提；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
+  const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next, chapter.revise, chapter.retitle, chapter.split, chapter.delete';
+  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样","mode":"revise|polish|de-ai"}，只改文字用 polish，拆机械感用 de-ai，可以动情节用 revise，单轮最多 3 章；作者要成批补章节标题时使用 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}，targetIds 留空表示按 scope 自动挑（missing 只补占位标题的章节，all 重命名全部），这一项自己会处理几百章，不要再逐章提；某几章字数超标要拆成多章时使用 {"type":"chapter.split","summary":"拆分超长章节","targetIds":[章节id],"targetWords":2400,"instruction":"可选"}，切点由应用按段落自己算、正文一个字都不改写，绝对不要用 chapter.update 加 chapter.create 手工拆章（那要把几万字正文塞进变更里，必然失败）；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。chapter.revise、chapter.retitle、chapter.split 都由应用自己去读正文，你只给 targetId 和要求，不要复述正文。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
   emitProgress(runId, { type: 'progress', data: { step: 'project-plan', progress: 22, message: '正在分析请求并制定操作计划' } });
   const response = await mobileChat({ ...params, maxOutputTokens: 6500 }, [
     { role: 'system', content: '保持小说资料一致，只返回约定 JSON；所有修改都只是待确认提案。' },
@@ -633,7 +712,7 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const outlines = Array.isArray(project.outlines) ? project.outlines : [];
   for (const item of planned) {
     const kind = item && typeof item === 'object' ? (item as Record<string, unknown>).type : '';
-    if (kind !== 'chapter.draft_next' && kind !== 'chapter.revise' && kind !== 'chapter.retitle') {
+    if (kind !== 'chapter.draft_next' && kind !== 'chapter.revise' && kind !== 'chapter.retitle' && kind !== 'chapter.split') {
       changes.push(item);
       continue;
     }
@@ -647,6 +726,17 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
         toolEvents.push({ tool: 'chapter.retitle', status: 'complete', message: result.message });
       } catch (error) {
         toolEvents.push({ tool: 'chapter.retitle', status: 'error', message: `批量补标题失败：${error instanceof Error ? error.message : String(error)}` });
+      }
+      continue;
+    }
+    if (kind === 'chapter.split') {
+      // 拆章同样只回一条 chapter.parts：切点是段落序号，正文留在本地，几万字不进模型也不进变更
+      try {
+        const result = await mobileChapterSplit(modelParams, request, chapters, stringValue(project.title), runId);
+        changes.push(result.change);
+        toolEvents.push({ tool: 'chapter.split', status: 'complete', message: result.message });
+      } catch (error) {
+        toolEvents.push({ tool: 'chapter.split', status: 'error', message: `拆分章节失败：${error instanceof Error ? error.message : String(error)}` });
       }
       continue;
     }

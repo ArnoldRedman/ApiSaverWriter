@@ -124,6 +124,25 @@ export const normalizeProjectAgentChange = (value: unknown, project: Project, in
     if (!titles.length) return null;
     return { type, id, status, summary, titles } as ProjectAgentChange;
   }
+  if (type === 'chapter.parts') {
+    // 拆章只带切点，不带正文：落地时按段落序号就地切开。规划时的段落数记在这里，
+    // 落地前对不上就说明这章的正文已经被改过，那一章跳过，其余照常
+    const splits = Array.isArray(value.splits) ? value.splits.filter(projectAgentRecord).flatMap(item => {
+      const targetId = projectAgentNumber(item.targetId);
+      const paragraphCount = projectAgentNumber(item.paragraphCount);
+      const breakAfter = Array.isArray(item.breakAfter)
+        ? [...new Set(item.breakAfter.map(projectAgentNumber).filter((entry): entry is number => Boolean(entry)))].sort((a, b) => a - b)
+        : [];
+      const titles = Array.isArray(item.titles) ? item.titles.map(entry => projectAgentString(entry, 160)) : [];
+      if (!targetId || !paragraphCount || !breakAfter.length || !project.chapters.some(chapter => chapter.id === targetId)) return [];
+      // 标题数必须正好覆盖切出来的每一段，缺一个就没法给新章命名
+      if (titles.length !== breakAfter.length + 1 || titles.some(entry => !entry)) return [];
+      if (breakAfter.some(entry => entry >= paragraphCount)) return [];
+      return [{ targetId, paragraphCount, breakAfter, titles }];
+    }).slice(0, 40) : [];
+    if (!splits.length) return null;
+    return { type, id, status, summary, splits } as ProjectAgentChange;
+  }
   if (type === 'chapter.delete') {
     const targetId = projectAgentNumber(value.targetId);
     const target = targetId ? project.chapters.find(item => item.id === targetId) : undefined;

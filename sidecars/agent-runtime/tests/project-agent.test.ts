@@ -18,7 +18,7 @@ const project = {
   graphEdges: [],
 };
 
-const delegates = () => ({ chapter: vi.fn(), chapterRevise: vi.fn(), chapterTitles: vi.fn(), outline: vi.fn(), card: vi.fn() });
+const delegates = () => ({ chapter: vi.fn(), chapterRevise: vi.fn(), chapterTitles: vi.fn(), chapterSplit: vi.fn(), outline: vi.fn(), card: vi.fn() });
 
 // 长篇：作者真实的书有一百多章，id 是创建时的时间戳，标题多半还是创建时的占位
 const bigProject = {
@@ -453,6 +453,33 @@ describe("project agent", () => {
     expect(result.toolEvents.some(event => event.tool === "chapter.retitle" && event.message.includes("2 章标题"))).toBe(true);
   });
 
+  it("拆章交给拆章智能体，只产出一条 chapter.parts，正文不进变更", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "开始拆章。", changes: [
+        { type: "chapter.split", summary: "把超长章拆开", targetIds: [1, 2], targetWords: 2400, instruction: "新段落标题贴合该段事件" },
+      ] }),
+      model: "test",
+    });
+    const chapterSplit = vi.fn().mockResolvedValue({
+      type: "chapter.parts",
+      summary: "把超长章拆开（2 章拆成 5 章）",
+      splits: [
+        { targetId: 1, paragraphCount: 12, breakAfter: [4, 8], titles: ["第 1 章 入城", "雨里的门牌", "空屋"] },
+        { targetId: 2, paragraphCount: 9, breakAfter: [5], titles: ["第 2 章 夜雨", "窗外"] },
+      ],
+    });
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "150 到 159 章有的六千字，拆成两千多字一章", project,
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterSplit });
+
+    expect(chapterSplit).toHaveBeenCalledWith(expect.objectContaining({ type: "chapter.split", targetIds: [1, 2], targetWords: 2400 }));
+    expect(result.changes).toHaveLength(1);
+    expect(result.changes[0].type).toBe("chapter.parts");
+    // 拆章走的是段落序号，几万字正文一个字都不该出现在变更里
+    expect(JSON.stringify(result.changes[0]).length).toBeLessThan(400);
+    expect(result.toolEvents.some(event => event.tool === "chapter.split" && event.message.includes("5 章"))).toBe(true);
+  });
   it("委派并发执行但产出顺序不变，一项失败不拖垮其余", async () => {
     const chat = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "批量润色。", changes: Array.from({ length: 6 }, (_, index) => ({

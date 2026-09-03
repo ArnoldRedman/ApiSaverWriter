@@ -1,7 +1,7 @@
 import { z } from "zod";
-import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterTitles, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@zhizhang/contracts";
+import { ProjectAgentChangeSchema, ProjectAgentPlanSchema as projectAgentPlanSchema, ProjectAgentPlannerChangeSchema as plannerChangeSchema, type ProjectAgentCardRequest, type ProjectAgentCardUpsert, type ProjectAgentChange, type ProjectAgentChapterCreate, type ProjectAgentChapterRequest, type ProjectAgentChapterParts, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentChapterTitles, type ProjectAgentChapterUpdate, type ProjectAgentOutlineRequest, type ProjectAgentOutlineUpsert } from "@zhizhang/contracts";
 export { ProjectAgentChangeSchema };
-export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterRetitleRequest, ProjectAgentChapterReviseRequest, ProjectAgentOutlineRequest } from "@zhizhang/contracts";
+export type { ProjectAgentCardRequest, ProjectAgentChange, ProjectAgentChapterRequest, ProjectAgentChapterRetitleRequest, ProjectAgentChapterReviseRequest, ProjectAgentChapterSplitRequest, ProjectAgentOutlineRequest } from "@zhizhang/contracts";
 import { ModelApiClient } from "./models/model-api.js";
 import { byteLength, compactText } from "./context/context-optimizer.js";
 import { mapWithConcurrency } from "./application/concurrency.js";
@@ -11,6 +11,7 @@ export interface ProjectAgentDelegates {
   chapter: (request: ProjectAgentChapterRequest) => Promise<ProjectAgentChapterCreate>;
   chapterRevise: (request: ProjectAgentChapterReviseRequest) => Promise<ProjectAgentChapterUpdate>;
   chapterTitles: (request: ProjectAgentChapterRetitleRequest) => Promise<ProjectAgentChapterTitles>;
+  chapterSplit: (request: ProjectAgentChapterSplitRequest) => Promise<ProjectAgentChapterParts>;
   outline: (request: ProjectAgentOutlineRequest) => Promise<ProjectAgentOutlineUpsert>;
   card: (request: ProjectAgentCardRequest) => Promise<ProjectAgentCardUpsert>;
 }
@@ -243,7 +244,7 @@ type ProjectAgentTurn = z.infer<typeof agentTurnSchema>;
 const changeTypeNames = new Set<string>([
   "project.update", "outline.upsert", "card.upsert", "memory.document.upsert",
   "graph.node.upsert", "graph.edge.upsert", "chapter.draft_next",
-  "chapter.revise", "chapter.retitle", "chapter.delete",
+  "chapter.revise", "chapter.retitle", "chapter.split", "chapter.delete",
 ]);
 
 function parseAgentTurn(value: string): ProjectAgentTurn {
@@ -365,7 +366,7 @@ const systemPrompt = `你是应用内的小说项目助手，可以多轮检索�
 章节索引条目格式是「#序号｜id｜标题」：作者说的“第 150 章”对应 #150，但所有变更的 targetId 必须填中间那个真实 id。
 章数很多时索引只列首尾，中间的章用 list 按序号翻。
 
-changes 里每一项只能是下列十种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
+changes 里每一项只能是下列十一种之一，字段必须原样铺平，不要自己包一层 patch 或 data：
 {"type":"project.update","summary":"修改简介","patch":{"synopsis":"..."}}
 {"type":"outline.write","summary":"重写总纲","targetId":1,"kind":"总纲","title":"...","instruction":"要改成什么样"}
 {"type":"card.write","summary":"更新角色卡","targetId":2,"cardType":"角色卡","title":"林舟","instruction":"要补充或修正什么"}
@@ -375,6 +376,7 @@ changes 里每一项只能是下列十种之一，字段必须原样铺平，不
 {"type":"chapter.draft_next","summary":"起草下一章","title":"第 12 章 夜访","instruction":"承接上一章并推进线索","outlineId":3}
 {"type":"chapter.revise","summary":"修订第 8 章","targetId":8,"instruction":"去掉 AI 味，保留情节和人物口吻","mode":"de-ai"}
 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}
+{"type":"chapter.split","summary":"把超长章拆开","targetIds":[150,151],"targetWords":2400,"instruction":"新段落标题贴合该段事件"}
 {"type":"chapter.delete","summary":"删除空稿章节","targetId":9,"title":"第 9 章"}
 
 重要：大纲、卡片、章节正文都不由你撰写。outline.write、card.write、chapter.draft_next、chapter.revise 只需要给出 instruction，
@@ -396,7 +398,18 @@ changes 里每一项只能是下列十种之一，字段必须原样铺平，不
 - chapter.revise 和 chapter.delete 的 targetId 必须是项目索引里真实存在的章节 id，不是第几章的序号。
 - 修订前先 open 该章正文，确认真的需要改，不要凭标题猜。
 - chapter.revise 会重写整章正文，一次最多提 10 章；更多章节请分批，并在 message 里说明已处理范围和剩下的部分。
-- 删除是不可恢复操作：只有作者明确要求删除时才能提，不要自作主张清理你觉得多余的章节。`;
+- 删除是不可恢复操作：只有作者明确要求删除时才能提，不要自作主张清理你觉得多余的章节。
+
+一章太长要拆成几章时用 chapter.split，不要自己写正文：
+- 填 targetIds（真实 id）和 targetWords（每章目标字数，作者说“两千多字”就填 2400）。
+- 应用会按段落边界就地切开，正文一个字都不改写，也不需要你把正文贴进 changes；新段落的标题由应用命名。
+- 一条 chapter.split 就能拆多章，不要一章一条，更不要用 chapter.update 加 chapter.create 手工拆——那样要贴几万字正文，必然超长失败。
+- 拆分只在段落边界上进行；某章整章没有分段或长度不够时，应用会跳过它并如实说明。
+
+失败重试：历史里出现「[本轮未完成] …失败（…｜目标 N）」时，说明那一项没做成，其余的已经生成了提案。
+作者说“再试一次”“重来一次”时，只针对失败的那一项重新提同一条变更即可，不要重提已经成功的部分，也不要说自己做不到——
+chapter.revise、chapter.retitle、chapter.split 都只需要 targetId 和 instruction，正文由应用自己从项目里读取，
+你并不需要先把该章正文 open 进上下文才能重试（想确认改动方向时才需要 open）。`;
 
 type AgentMessage = { role: "system" | "user" | "assistant"; content: string };
 
@@ -560,8 +573,10 @@ export async function runProjectAgent(
       try {
         turn = parseAgentTurn(repaired.content);
       } catch {
-        // 两轮都没修好就如实说明，不要把原始 JSON 当成回复扔给作者
-        turn = { action: "finish", message: "模型这轮没有按约定格式回复，请再说一次或换个说法。", changes: [] };
+        // 两轮都没修好就如实说明，不要把原始 JSON 当成回复扔给作者。
+        // 最常见的原因是模型把整章正文塞进了 changes，JSON 还没写完就被 max_tokens 截断，
+        // 所以这里要给出能自己解决问题的下一步，而不是让作者原样再说一遍
+        turn = { action: "finish", message: "模型这轮没有按约定格式回复，多半是想把正文直接写进变更里、JSON 被截断了。请把范围说得更小一些（比如一次只处理三五章），或者明确说“交给章节智能体处理”再试一次。", changes: [] };
       }
     }
 
@@ -614,6 +629,7 @@ export async function runProjectAgent(
       "chapter.draft_next": { label: "章节智能体", run: () => delegates.chapter(change as ProjectAgentChapterRequest) },
       "chapter.revise": { label: "章节修订智能体", run: () => delegates.chapterRevise(change as ProjectAgentChapterReviseRequest) },
       "chapter.retitle": { label: "标题智能体", run: () => delegates.chapterTitles(change as ProjectAgentChapterRetitleRequest) },
+      "chapter.split": { label: "拆章", run: () => delegates.chapterSplit(change as ProjectAgentChapterSplitRequest) },
       "outline.write": { label: "大纲智能体", run: () => delegates.outline(change as ProjectAgentOutlineRequest) },
       "card.write": { label: "卡片智能体", run: () => delegates.card(change as ProjectAgentCardRequest) },
     }[change.type as string];
@@ -673,6 +689,7 @@ export async function runProjectAgent(
 /** 委派产出的确认文案：章节给标题，批量标题给章数 */
 function describeProduced(change: ProjectAgentChange): string {
   if (change.type === "chapter.titles") return `${change.titles.length} 章标题`;
+  if (change.type === "chapter.parts") return `${change.splits.length} 章拆成 ${change.splits.reduce((sum, item) => sum + item.breakAfter.length + 1, 0)} 章`;
   if ("title" in change && change.title) return change.title;
   if ("targetId" in change && change.targetId !== undefined) return `目标 ${String(change.targetId)}`;
   return change.summary;

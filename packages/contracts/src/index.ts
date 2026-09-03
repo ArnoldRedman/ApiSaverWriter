@@ -94,23 +94,43 @@ export const chapterTitlesSchema = z.object({
   type: z.literal('chapter.titles'), summary: z.string().min(1).max(200),
   titles: z.array(z.object({ targetId: requiredId, title: z.string().min(1).max(160), stripHeading: z.boolean().optional() })).min(1).max(400),
 });
+// 拆章意图：只说要把哪几章拆到多少字，切点由应用按段落算，正文不经过模型，落地为一条 chapter.parts
+export const chapterSplitSchema = z.object({ type: z.literal('chapter.split'), summary: z.string().min(1).max(200), targetIds: z.array(requiredId).min(1).max(40), targetWords: z.coerce.number().int().min(600).max(20_000).default(2400), instruction: z.string().max(2000).optional() });
+/**
+ * 拆章落地：只带切点和新标题，不带正文
+ * 正文两边都有，回传几万字只会撑爆变更归档；应用按 breakAfter 里的段落序号就地切开。
+ * paragraphCount 是规划时的段落数，落地前对不上就说明正文已被改过，这一章跳过。
+ */
+export const chapterPartsSchema = z.object({
+  type: z.literal('chapter.parts'),
+  summary: z.string().min(1).max(200),
+  splits: z.array(z.object({
+    targetId: requiredId,
+    paragraphCount: z.coerce.number().int().min(2),
+    breakAfter: z.array(z.coerce.number().int().min(1)).min(1).max(20),
+    titles: z.array(z.string().min(1).max(160)).min(2).max(21),
+  })).min(1).max(40),
+});
+
 export const chapterUpdateSchema = z.object({ type: z.literal('chapter.update'), summary: z.string().min(1).max(200), targetId: requiredId, title: z.string().min(1).max(160).optional(), content: z.string().min(1).max(120_000) });
 // 删除不需要模型产出，规划和落地用同一个形状；title 只用于确认时显示
 export const chapterDeleteSchema = z.object({ type: z.literal('chapter.delete'), summary: z.string().min(1).max(200), targetId: requiredId, title: z.string().max(160).optional() });
 
-export const ProjectAgentChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineUpsertSchema, cardUpsertSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterCreateSchema, chapterUpdateSchema, chapterTitlesSchema, chapterDeleteSchema]);
-export const ProjectAgentPlannerChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineWriteSchema, cardWriteSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterDraftNextSchema, chapterReviseSchema, chapterRetitleSchema, chapterDeleteSchema]);
+export const ProjectAgentChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineUpsertSchema, cardUpsertSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterCreateSchema, chapterUpdateSchema, chapterTitlesSchema, chapterPartsSchema, chapterDeleteSchema]);
+export const ProjectAgentPlannerChangeSchema = z.discriminatedUnion('type', [projectUpdateSchema, outlineWriteSchema, cardWriteSchema, memoryDocumentUpsertSchema, graphNodeUpsertSchema, graphEdgeUpsertSchema, chapterDraftNextSchema, chapterReviseSchema, chapterRetitleSchema, chapterSplitSchema, chapterDeleteSchema]);
 export const ProjectAgentPlanSchema = z.object({ message: z.string().min(1).max(5000), changes: z.array(ProjectAgentPlannerChangeSchema).max(16).default([]) });
 
 export type ProjectAgentChange = z.infer<typeof ProjectAgentChangeSchema>;
 export type ProjectAgentChapterRequest = z.infer<typeof chapterDraftNextSchema>;
 export type ProjectAgentChapterReviseRequest = z.infer<typeof chapterReviseSchema>;
 export type ProjectAgentChapterRetitleRequest = z.infer<typeof chapterRetitleSchema>;
+export type ProjectAgentChapterSplitRequest = z.infer<typeof chapterSplitSchema>;
 export type ProjectAgentOutlineRequest = z.infer<typeof outlineWriteSchema>;
 export type ProjectAgentCardRequest = z.infer<typeof cardWriteSchema>;
 export type ProjectAgentChapterCreate = z.infer<typeof chapterCreateSchema>;
 export type ProjectAgentChapterUpdate = z.infer<typeof chapterUpdateSchema>;
 export type ProjectAgentChapterTitles = z.infer<typeof chapterTitlesSchema>;
+export type ProjectAgentChapterParts = z.infer<typeof chapterPartsSchema>;
 export type ProjectAgentOutlineUpsert = z.infer<typeof outlineUpsertSchema>;
 export type ProjectAgentCardUpsert = z.infer<typeof cardUpsertSchema>;
 

@@ -89,3 +89,53 @@ test('批量标题不做冲突快照：落地时按章重新取当前标题和�
 
   assert.equal(change?.baseUpdatedAt, undefined);
 });
+
+test('拆章：切点去重排序，标题原样保留，正文不进变更', () => {
+  const change = normalizeProjectAgentChange({
+    type: 'chapter.parts',
+    summary: '拆分超长章节（1 章拆成 3 章）',
+    splits: [{ targetId: 10, paragraphCount: 9, breakAfter: [6, 3, 3], titles: ['第 1 章 入城', '雨里的门牌', '空屋'] }],
+  }, project);
+
+  assert.equal(change?.type, 'chapter.parts');
+  assert.deepEqual(change?.type === 'chapter.parts' ? change.splits : [], [
+    { targetId: 10, paragraphCount: 9, breakAfter: [3, 6], titles: ['第 1 章 入城', '雨里的门牌', '空屋'] },
+  ]);
+  assert.equal(JSON.stringify(change).includes('林舟抵达城南'), false);
+});
+
+test('拆章：标题数对不上切点数的整条丢弃，不给新章留无名占位', () => {
+  assert.equal(normalizeProjectAgentChange({
+    type: 'chapter.parts',
+    summary: '拆分超长章节',
+    splits: [{ targetId: 10, paragraphCount: 9, breakAfter: [3, 6], titles: ['第 1 章 入城', '雨里的门牌'] }],
+  }, project), null);
+  assert.equal(normalizeProjectAgentChange({
+    type: 'chapter.parts',
+    summary: '拆分超长章节',
+    splits: [{ targetId: 10, paragraphCount: 9, breakAfter: [3], titles: ['第 1 章 入城', '   '] }],
+  }, project), null);
+});
+
+test('拆章：切点越界或章节不存在的丢掉，其余照常保留', () => {
+  const change = normalizeProjectAgentChange({
+    type: 'chapter.parts',
+    summary: '拆分超长章节',
+    splits: [
+      { targetId: 10, paragraphCount: 4, breakAfter: [4], titles: ['第 1 章 入城', '越界的切点'] },
+      { targetId: 999, paragraphCount: 9, breakAfter: [3], titles: ['不存在的章', '也不存在'] },
+      { targetId: 20, paragraphCount: 6, breakAfter: [3], titles: ['第 2 章 夜雨', '窗外'] },
+    ],
+  }, project);
+
+  assert.deepEqual(change?.type === 'chapter.parts' ? change.splits.map(item => item.targetId) : [], [20]);
+});
+
+test('拆章：没有切点或一条都没剩下时整项丢弃', () => {
+  assert.equal(normalizeProjectAgentChange({
+    type: 'chapter.parts',
+    summary: '拆分超长章节',
+    splits: [{ targetId: 10, paragraphCount: 9, breakAfter: [], titles: ['第 1 章 入城'] }],
+  }, project), null);
+  assert.equal(normalizeProjectAgentChange({ type: 'chapter.parts', summary: '拆分超长章节', splits: [] }, project), null);
+});

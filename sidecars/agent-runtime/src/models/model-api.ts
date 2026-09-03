@@ -865,17 +865,28 @@ export class ModelApiClient {
         });
       })()
       : JSON.stringify({ model, messages: contextMessages, temperature: options.temperature ?? 0.7, max_tokens: maxTokens, response_format: supportsOpenAIJsonMode(model) ? options.response_format : undefined, reasoning_effort: supportsOpenAIReasoning(model) && reasoningMode ? openAIReasoningEffort[reasoningMode] : undefined, stream: true, stream_options: { include_usage: true } });
-    const streamResponse = await fetchWithTimeout(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.authHeaders(apiKey) },
-      body: streamBody,
-      ...(dispatcher ? { dispatcher } : {}),
-    } as RequestInit, 300_000);
+    // 建流阶段和非流式一样会撞上 429/502/503 抖动，之前这里一次都不重试，
+    // 一个瞬时限流就让整章白跑。只重试建流：一旦开始收字节就交给下面的断点续写逻辑
+    const streamAttempts = Math.max(1, Math.min(5, options.retryAttempts ?? 3));
+    let streamResponse!: Response;
+    for (let attempt = 1; attempt <= streamAttempts; attempt += 1) {
+      streamResponse = await fetchWithTimeout(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...this.authHeaders(apiKey) },
+        body: streamBody,
+        ...(dispatcher ? { dispatcher } : {}),
+      } as RequestInit, 300_000);
+      if (streamResponse.ok) break;
+      if (attempt >= streamAttempts || ![408, 429, 500, 502, 503].includes(streamResponse.status)) break;
+      // 524 不在重试之列：网关超时说明上一次请求太慢，重发同一个请求只会再超时一次
+      await streamResponse.text().catch(() => "");
+      await sleep(800 * 2 ** (attempt - 1));
+    }
     const responseBody = streamResponse.ok ? streamResponse.body : null;
     if (!responseBody) {
       const detail = await streamResponse.text();
       throw new ApiRequestError(apiErrorMessage({
-        status: streamResponse.status, detail, statusText: streamResponse.statusText,
+        status: streamResponse.status, detail, statusText: streamResponse.statusText, attempts: streamAttempts,
         routeHint: proxyRouteHint(endpoint, this.config), requestHint: `，模型 ${model} · ${endpoint}`,
         mode, requestBytes: Buffer.byteLength(streamBody, "utf8"),
       }), streamResponse.status);

@@ -275,6 +275,33 @@ describe("model client configuration", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("建流阶段撞上 503 会重试，一个瞬时抖动不该让整章白跑", async () => {
+    const ok = () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ choices: [{ delta: { content: "正文" }, finish_reason: "stop" }] })}\n\n`));
+        controller.close();
+      },
+    }), { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response("upstream busy", { status: 503 }))
+      .mockImplementation(async () => ok());
+
+    const result = await new ModelApiClient({ apiKey: "k", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
+      .chatStream([{ role: "user", content: "改写整章" }], { retryAttempts: 3 });
+
+    expect(result.content).toBe("正文");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("建流阶段的 524 不重试：网关超时说明这个请求本身太慢，重发只会再超一次", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response("gateway time-out", { status: 524 }));
+
+    await expect(new ModelApiClient({ apiKey: "k", baseURL: "https://relay.test/v1", defaultModel: "gpt-test" })
+      .chatStream([{ role: "user", content: "改写整章" }], { retryAttempts: 3 }))
+      .rejects.toThrow("524");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
   it("does not retry an exhausted quota response", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch")
       .mockResolvedValue(new Response(JSON.stringify({ error: { message: "The quota has been exceeded" } }), { status: 429 }));

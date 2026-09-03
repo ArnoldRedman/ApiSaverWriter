@@ -802,6 +802,7 @@ const projectAgentChangeTargetKey = (change: ProjectAgentChange) => {
   if (change.type === 'chapter.update' || change.type === 'chapter.delete') return `chapter:${change.targetId}`;
   // 批量标题只改标题栏，和逐章修订不冲突；同一批里再来一条批量标题才算互斥
   if (change.type === 'chapter.titles') return 'chapter-titles';
+  if (change.type === 'chapter.parts') return 'chapter-parts';
   return `chapter:new:${change.title}`;
 };
 
@@ -831,8 +832,10 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
     'chapter.update': 7,
     // 标题在正文之后：同一章既被修订又被补标题时，标题要落在修订后的正文上
     'chapter.titles': 8,
+    // 拆章在标题之后：先把标题落定，再按段落切开，新章直接插在原章后面
+    'chapter.parts': 9,
     // 删除最后执行：否则同批次里针对该章的其他变更会找不到目标
-    'chapter.delete': 9,
+    'chapter.delete': 10,
   };
   const pending = changes.filter(change => change.status === 'pending').sort((left, right) => order[left.type] - order[right.type]);
   if (!pending.length) throw new Error('没有待应用的变更');
@@ -1024,6 +1027,53 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
           const title = chapterId && byId.has(chapterId) ? titleById.get(chapterId) : undefined;
           return title ? { ...node, label: title, updatedAt: now } : node;
         }),
+      };
+      continue;
+    }
+    if (change.type === 'chapter.parts') {
+      // 拆章只收到切点，正文在本地：按空行分段后就地切开，新章紧跟在原章后面插入，
+      // 不能走 chapter.create（那个只会追加到全书末尾，拆出来的下半章会跑到几百章之后）
+      const bySource = new Map(change.splits.map(item => [item.targetId, item]));
+      const chapters: Chapter[] = [];
+      const skipped: string[] = [];
+      let split = 0;
+      for (const chapter of next.chapters) {
+        const plan = bySource.get(chapter.id);
+        const paragraphs = plan ? chapter.content.replace(/\r\n/gu, '\n').split(/\n\s*\n/u).map(item => item.trim()).filter(Boolean) : [];
+        // 规划之后正文又被改过就跳过这一章：按旧段落序号硬切会把句子拦腰截断
+        if (!plan || paragraphs.length !== plan.paragraphCount) {
+          if (plan) skipped.push(chapter.title);
+          chapters.push(chapter);
+          continue;
+        }
+        split += 1;
+        const bounds = [0, ...plan.breakAfter, paragraphs.length];
+        for (let index = 0; index < bounds.length - 1; index += 1) {
+          const body = paragraphs.slice(bounds[index], bounds[index + 1]).join('\n\n');
+          const title = plan.titles[index] || chapter.title;
+          // 第一段原地留在本章：保留 id、创建时间和历史版本，作者的书签和引用不会断
+          if (index === 0) {
+            chapters.push({ ...pushChapterSnapshot(chapter, 'Agent 拆章'), title, content: body, wordCount: countNovelCharacters(body), updatedAt: now });
+            continue;
+          }
+          chapters.push({ id: ++serial, title, content: body, wordCount: countNovelCharacters(body), createdAt: now, updatedAt: now });
+        }
+      }
+      if (!split) throw new Error(`拆章没有落地：${skipped.length ? `《${skipped[0]}》等章节的正文已在提案生成后被修改` : '这些章节都已经不存在了'}，请重新让项目 Agent 处理`);
+      const existingNodes = new Set(next.graphNodes.map(node => node.id));
+      next = {
+        ...next,
+        chapters,
+        graphNodes: [
+          ...next.graphNodes.map(node => {
+            const chapterId = node.id.startsWith('chapter:') ? Number(node.id.slice(8)) : 0;
+            const renamed = chapterId ? chapters.find(chapter => chapter.id === chapterId) : undefined;
+            return renamed && bySource.has(chapterId) ? { ...node, label: renamed.title, updatedAt: now } : node;
+          }),
+          // 拆出来的新章要各自进图谱，否则它们在关系图里根本不存在
+          ...chapters.filter(chapter => !existingNodes.has(`chapter:${chapter.id}`))
+            .map(chapter => ({ id: `chapter:${chapter.id}`, label: chapter.title, type: 'chapter' as const, content: createGraphNodeProfile('chapter'), updatedAt: now })),
+        ],
       };
       continue;
     }
@@ -4014,7 +4064,12 @@ function App() {
           instruction,
           project,
           activeChapterId: activeChapter?.id,
-          history: session.messages.slice(-12).map(message => ({ role: message.role, content: message.content })),
+          history: session.messages.slice(-12).map(message => ({
+            role: message.role,
+            // 失败的委派只写在 toolEvents 里。不把它带回历史，作者说“刚刚那章失败了，再试一次”时，
+            // 模型手上只有自己那段“已完成修订”的场面话，根本不知道是哪一章没做成，只能回答做不到
+            content: [message.content, ...(message.toolEvents || []).filter(event => event.status === 'error').map(event => `[本轮未完成] ${event.message}`)].join('\n'),
+          })),
           writingStyle: activeStyle ? { name: activeStyle.name, content: activeStyle.content } : undefined,
           skills: skills.map(skill => ({ name: skill.name, displayName: 'displayName' in skill ? skill.displayName : undefined, category: skill.category, description: skill.description, tags: skill.tags, content: skill.content })),
           apiKey: agentConfig.apiKey.trim(),
@@ -5667,6 +5722,7 @@ function App() {
       case 'chapter.create': return '新建章节草稿';
       case 'chapter.update': return '修订章节正文';
       case 'chapter.titles': return '批量补章节标题';
+      case 'chapter.parts': return '拆分超长章节';
       case 'chapter.delete': return '删除章节';
     }
   };
@@ -5681,6 +5737,10 @@ function App() {
     if (change.type === 'chapter.titles') {
       const stripped = change.titles.filter(item => item.stripHeading).length;
       return `${change.titles.length} 章${stripped ? ` · 其中 ${stripped} 章同时把正文开头的标题行移走` : ''}`;
+    }
+    if (change.type === 'chapter.parts') {
+      const added = change.splits.reduce((sum, item) => sum + item.breakAfter.length, 0);
+      return `${change.splits.length} 章拆成 ${change.splits.length + added} 章 · 正文不改写`;
     }
     if (change.type === 'chapter.update') {
       const target = editingProject?.chapters.find(item => item.id === change.targetId);
@@ -5699,6 +5759,22 @@ function App() {
         const current = index >= 0 ? editingProject?.chapters[index]?.title : '';
         return `${index >= 0 ? `#${index + 1}` : `id ${item.targetId}`}　${current || '（无标题）'} → ${item.title}${item.stripHeading ? '　[同时移走正文标题行]' : ''}`;
       }).join('\n');
+    }
+    if (change.type === 'chapter.parts') {
+      // 拆章不改写正文，作者要核对的是"在哪里断开、断成几章、每章多少字"
+      return change.splits.map(item => {
+        const index = editingProject?.chapters.findIndex(chapter => chapter.id === item.targetId) ?? -1;
+        const source = index >= 0 ? editingProject?.chapters[index] : undefined;
+        const paragraphs = (source?.content || '').replace(/\r\n/gu, '\n').split(/\n\s*\n/u).map(entry => entry.trim()).filter(Boolean);
+        const stale = paragraphs.length !== item.paragraphCount;
+        const bounds = [0, ...item.breakAfter, item.paragraphCount];
+        const parts = item.titles.map((title, order) => {
+          const body = paragraphs.slice(bounds[order], bounds[order + 1]).join('\n\n');
+          return `    ${order + 1}. ${title}${stale ? '' : ` · ${countNovelCharacters(body).toLocaleString()} 字`}`;
+        });
+        const head = `${index >= 0 ? `#${index + 1}` : `id ${item.targetId}`}　${source?.title || `章节 ${item.targetId}`}（原 ${source?.wordCount.toLocaleString() || '?'} 字）拆成 ${item.titles.length} 章`;
+        return [head, ...parts, stale ? '    ⚠ 这一章的正文在提案生成后被改过，应用时会跳过它' : ''].filter(Boolean).join('\n');
+      }).join('\n\n');
     }
     return projectAgentChangeDetail(change);
   };

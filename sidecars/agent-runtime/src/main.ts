@@ -6,9 +6,10 @@ import { StreamEmitter } from "./streaming/stream-handler.js";
 import { byteLength, compactKnowledgeGraph, compactText, contextBudgetBytes, prepareChapterInput, stableHash, type ContextReport, type PreparedChapterInput } from "./context/context-optimizer.js";
 import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPreparationCache, compactAgentSession, memoryEditorSystemPrompt, memoryField, memoryStringList, memoryTypeForDocument, normalizeAgentSession, normalizeMemoryResult, normalizeRelationWeight, novelSessionCache, outlineSessionCache, renderAgentSession, renderRecentTurns, renderSessionSummary, cardWriterSystemPrompt, chapterOutlineOutputProtocol, outlineWriterSystemPrompt, normalizeChapterOutlineOutput, type AgentSessionState } from "./application/runtime-state.js";
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
-import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
+import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
 import { applyDraftChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
+import { planChapterSplits } from "./application/chapter-split.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
 import { registerLibraryHandlers } from "./rpc/library-handlers.js";
@@ -328,7 +329,44 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         };
       };
 
-      emitProjectEvent({ type: "progress", data: { step: "project-plan", progress: 20, message: "正在分析请求并制定受控操作计划" } });
+      /**
+       * 批量拆章
+       * 切点是纯文本按段落算出来的，正文一个字都不改，也不回传：两边都有正文，
+       * 回传十章正文只会把变更归档撑爆。落地时应用按段落序号就地切开。
+       */
+      const delegateChapterSplit = async (request: ProjectAgentChapterSplitRequest) => {
+        const chapters = projectList("chapters");
+        const wanted = new Set(request.targetIds.map(id => String(id)));
+        const picked = chapters.filter(item => wanted.has(String(item.id)));
+        if (!picked.length) {
+          throw new Error("要拆分的章节都不存在");
+        }
+        emitProjectEvent({ type: "progress", data: { step: "chapter-split", progress: 40, message: `正在规划 ${picked.length} 章的拆分` } });
+        const result = await planChapterSplits(client, picked.map(item => ({
+          targetId: Number(item.id),
+          title: String(item.title || ""),
+          content: String(item.content || ""),
+        })), {
+          targetWords: request.targetWords,
+          instruction: request.instruction,
+          projectTitle: String(projectRecord.title || "未命名小说"),
+          onProgress: (done, total) => emitProjectEvent({
+            type: "progress",
+            data: { step: "chapter-split", progress: Math.min(72, 40 + Math.round(done / Math.max(1, total) * 32)), message: `已规划 ${done}/${total} 章` },
+          }),
+        });
+        if (!result.splits.length) {
+          throw new Error(result.failures[0] || "这些章节都不需要拆分");
+        }
+        const added = result.splits.reduce((sum, item) => sum + item.breakAfter.length, 0);
+        const detail = [`${result.splits.length} 章拆成 ${result.splits.length + added} 章`, ...result.failures].filter(Boolean).join("；");
+        return {
+          type: "chapter.parts" as const,
+          summary: `${request.summary}（${detail}）`.slice(0, 200),
+          splits: result.splits,
+        };
+      };
+
       const result = await runProjectAgent({
         mode: mode === "execute" ? "execute" : "discuss",
         instruction: String(instruction),
@@ -354,6 +392,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         chapter: delegateChapter,
         chapterRevise: delegateChapterRevise,
         chapterTitles: delegateChapterTitles,
+        chapterSplit: delegateChapterSplit,
         outline: delegateOutline,
         card: delegateCard,
       });

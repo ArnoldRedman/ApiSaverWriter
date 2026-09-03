@@ -29,16 +29,21 @@ export const registerTextHandlers = (registry: RpcRegistry): RpcRegistry => regi
       : mode === "de-ai"
         ? `你是小说文字编辑。请为以下《${String(projectTitle || "未命名小说")}》${String(chapterTitle || "当前章节")}的文本去除机械化 AI 写作痕迹。\n\n要求：保持原意、人物、叙述视角、事实、情节与既有文风不变；拆除模板化套话、均匀句式、总结腔和机械因果衔接；优先使用准确的动作、感官细节与角色化表达；不要新增剧情、设定、人物或信息，不要解释，不加标题或 Markdown 标记。${extraRequirement ? `\n作者额外要求：${extraRequirement}` : ""}\n\n待改写文本：\n${String(content)}`
       : `你是长篇网络小说作者。请为《${String(projectTitle || "未命名小说")}》的${String(chapterTitle || "当前章节")}续写一段可直接插入正文的内容。\n\n要求：只输出续写正文，不复述已有内容，不加标题、注释或 Markdown 标记；承接已有的叙事视角、人物状态、时间线和文风；推进一个明确动作或事件，并自然收束在可继续写作的位置；输出不得超过 ${numericLimit} 个非空白字符。${extraRequirement ? `\n作者续写要求：${extraRequirement}` : ""}\n\n上一章结尾（仅在当前章为空时优先承接）：\n${String(previousChapter || "无")}\n\n当前章节已有内容：\n${String(content || "（当前章为空，请承接上一章）")}`;
-    const response = await client.chat([{ role: "user", content: prompt }], {
+    const options = {
       temperature: mode === "continue" ? 0.75 : mode === "de-ai" ? 0.45 : mode === "revise" ? 0.6 : 0.35,
       // 整章改写的输出长度和输入同量级：润色、去 AI 味、修订都会重写整章，
       // 固定 5000 会把三千字以上的章节从中间截断，作者看到的是“后半章没了”
       max_tokens: mode === "continue"
         ? Math.min(7000, Math.max(500, Math.ceil(numericLimit * 1.6)))
         : wholeChapterTokenBudget(String(content || "")),
-      // 整章改写单次要跑好几十秒，上游 429/5xx 抖动比短请求常见得多；只重试一次很容易整章白跑
       retryAttempts: mode === "continue" ? 2 : 3,
-    });
+    };
+    // 整章改写走流式：六千字的章节要生成一两分钟，非流式时网关全程收不到任何字节，
+    // 会在模型写完之前先切断连接并回 524；而重试发出去的是同一个同样慢的请求，重几次都还是 524。
+    // 流式下字节持续流动，网关不会认为源站卡死；中途真断了也能带着已生成的半章接着写完。
+    const response = mode === "continue"
+      ? await client.chat([{ role: "user", content: prompt }], options)
+      : await client.chatStream([{ role: "user", content: prompt }], options);
     let result = response.content.trim().replace(/^```(?:markdown|text)?\s*/i, "").replace(/```$/u, "").trim();
     if (mode === "continue" && numericLimit > 0 && Array.from(result.replace(/\s/gu, "")).length > numericLimit) {
       const limited = Array.from(result).slice(0, numericLimit).join("");
