@@ -22,6 +22,24 @@ export const isPlaceholderChapterTitle = (value: string): boolean => {
 };
 
 /**
+ * 模型给的标题名里常带的多余包装：书名号、引号、句末标点
+ * “《夜雨敲窗》。”这种套层要反复剥：单轮只能去掉最外一层
+ */
+export const cleanChapterTitleName = (value: string): string => {
+  let name = value.trim().split(/\n/u)[0].trim();
+  for (let round = 0; round < 4; round += 1) {
+    const stripped = name
+      .replace(/^[《【["'“‘（(]+/u, '')
+      .replace(/[》】\]"'”’）)]+$/u, '')
+      .replace(/[。！？…、；，!?]+$/u, '')
+      .trim();
+    if (stripped === name) break;
+    name = stripped;
+  }
+  return name.slice(0, 60);
+};
+
+/**
  * 章节标题属于标题栏，不属于正文：把模型补在正文开头的 # 标题行拆出来
  * 标题不能直接丢掉——它是模型唯一给出章节名的地方，丢了标题栏就只剩“第 N 章”占位
  * 模型偶尔连写多行重复标题，最多剥 3 行；标题只取第一行，其余重复行丢掉

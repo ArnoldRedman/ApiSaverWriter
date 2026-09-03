@@ -6,7 +6,7 @@ import type { StreamEmitter } from "../streaming/stream-handler.js";
 import { StreamAccumulator } from "../streaming/stream-handler.js";
 import { byteLength, compactText, formatContextReport, type ContextReport } from "../context/context-optimizer.js";
 // 标题拆分与补全是纯文本处理，批量补标题也要用同一套判定，统一放在 application 层
-import { applyDraftChapterTitle, splitChapterTitleHeading } from "../application/chapter-titles.js";
+import { applyDraftChapterTitle, cleanChapterTitleName, splitChapterTitleHeading } from "../application/chapter-titles.js";
 
 export interface SkillDefinition {
   name: string;
@@ -50,7 +50,10 @@ const chapterAgentSystemPrompt = `你是专业长篇网络小说创作 Agent。�
 4. 正文使用自然的中文网文叙事，段落有节奏，结尾停在可继续发展的行动、发现或风险上。
 5. 严格执行最后一条消息指定的阶段任务与输出格式，不输出隐藏思考。`;
 
-const chapterWriterTaskPrompt = `你正在执行“章节正文”阶段。返回严格 JSON 对象，不要代码围栏或额外说明：{"content":"章节正文 Markdown","summary":"200 字以内章节摘要"}。content 只能是小说正文本身，绝不能是计划确认、写作思路、意向声明或对任务的回应。`; 
+const chapterWriterTaskPrompt = `你正在执行“章节正文”阶段。返回严格 JSON 对象，不要代码围栏或额外说明：{"content":"章节正文 Markdown","title":"本章标题","summary":"200 字以内章节摘要"}。content 只能是小说正文本身，绝不能是计划确认、写作思路、意向声明或对任务的回应。
+title 是这一章的名字，必须填：4 到 14 个汉字，只概括本章真正发生的事，不带“第几章”前缀，不带书名号、引号、句号和省略号；章号由应用自己编，你不用数。
+标题只放在 title 字段里，不要在 content 开头再写一遍 # 标题行。`;
+
 
 /** JSON 传输信封绝不能成为展示给作者的章节正文。 */
 function unwrapChapterDraft(value: unknown, depth = 0): string {
@@ -83,6 +86,27 @@ function chapterSummaryFromEnvelope(value: unknown, depth = 0): string {
     if (typeof parsed.summary === "string") return parsed.summary.trim();
     const nested = typeof parsed.draftContent === "string" ? parsed.draftContent : typeof parsed.content === "string" ? parsed.content : "";
     return nested ? chapterSummaryFromEnvelope(nested, depth + 1) : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 信封里的章节标题
+ * 标题现在是信封的一等字段：模型不再把它写在正文开头，就不能只指望从正文里剥 # 标题行。
+ * chapterTitle 缺失时新建的章节只能停在“第 N 章”占位，作者看到的就是“只写了正文、没写标题”。
+ */
+function chapterTitleFromEnvelope(value: unknown, depth = 0): string {
+  if (typeof value !== "string" || depth >= 4) return "";
+  try {
+    const parsed = JSON.parse(value.trim().replace(/^```(?:json|markdown|text)?\s*/iu, "").replace(/\s*```$/u, "")) as Record<string, unknown>;
+    for (const key of ["title", "chapterTitle", "chapter_title", "标题", "章节标题"]) {
+      const found = parsed[key];
+      // 只取一行：模型偶尔把标题写成“第 12 章 夜访\n（本章完）”这种多行文本
+      if (typeof found === "string" && found.trim()) return cleanChapterTitleName(found);
+    }
+    const nested = typeof parsed.draftContent === "string" ? parsed.draftContent : typeof parsed.content === "string" ? parsed.content : "";
+    return nested ? chapterTitleFromEnvelope(nested, depth + 1) : "";
   } catch {
     return "";
   }
@@ -481,9 +505,11 @@ export function createChapterGraph(config: ChapterGraphConfig) {
 
       // 标题行在产出时就从正文里拆走，避免模型补的 # 章节标题混进正文；承诺语由 unwrapChapterDraft 内部处理
       const draft = splitChapterTitleHeading(unwrapChapterDraft(response.content));
+      // 标题两条路都要接：信封的 title 字段优先，模型仍把标题写在正文开头时用剥下来的那行兵底
+      const envelopeTitle = chapterTitleFromEnvelope(response.content);
       return {
         draftContent: draft.content,
-        chapterTitle: draft.title,
+        chapterTitle: envelopeTitle || draft.title,
         summary: chapterSummaryFromEnvelope(response.content),
         contextReport,
         upstreamUsage: addUsage(state.upstreamUsage, response.usage),

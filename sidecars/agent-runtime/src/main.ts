@@ -8,7 +8,7 @@ import { appendAgentSession, cardSessionCache, chapterMemoryCache, chapterPrepar
 import { readPersistentContext, readPersistentDocument, writePersistentContext, writePersistentDocument } from "./context/persistent-context-cache.js";
 import { runProjectAgent, type ProjectAgentCardRequest, type ProjectAgentChapterRequest, type ProjectAgentChapterRetitleRequest, type ProjectAgentChapterReviseRequest, type ProjectAgentChapterSplitRequest, type ProjectAgentOutlineRequest } from "./project-agent.js";
 import { createModelApiClient, networkProxyConfig, stringList } from "./application/model-client.js";
-import { applyDraftChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
+import { applyDraftChapterTitle, generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "./application/chapter-titles.js";
 import { planChapterSplits } from "./application/chapter-split.js";
 import { RpcRegistry, type RuntimeRpcRequest } from "./rpc/registry.js";
 import { registerModelHandlers } from "./rpc/model-handlers.js";
@@ -736,6 +736,22 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           authorPreferences: stringList(authorPreferences, 20),
         });
         const resultRecord = result as Record<string, unknown>;
+        // 标题兵底：信封里没给 title、正文开头也没写标题行时，这一章会停在“第 N 章”占位。
+        // 写完整章才发现没名字太晚，补一次几十 token 的命名请求；失败也不影响正文
+        if (!String(resultRecord.chapterTitle || "").trim() && String(resultRecord.draftContent || "").trim()) {
+          streamEmitter.progress("review", 97, "正文已完成，正在为本章起标题");
+          // 命名失败绝不能拖垮已经写好的整章正文：建客户端和请求都吐在这里
+          try {
+            const named = await generateChapterTitle(
+              createModelApiClient(req.params ?? {}, { model: "gpt-4o-mini" }),
+              String(resultRecord.draftContent),
+              { projectTitle: String(projectTitle || ""), instruction: String(instruction) },
+            );
+            if (named) resultRecord.chapterTitle = named;
+          } catch {
+            // 标题缺失时作者仍可在接受草稿前自己填，不报错中断本次写作
+          }
+        }
         const handoff = [resultRecord.chapterPlan, resultRecord.summary, resultRecord.reviewResult && JSON.stringify(resultRecord.reviewResult)].filter(Boolean).join("\n");
         if (handoff) {
           const nextChapterSession = appendAgentSession(chapterSession, String(instruction), handoff, contextWindow, prepared.report.packedBytes);
@@ -746,6 +762,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
         }
         const resultWithUsage = {
           ...result,
+          chapterTitle: resultRecord.chapterTitle,
           contextReport: {
             ...contextReport,
             ...(result.contextReport || {}),

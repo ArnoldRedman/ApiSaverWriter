@@ -3008,6 +3008,34 @@ select.input {
   font-size: 12px;
 }
 
+/* 草稿标题栏：接受前就能看见并修正本章名字 */
+.agent-draft-title {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.agent-draft-title span {
+  color: var(--text-4);
+  font-size: 11px;
+}
+
+.agent-draft-title input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--surface-sunken);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+
+.agent-draft-title input:focus-visible {
+  outline: 2px solid var(--accent-line);
+  outline-offset: 1px;
+}
+
 .agent-summary,
 .agent-review {
   padding: 10px;

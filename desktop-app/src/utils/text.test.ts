@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { splitChapterTitleHeading, applyDraftChapterTitle, isPlaceholderChapterTitle } from './text.ts';
+import { splitChapterTitleHeading, applyDraftChapterTitle, cleanChapterTitleName, isPlaceholderChapterTitle } from './text.ts';
 
 test('章节草稿标题：正文开头的 # 标题被剥出来，重复标题行只取第一行', () => {
   const split = splitChapterTitleHeading('# 第 151 章 黑暗中的后退\n# 第 151 章 黑暗中的后退\n\n林砚僵在门前。');
@@ -43,4 +43,14 @@ test('占位标题判定：批量补标题按它挑出还没有名字的章节',
   for (const title of ['第 12 章 夜雨敲窗', '夜雨敲窗', '楔子']) {
     assert.equal(isPlaceholderChapterTitle(title), false, title);
   }
+});
+
+test('标题清洗：模型带回的书名号、引号和句末标点逐层剥掉', () => {
+  assert.equal(cleanChapterTitleName('《夜雨敲窗》。'), '夜雨敲窗');
+  assert.equal(cleanChapterTitleName('“夜雨敲窗”'), '夜雨敲窗');
+  assert.equal(cleanChapterTitleName('夜雨敲窗！？'), '夜雨敲窗');
+  // 多行只取第一行：模型偶尔在标题后面接一句说明
+  assert.equal(cleanChapterTitleName('夜雨敲窗\n（本章完）'), '夜雨敲窗');
+  // 正常标题里的标点不该被误剥
+  assert.equal(cleanChapterTitleName('夜雨，敲窗人'), '夜雨，敲窗人');
 });

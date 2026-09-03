@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { mapWithConcurrency } from "../src/application/concurrency.js";
-import { generateChapterTitles, isPlaceholderChapterTitle } from "../src/application/chapter-titles.js";
+import { generateChapterTitle, generateChapterTitles, isPlaceholderChapterTitle } from "../src/application/chapter-titles.js";
 import { ModelApiClient } from "../src/models/model-api.js";
 
 const clientReturning = (bodies: string[]) => {
@@ -73,7 +73,7 @@ describe("generateChapterTitles", () => {
 
   it("正文里没有标题时才分批交给模型命名", async () => {
     const { client, chat } = clientReturning([
-      JSON.stringify({ titles: [{ id: 150, title: "旧仓库的账本" }, { id: 151, title: "夜雨里的口供" }] }),
+      JSON.stringify({ titles: [{ index: 150, title: "旧仓库的账本" }, { index: 151, title: "夜雨里的口供" }] }),
     ]);
 
     const result = await generateChapterTitles(client, [
@@ -85,7 +85,7 @@ describe("generateChapterTitles", () => {
     const [messages] = chat.mock.calls[0] as [Array<{ role: string; content: string }>];
     expect(messages[1].content).toContain("城南夜雨");
     expect(messages[1].content).toContain("标题贴合本章事件");
-    expect(messages[1].content).toContain("id=150");
+    expect(messages[1].content).toContain("index=150");
     expect(result.recovered).toBe(0);
     expect(result.named).toBe(2);
     // 有章号的沿用章号，没章号的直接用模型给的名字
@@ -99,7 +99,8 @@ describe("generateChapterTitles", () => {
   it("一批失败只丢这一批，其余章节照常返回", async () => {
     const chat = vi.fn()
       .mockRejectedValueOnce(new Error("无法连接 API 中转服务，已自动重试 3 次"))
-      .mockResolvedValueOnce({ content: JSON.stringify({ titles: [{ id: 21, title: "码头的第二封信" }] }), model: "test" });
+      .mockRejectedValue(new Error("无法连接 API 中转服务，已自动重试 3 次"))
+      .mockResolvedValueOnce({ content: JSON.stringify({ titles: [{ index: 21, title: "码头的第二封信" }] }), model: "test" });
     const client = { chat } as unknown as ModelApiClient;
     const candidates = Array.from({ length: 21 }, (_, index) => ({
       targetId: index + 1,
@@ -109,14 +110,15 @@ describe("generateChapterTitles", () => {
 
     const result = await generateChapterTitles(client, candidates);
 
-    // 20 章一批：第一批整批失败，第二批的一章正常产出
-    expect(chat).toHaveBeenCalledTimes(2);
+    // 20 章一批：第一批整批失败且兑底也失败（网络不通），第二批的一章正常产出；
+    // 兑底重试过的章仍排在失败名单里，作者能照着章号重试
     expect(result.entries).toEqual([{ targetId: 21, title: "第 21 章 码头的第二封信" }]);
-    expect(result.failures.some(item => item.includes("20 章命名失败") && item.includes("无法连接"))).toBe(true);
+    expect(result.failures.some(item => item.includes("无法连接"))).toBe(true);
+    expect(result.failures.some(item => item.includes("等 20 章") && item.includes("没给出可用标题"))).toBe(true);
   });
 
   it("模型漏掉的章节如实报出来，不假装全部完成", async () => {
-    const { client } = clientReturning([JSON.stringify({ titles: [{ id: 1, title: "入城" }] })]);
+    const { client } = clientReturning([JSON.stringify({ titles: [{ index: 1, title: "入城" }] }), "这一章可以叫夜雨敲窗"]);
 
     const result = await generateChapterTitles(client, [
       { targetId: 1, currentTitle: "第 1 章", content: "林舟抵达城南。" },
@@ -124,7 +126,8 @@ describe("generateChapterTitles", () => {
     ]);
 
     expect(result.entries).toHaveLength(1);
-    expect(result.failures[0]).toContain("有 1 章模型没给出可用标题");
+    expect(result.failures[0]).toContain("第 2 章");
+    expect(result.failures[0]).toContain("模型没给出可用标题");
   });
 
   it("没有正文的章节不去调模型，直接报为失败", async () => {
@@ -149,3 +152,91 @@ describe("generateChapterTitles", () => {
     expect(seen).toEqual([[1, 2], [2, 2]]);
   });
 });
+
+describe("generateChapterTitle", () => {
+  it("单章兵底命名去掉书名号和句末标点", async () => {
+    const { client, chat } = clientReturning([JSON.stringify({ title: "《夜雨敲窗》。" })]);
+
+    const title = await generateChapterTitle(client, "夜雨落在窗框上，他把口供压在灯下。", {
+      projectTitle: "城南夜雨",
+      instruction: "承接上一章的对峙",
+    });
+
+    expect(title).toBe("夜雨敲窗");
+    const [messages] = chat.mock.calls[0] as [Array<{ role: string; content: string }>];
+    expect(messages[1].content).toContain("城南夜雨");
+    expect(messages[1].content).toContain("承接上一章的对峙");
+  });
+
+  it("模型报错或返回不可解析内容时返回空串，不拖累正文", async () => {
+    const chat = vi.fn().mockRejectedValue(new Error("无法连接 API 中转服务"));
+    expect(await generateChapterTitle({ chat } as unknown as ModelApiClient, "正文内容")).toBe("");
+
+    const { client } = clientReturning(["这一章可以叫夜雨敲窗"]);
+    expect(await generateChapterTitle(client, "正文内容")).toBe("");
+  });
+
+  it("正文为空时不调模型", async () => {
+    const { client, chat } = clientReturning([]);
+    expect(await generateChapterTitle(client, "   ")).toBe("");
+    expect(chat).not.toHaveBeenCalled();
+  });
+});
+
+  it("模型把章号当 id 返回时照样配上章节（线上真实事故：9/10/11 章全被丢）", async () => {
+    const { client } = clientReturning([
+      // 三个 targetId 是十几位时间戳，模型回的 id 却是章号 9/10/11——旧代码按真实 id 硬配，整批全丢
+      JSON.stringify({ titles: [{ id: 9, title: "旧仓库的账本" }, { id: 10, title: "夜雨里的口供" }, { id: 11, title: "码头的第二封信" }] }),
+    ]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 1756880000001, currentTitle: "第 9 章", content: "林舟翻开账本，纸页上只有一行数字。" },
+      { targetId: 1756880000002, currentTitle: "第 10 章", content: "夜雨落在窗框上，他把口供压在灯下。" },
+      { targetId: 1756880000003, currentTitle: "第 11 章", content: "码头的第二封信到了，他拆开看了一遍。" },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.entries).toEqual([
+      { targetId: 1756880000001, title: "第 9 章 旧仓库的账本" },
+      { targetId: 1756880000002, title: "第 10 章 夜雨里的口供" },
+      { targetId: 1756880000003, title: "第 11 章 码头的第二封信" },
+    ]);
+  });
+
+  it("模型回包形状不标准时逐章兑底补命名", async () => {
+    const { client } = clientReturning([
+      // 批量回包不是约定的 {titles:[...]}，一行都没配上
+      JSON.stringify({ results: "标题我起好了" }),
+      // 逐章兑底走单章信封，一次一章
+      JSON.stringify({ title: "夜雨敲窗" }),
+      JSON.stringify({ title: "旧仓库的账本" }),
+    ]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 1756880000001, currentTitle: "第 9 章", content: "夜雨落在窗框上，他把口供压在灯下。" },
+      { targetId: 1756880000002, currentTitle: "第 10 章", content: "林舟翻开账本，纸页上只有一行数字。" },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.entries).toEqual([
+      { targetId: 1756880000001, title: "第 9 章 夜雨敲窗" },
+      { targetId: 1756880000002, title: "第 10 章 旧仓库的账本" },
+    ]);
+  });
+
+  it("模型把映射当回包（键是章号）时也能配上", async () => {
+    const { client } = clientReturning([
+      JSON.stringify({ "9": "夜雨敲窗", "10": "旧仓库的账本" }),
+    ]);
+
+    const result = await generateChapterTitles(client, [
+      { targetId: 1756880000001, currentTitle: "第 9 章", content: "夜雨落在窗框上，他把口供压在灯下。" },
+      { targetId: 1756880000002, currentTitle: "第 10 章", content: "林舟翻开账本，纸页上只有一行数字。" },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.entries).toEqual([
+      { targetId: 1756880000001, title: "第 9 章 夜雨敲窗" },
+      { targetId: 1756880000002, title: "第 10 章 旧仓库的账本" },
+    ]);
+  });

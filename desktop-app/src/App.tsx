@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type ChangeEvent } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, type ChangeEvent } from 'react';
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
@@ -1359,6 +1359,8 @@ function App() {
   const [agentStage, setAgentStage] = useState<AgentStage>('idle');
   const [agentDraft, setAgentDraft] = useState<AgentDraftResult | null>(null);
   const [agentDisplayContent, setAgentDisplayContent] = useState('');
+  /** 草稿的章节标题：接受前可改，标题不能只靠模型写得对 */
+  const [agentDraftTitle, setAgentDraftTitle] = useState('');
   const [outlineChatMessages, setOutlineChatMessages] = useState<AgentChatMessage[]>([]);
   const [cardChatMessages, setCardChatMessages] = useState<AgentChatMessage[]>([]);
   const [showProjectAgent, setShowProjectAgent] = useState(false);
@@ -1556,8 +1558,41 @@ function App() {
   const chapterEditorRef = useRef<HTMLTextAreaElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const highlightLayerRef = useRef<HTMLDivElement | null>(null);
+  const readingArticleRef = useRef<HTMLElement | null>(null);
   const goalNoticeChapterRef = useRef<number | null>(null);
   const persistCurrentChapterRef = useRef<() => Promise<void>>(async () => {});
+  /**
+   * 切章时把编辑器、高亮层和阅读视图的滚动位置归零，并把光标放回开头
+   * 这几个 DOM 节点在切章时是复用的（React 只换 value 不换节点），不归零的话滚动位置会留在上一章读到的地方；
+   * 只在章节 id 变化时执行：打字、自动保存、Agent 改稿都会替换章节对象但不改 id，不能把正在读的位置拉回开头
+   */
+  useLayoutEffect(() => {
+    if (!activeChapter) return;
+    const editor = chapterEditorRef.current;
+    if (editor) {
+      editor.setSelectionRange(0, 0);
+      editor.scrollTop = 0;
+    }
+    if (highlightLayerRef.current) highlightLayerRef.current.scrollTop = 0;
+    if (readingArticleRef.current) readingArticleRef.current.scrollTop = 0;
+  }, [activeChapter?.id]);
+  /**
+   * 目录跟随当前章：当前章滚到列表可见区域
+   * 新建/插入/Alt 切章/项目 Agent 产出都会改 activeChapter，与其在每个入口补 scrollIntoView，不如统一在这里跟随；
+   * 已在视野内的不再动它，免得点目录时列表抖动
+   */
+  useLayoutEffect(() => {
+    if (!activeChapter || editorSidebarTab !== 'chapters') return;
+    const list = chaptersListRef.current;
+    const item = list?.querySelector<HTMLElement>(`[data-chapter-id="${activeChapter.id}"]`);
+    if (!list || !item) return;
+    const listRect = list.getBoundingClientRect();
+    const itemRect = item.getBoundingClientRect();
+    // 留出列表内边距的余量，避免“刚好在边缘”时抖来抖去
+    if (itemRect.top < listRect.top + 8 || itemRect.bottom > listRect.bottom - 8) {
+      list.scrollTop = item.offsetTop - list.offsetTop - Math.max(0, (list.clientHeight - item.offsetHeight) / 2);
+    }
+  }, [activeChapter?.id, editorSidebarTab, editingProject?.chapters.length]);
   const [settingsDraft, setSettingsDraft] = useState(agentConfig);
   const refreshGatewayUsageRef = useRef(refreshGatewayUsage);
   refreshGatewayUsageRef.current = refreshGatewayUsage;
@@ -3065,16 +3100,12 @@ function App() {
     setActiveChapterMemoryId(null);
   };
 
-  // 选中章节并把它滚到列表可见区域，长篇不必手动滚动查找
+  // 选中章节：目录跟随和滚动归零统一由切章 effect 处理，这里只收尾本章的编辑状态
   const selectChapter = (chapter: Chapter) => {
     setActiveChapter(chapter);
     setSelectionSnapshot(null);
     setSearchMatchIndex(0);
     goalNoticeChapterRef.current = null;
-    // 等本次渲染提交后再滚动，否则读到的还是旧的列表位置
-    window.requestAnimationFrame(() => {
-      chaptersListRef.current?.querySelector(`[data-chapter-id="${chapter.id}"]`)?.scrollIntoView({ block: 'center' });
-    });
   };
 
   // 跳转框接受「12」「第 12 章」和标题关键字三种写法
@@ -4540,6 +4571,7 @@ function App() {
     setAgentError('');
     setAgentDraft(null);
     setAgentDisplayContent('');
+    setAgentDraftTitle('');
     agentStreamRawContentRef.current = '';
     setAgentStage('starting');
     setContextTrace([]);
@@ -4621,9 +4653,12 @@ function App() {
       // 运行时已经在图里拆过一次，这里再兜一次——非流式回退或模型二次补标题时也能拿到章节名
       const draft = splitChapterTitleHeading(chapterDraftFromStream(result.draftContent || ''));
       const draftContent = draft.content;
-      const normalizedResult = { ...result, draftContent, chapterTitle: draft.title || result.chapterTitle };
+      // 运行时的信封 title 优先（它已做过清洗和命名兵底），非流式回退时才用正文开头剥下来的那行
+      const normalizedResult = { ...result, draftContent, chapterTitle: result.chapterTitle || draft.title };
       setAgentDraft(normalizedResult);
       setAgentDisplayContent(draftContent);
+      // 标题当场算好并展示：作者接受前能看见、能改，不用写入后才发现标题标还是占位章号
+      setAgentDraftTitle(applyDraftChapterTitle(activeChapter.title, normalizedResult.chapterTitle || ''));
       agentStreamRawContentRef.current = '';
       // SSE chunks are already rendered by the shared stream listener. The
       // completed result is authoritative when the provider falls back to a
@@ -4656,12 +4691,14 @@ function App() {
       // 写入前再剥一次标题行：预览框可手改，手改后同样不该把 # 标题存进正文
       const draft = splitChapterTitleHeading(agentDraft.draftContent);
       const chapterContent = draft.content;
-      // 手改过的预览框以框里的标题为准，否则用运行时剥下来的那一行；只补占位标题，作者起过名的不动
-      const draftTitle = draft.title || agentDraft.chapterTitle || '';
+      // 标题栏里的值是作者看得见也改得动的那一个，优先级最高；
+      // 它被清空才回退到正文开头剥下来的标题行与运行时给的章节名，且只补占位标题
+      const draftTitle = agentDraftTitle.trim()
+        || applyDraftChapterTitle(activeChapter.title, draft.title || agentDraft.chapterTitle || '');
       const updatedChapter: Chapter = {
         // 采用草稿会覆盖现有正文，先存快照
         ...pushChapterSnapshot(activeChapter, 'Agent 草稿'),
-        title: applyDraftChapterTitle(activeChapter.title, draftTitle),
+        title: draftTitle.slice(0, 160),
         content: chapterContent,
         wordCount: countNovelCharacters(chapterContent),
         updatedAt: now,
@@ -4681,6 +4718,7 @@ function App() {
     }
     setAgentDraft(null);
     setAgentDisplayContent('');
+    setAgentDraftTitle('');
     setAgentStage('idle');
     setAgentProgress([]);
     setAgentProgressPercent(0);
@@ -6583,6 +6621,16 @@ function App() {
                       {agentDraft.contextReport.prunedBytes ? <span>已裁剪 {(agentDraft.contextReport.prunedBytes / 1024).toFixed(1)} KB</span> : null}
                       {agentDraft.contextReport.upstreamUsage?.requests ? <><span>中转输入 {agentDraft.contextReport.upstreamUsage.inputTokens.toLocaleString()} tokens</span><span>中转输出 {agentDraft.contextReport.upstreamUsage.outputTokens.toLocaleString()} tokens</span><span>中转总计 {agentDraft.contextReport.upstreamUsage.totalTokens.toLocaleString()} tokens</span><span>上游缓存命中 {agentDraft.contextReport.upstreamUsage.cachedInputTokens.toLocaleString()} tokens</span><span>上游缓存命中率 {agentDraft.contextReport.upstreamUsage.inputTokens ? `${((agentDraft.contextReport.upstreamUsage.cachedInputTokens / agentDraft.contextReport.upstreamUsage.inputTokens) * 100).toFixed(1)}%` : '未返回输入用量'}</span></> : <span>中转站未返回用量与缓存字段</span>}
                     </div>}
+                    <label className="agent-draft-title">
+                      <span>章节标题</span>
+                      <input
+                        type="text"
+                        value={agentDraftTitle}
+                        maxLength={160}
+                        placeholder={activeChapter?.title || '给这一章起个名字'}
+                        onChange={(event) => setAgentDraftTitle(event.target.value)}
+                      />
+                    </label>
                     <textarea className="agent-draft-preview" value={agentDisplayContent || agentDraft.draftContent} onChange={(event) => { setAgentDisplayContent(event.target.value); setAgentDraft({ ...agentDraft, draftContent: event.target.value }); }} />
                     {agentDraft.summary && <p className="agent-summary">{agentDraft.summary}</p>}
                     {agentDraft.reviewResult && (
@@ -6593,7 +6641,7 @@ function App() {
                       </div>
                     )}
                     <div className="agent-result-actions">
-                      <button className="btn-secondary" onClick={() => setAgentDraft(null)}>放弃</button>
+                      <button className="btn-secondary" onClick={() => { setAgentDraft(null); setAgentDraftTitle(''); }}>放弃</button>
                       <button className="btn-primary" onClick={acceptAgentDraft}>接受并写入</button>
                     </div>
                   </section>
@@ -7526,7 +7574,7 @@ function App() {
             <div><strong>{activeChapter.title}</strong><small>{activeChapter.wordCount.toLocaleString()} 字</small></div>
             <button className="editor-tool-button" onClick={() => setReadingMode(false)}>退出阅读（Esc）</button>
           </header>
-          <article>{activeChapter.content.split(/\n+/u).filter(Boolean).map((paragraph, index) => <p key={`${index}-${paragraph.slice(0, 12)}`}>{paragraph}</p>)}</article>
+          <article ref={readingArticleRef}>{activeChapter.content.split(/\n+/u).filter(Boolean).map((paragraph, index) => <p key={`${index}-${paragraph.slice(0, 12)}`}>{paragraph}</p>)}</article>
         </div>
       )}
 

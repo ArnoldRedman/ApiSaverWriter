@@ -39,6 +39,37 @@ describe("chapter continuity context", () => {
     store.close();
   });
 
+  it("信封里的 title 字段优先于正文开头的标题行", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      const body = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
+      const messages = JSON.stringify(body.messages || "");
+      const content = messages.includes("待审查章节")
+        ? JSON.stringify({ consistent: true, issues: [], suggestions: [] })
+        : messages.includes("五段写作任务书")
+          ? JSON.stringify({ plan: "1. 开篇承接：承接敲门。", handoff: "门锁转动。" })
+          // 正常路径：标题单独放在 title 字段，模型常带上书名号和自己数的章号
+          : JSON.stringify({ content: "林砚僵在门前。", title: "《黑暗中的后退》", summary: "承接。" });
+      return new Response(JSON.stringify({ model: "test-model", choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const store = StoryStore.inMemory();
+    store.createProject({ id: "envelope-title-project", title: "信封标题测试" });
+    const graph = createChapterGraph({ store, apiKey: "test-key", baseURL: "https://relay.test/v1", model: "test-model" });
+    const result = await graph.invoke({
+      projectId: "envelope-title-project",
+      chapterId: "12",
+      instruction: "继续写本章",
+    });
+
+    expect(result.draftContent).toBe("林砚僵在门前。");
+    // 书名号被摸掉，章号由应用自己拼，图只负责给名字
+    expect(result.chapterTitle).toBe("黑暗中的后退");
+    store.close();
+  });
+
   it("正文只回一句写作承诺时如实返回空，不用承诺语冒充正文", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
       const body = JSON.parse(String(init?.body || "{}")) as Record<string, unknown>;
