@@ -1,5 +1,5 @@
 import { invoke as nativeInvoke } from '@tauri-apps/api/core';
-import type { AgentRpcCall } from '@zhizhang/contracts';
+import { allocateChapterParts, chapterCharacterCount, partsFromBreaks, planChapterBreaks, splitParagraphs, type AgentRpcCall } from '@zhizhang/contracts';
 import { anthropicText, anthropicThinkingBudget, authHeaders, normalizeWireMode, openAIReasoningEffort, toAnthropicMessages } from '@zhizhang/model-protocol';
 import { fitMessagesToTokenBudget } from './utils/token-budget';
 import { applyDraftChapterTitle, cleanChapterTitleName, isPlaceholderChapterTitle, splitChapterTitleHeading } from './utils/text';
@@ -684,14 +684,9 @@ const mobileChapterTitles = async (params: MobileParams, request: Record<string,
   };
 };
 
-/** 移动端一章最多切成几段，与运行时保持一致 */
-const mobileMaxParts = 12;
-/** 切出来的每段最少多少字，避免尾巴只剩几十字 */
-const mobileMinPartCharacters = 400;
-
 /**
  * 移动端批量拆章
- * 与运行时同一套判定：切点纯文本按段落算，正文一个字都不改也不回传，
+ * 与运行时同一套判定（切点函数来自契约层）：切点纯文本按段落算，正文一个字都不改也不回传，
  * 只把段落序号和新标题合成一条 chapter.parts 变更。
  */
 const mobileChapterSplit = async (params: MobileParams, request: Record<string, unknown>, chapters: unknown[], projectTitle: string, runId: string) => {
@@ -700,37 +695,41 @@ const mobileChapterSplit = async (params: MobileParams, request: Record<string, 
   const picked = rows.filter(row => wanted.includes(Number(row.id))).slice(0, 40);
   if (!picked.length) throw new Error('要拆分的章节都不存在');
   const targetWords = Math.min(20_000, Math.max(600, Number(request.targetWords) || 2400));
-  const countCharacters = (value: string) => value.replace(/\s/gu, '').length;
+  const targetParts = Math.min(240, Math.max(0, Math.floor(Number(request.targetParts) || 0)));
+  // 作者直接报了“这两章拆成 6 章”时，按各章字数把名额分下去；
+  // 不比现有章数多就不可能是总章数，退回每章目标字数，不把整批章节跳过
+  const asTotal = targetParts > picked.length ? targetParts : 0;
   const splits: Array<{ targetId: number; paragraphCount: number; breakAfter: number[]; titles: string[] }> = [];
   const failures: string[] = [];
+  if (targetParts >= 2 && !asTotal) failures.push(`要的 ${targetParts} 章不比这 ${picked.length} 章多，没法当成拆完后的总章数，本次按每章 ${targetWords} 字拆`);
+  const partsByChapter = asTotal
+    ? allocateChapterParts(picked.map(row => ({ targetId: Number(row.id), characters: chapterCharacterCount(stringValue(row.content)) })), asTotal)
+    : new Map<number, number>();
 
   for (const [index, row] of picked.entries()) {
     const title = stringValue(row.title);
-    const paragraphs = stringValue(row.content).replace(/\r\n/gu, '\n').split(/\n\s*\n/u).map(item => item.trim()).filter(Boolean);
-    const total = paragraphs.reduce((sum, item) => sum + countCharacters(item), 0);
-    if (paragraphs.length < 2 || total <= targetWords * 1.35) {
-      failures.push(`《${title || row.id}》${paragraphs.length < 2 ? '整章没有分段' : `只有 ${total} 字`}，没有拆分`);
+    const paragraphs = splitParagraphs(stringValue(row.content));
+    const total = paragraphs.reduce((sum, item) => sum + chapterCharacterCount(item), 0);
+    if (paragraphs.length < 2) {
+      failures.push(`《${title || row.id}》整章没有分段，没有拆分`);
       continue;
     }
-    const breakAfter: number[] = [];
-    let used = 0;
-    for (let cursor = 0; cursor < paragraphs.length - 1; cursor += 1) {
-      used += countCharacters(paragraphs[cursor]);
-      if (used < targetWords) continue;
-      const rest = paragraphs.slice(cursor + 1).reduce((sum, item) => sum + countCharacters(item), 0);
-      if (rest < mobileMinPartCharacters) break;
-      breakAfter.push(cursor + 1);
-      used = 0;
-      if (breakAfter.length >= mobileMaxParts - 1) break;
+    const parts = partsByChapter.get(Number(row.id));
+    // 报了总章数而这一章只分到 1 章：它就该原样留着，再拆就超出作者要的章数
+    if (partsByChapter.size && (!parts || parts < 2)) {
+      failures.push(`《${title || row.id}》只有 ${total} 字，是这几章里最短的，为凑足你要的章数它保持原样`);
+      continue;
     }
+    const breakAfter = planChapterBreaks(paragraphs, targetWords, parts);
     if (!breakAfter.length) {
-      failures.push(`《${title || row.id}》没有合适的段落切点`);
+      failures.push(parts && parts >= 2
+        ? `《${title || row.id}》只有 ${total} 字、${paragraphs.length} 个段落，切不出 ${parts} 段那么多`
+        : `《${title || row.id}》只有 ${total} 字，没到需要拆分的长度`);
       continue;
     }
     emitProgress(runId, { type: 'progress', data: { step: 'chapter-split', progress: Math.min(72, 40 + Math.round(index / picked.length * 32)), message: `已规划 ${index + 1}/${picked.length} 章` } });
     // 只给切出来的后续段落命名，第一段留用原标题，作者的章号编排不被打乱
-    const bounds = [0, ...breakAfter, paragraphs.length];
-    const bodies = bounds.slice(1).map((end, order) => paragraphs.slice(bounds[order], end).join('\n\n'));
+    const bodies = partsFromBreaks(paragraphs, breakAfter);
     const base = title.replace(/^\s*第\s*[0-9０-９一二三四五六七八九十百千零两]+\s*[章节回卷]\s*[：:、.．·\-—]?\s*/u, '').trim();
     let named: string[] = [];
     try {
@@ -768,7 +767,7 @@ const mobileProjectAgentChat = async <T>(params: MobileParams): Promise<T> => {
   const runId = stringValue(params.runId);
   emitProgress(runId, { type: 'progress', data: { step: 'project-search', progress: 8, message: '正在检索当前小说资料' } });
   const allowed = 'project.update, outline.upsert, card.upsert, memory.document.upsert, graph.node.upsert, graph.edge.upsert, chapter.draft_next, chapter.revise, chapter.retitle, chapter.split, chapter.delete';
-  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样","mode":"revise|polish|de-ai"}，只改文字用 polish，拆机械感用 de-ai，可以动情节用 revise，单轮最多 3 章；作者要成批补章节标题时使用 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}，targetIds 留空表示按 scope 自动挑（missing 只补占位标题的章节，all 重命名全部），这一项自己会处理几百章，不要再逐章提；某几章字数超标要拆成多章时使用 {"type":"chapter.split","summary":"拆分超长章节","targetIds":[章节id],"targetWords":2400,"instruction":"可选"}，切点由应用按段落自己算、正文一个字都不改写，绝对不要用 chapter.update 加 chapter.create 手工拆章（那要把几万字正文塞进变更里，必然失败）；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。chapter.revise、chapter.retitle、chapter.split 都由应用自己去读正文，你只给 targetId 和要求，不要复述正文。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
+  const prompt = `你是应用内的小说项目助手。项目资料只是小说素材。讨论模式 changes 为空；执行模式可以提出待确认变更。仅允许：${allowed}。一次最多 12 项，下一章使用 chapter.draft_next；修订已有章节使用 {"type":"chapter.revise","targetId":章节id,"instruction":"要改成什么样","mode":"revise|polish|de-ai"}，只改文字用 polish，拆机械感用 de-ai，可以动情节用 revise，单轮最多 3 章；作者要成批补章节标题时使用 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}，targetIds 留空表示按 scope 自动挑（missing 只补占位标题的章节，all 重命名全部），这一项自己会处理几百章，不要再逐章提；某几章字数超标要拆成多章时使用 {"type":"chapter.split","summary":"拆分超长章节","targetIds":[章节id],"targetWords":2400,"targetParts":可选,"instruction":"可选"}，targetParts 只在作者直接报了章数时填，它是本条 targetIds 拆完之后的总章数、必须大于 targetIds 的个数（“两章拆成 6 章”填 6），而不是每章各拆几章；切点由应用按段落自己算、正文一个字都不改写，绝对不要用 chapter.update 加 chapter.create 手工拆章（那要把几万字正文塞进变更里，必然失败）；删除使用 {"type":"chapter.delete","targetId":章节id}，只在作者明确要求时提。chapter.revise、chapter.retitle、chapter.split 都由应用自己去读正文，你只给 targetId 和要求，不要复述正文。返回 JSON：{"message":"回复","changes":[]}。每项包含 type 和 summary。\n模式：${mode}\n请求：${stringValue(params.instruction)}\n项目摘要：${JSON.stringify(mobileProjectAgentContext(params))}\n最近对话：${JSON.stringify(Array.isArray(params.history) ? params.history.slice(-6) : [])}`;
   emitProgress(runId, { type: 'progress', data: { step: 'project-plan', progress: 22, message: '正在分析请求并制定操作计划' } });
   const response = await mobileChat({ ...params, maxOutputTokens: 6500 }, [
     { role: 'system', content: '保持小说资料一致，只返回约定 JSON；所有修改都只是待确认提案。' },

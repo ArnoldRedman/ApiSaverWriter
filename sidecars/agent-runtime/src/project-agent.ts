@@ -428,7 +428,7 @@ changes 里每一项只能是下列十一种之一，字段必须原样铺平，
 {"type":"chapter.draft_next","summary":"起草下一章","title":"第 12 章 夜访","instruction":"承接上一章并推进线索","outlineId":3}
 {"type":"chapter.revise","summary":"修订第 8 章","targetId":8,"instruction":"去掉 AI 味，保留情节和人物口吻","mode":"de-ai"}
 {"type":"chapter.retitle","summary":"批量补标题","targetIds":[],"scope":"missing","instruction":"标题贴合本章事件"}
-{"type":"chapter.split","summary":"把超长章拆开","targetIds":[150,151],"targetWords":2400,"instruction":"新段落标题贴合该段事件"}
+{"type":"chapter.split","summary":"把超长章拆开","targetIds":[150,151],"targetWords":2000,"targetParts":6,"instruction":"新段落标题贴合该段事件"}
 {"type":"chapter.delete","summary":"删除空稿章节","targetId":9,"title":"第 9 章"}
 
 重要：大纲、卡片、章节正文都不由你撰写。outline.write、card.write、chapter.draft_next、chapter.revise 只需要给出 instruction，
@@ -454,9 +454,13 @@ changes 里每一项只能是下列十一种之一，字段必须原样铺平，
 
 一章太长要拆成几章时用 chapter.split，不要自己写正文：
 - 填 targetIds（真实 id）和 targetWords（每章目标字数，作者说“两千多字”就填 2400）。
+- 作者直接说了拆成几章（“这两章拆成 6 章”）时另外填 targetParts：它是本条所有 targetIds 拆完之后的总章数，
+  必须大于 targetIds 的个数，不是每章各拆几章；“两章拆成 6 章”就填 6，不是 3。
+  应用会按各章字数把名额分下去，并保证每段字数尽量相等；给了 targetParts 就不再看 targetWords，
+  这意味着不算超长的章也会被拆，所以只在作者真的报了章数时才填；作者只说“拆短一点”就只填 targetWords。
 - 应用会按段落边界就地切开，正文一个字都不改写，也不需要你把正文贴进 changes；新段落的标题由应用命名。
 - 一条 chapter.split 就能拆多章，不要一章一条，更不要用 chapter.update 加 chapter.create 手工拆——那样要贴几万字正文，必然超长失败。
-- 拆分只在段落边界上进行；某章整章没有分段或长度不够时，应用会跳过它并如实说明。
+- 拆分只在段落边界上进行；某章整章没有分段、或段落数不够切到要的章数时，应用会跳过它并如实说明。
 
 失败重试：历史里出现「[本轮未完成] …失败（…｜目标 N）」时，说明那一项没做成，其余的已经生成了提案。
 作者说“再试一次”“重来一次”时，只针对失败的那一项重新提同一条变更即可，不要重提已经成功的部分，也不要说自己做不到——

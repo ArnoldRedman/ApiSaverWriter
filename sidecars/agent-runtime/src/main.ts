@@ -348,6 +348,7 @@ ${chapterContent}${compactCardContext}${compactGraphContext}
           content: String(item.content || ""),
         })), {
           targetWords: request.targetWords,
+          targetParts: request.targetParts,
           instruction: request.instruction,
           projectTitle: String(projectRecord.title || "未命名小说"),
           onProgress: (done, total) => emitProjectEvent({

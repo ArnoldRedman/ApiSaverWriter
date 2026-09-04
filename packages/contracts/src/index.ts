@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+// 拆章切点的纯函数：运行时、移动端和前端落地共用同一份分段与切点规则，否则同一个 breakAfter 会切在不同地方
+export { allocateChapterParts, chapterCharacterCount, maxChapterParts, minChapterPartCharacters, partsFromBreaks, planBalancedBreaks, planChapterBreaks, splitParagraphs } from "./chapter-split.js";
+
 /**
  * 模型类 RPC 的共享参数形状
  * 这是全仓库唯一一份模型参数定义：字段名、类型和 TS 类型都从这里派生
@@ -94,8 +97,9 @@ export const chapterTitlesSchema = z.object({
   type: z.literal('chapter.titles'), summary: z.string().min(1).max(200),
   titles: z.array(z.object({ targetId: requiredId, title: z.string().min(1).max(160), stripHeading: z.boolean().optional() })).min(1).max(400),
 });
-// 拆章意图：只说要把哪几章拆到多少字，切点由应用按段落算，正文不经过模型，落地为一条 chapter.parts
-export const chapterSplitSchema = z.object({ type: z.literal('chapter.split'), summary: z.string().min(1).max(200), targetIds: z.array(requiredId).min(1).max(40), targetWords: z.coerce.number().int().min(600).max(20_000).default(2400), instruction: z.string().max(2000).optional() });
+// 拆章意图：只说要把哪几章拆到多少字（或拆成几段），切点由应用按段落算，正文不经过模型，落地为一条 chapter.parts
+// targetParts 是作者直接给的整批总段数（“两章拆成 6 章”）；给了就按字数比例分到各章，不再拿 targetWords 反推
+export const chapterSplitSchema = z.object({ type: z.literal('chapter.split'), summary: z.string().min(1).max(200), targetIds: z.array(requiredId).min(1).max(40), targetWords: z.coerce.number().int().min(600).max(20_000).default(2400), targetParts: z.coerce.number().int().min(2).max(240).optional(), instruction: z.string().max(2000).optional() });
 /**
  * 拆章落地：只带切点和新标题，不带正文
  * 正文两边都有，回传几万字只会撑爆变更归档；应用按 breakAfter 里的段落序号就地切开。

@@ -2,7 +2,7 @@ import { useState, useEffect, useLayoutEffect, useRef, type ChangeEvent } from '
 import { listen } from '@tauri-apps/api/event';
 import { invoke, isDirectBaiduRuntime, isMobileRuntime } from './platform';
 import { agentRpc } from './services/agent-client';
-import type { AgentProgressEvent, RuntimeUsageSummary } from '@zhizhang/contracts';
+import { partsFromBreaks, splitParagraphs, type AgentProgressEvent, type RuntimeUsageSummary } from '@zhizhang/contracts';
 import { nativeClient } from './services/native-client';
 import type { Skill } from './domain/skill';
 import type { Chapter, OutlineKind, OutlineDocument, CardType, KnowledgeCard, ChapterMemory, AIDetectionChapter, AIDetectionLabel, AIDetectionSegment, AIDetectionReport, MemoryDocumentKind, MemoryDocument, KnowledgeGraphNode, KnowledgeGraphEdge, Project, TagTab, Channel } from './domain/project';
@@ -1039,7 +1039,7 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
       let split = 0;
       for (const chapter of next.chapters) {
         const plan = bySource.get(chapter.id);
-        const paragraphs = plan ? chapter.content.replace(/\r\n/gu, '\n').split(/\n\s*\n/u).map(item => item.trim()).filter(Boolean) : [];
+        const paragraphs = plan ? splitParagraphs(chapter.content) : [];
         // 规划之后正文又被改过就跳过这一章：按旧段落序号硬切会把句子拦腰截断
         if (!plan || paragraphs.length !== plan.paragraphCount) {
           if (plan) skipped.push(chapter.title);
@@ -1047,9 +1047,8 @@ const applyProjectAgentChangeBatch = (project: Project, changes: ProjectAgentCha
           continue;
         }
         split += 1;
-        const bounds = [0, ...plan.breakAfter, paragraphs.length];
-        for (let index = 0; index < bounds.length - 1; index += 1) {
-          const body = paragraphs.slice(bounds[index], bounds[index + 1]).join('\n\n');
+        const bodies = partsFromBreaks(paragraphs, plan.breakAfter);
+        for (const [index, body] of bodies.entries()) {
           const title = plan.titles[index] || chapter.title;
           // 第一段原地留在本章：保留 id、创建时间和历史版本，作者的书签和引用不会断
           if (index === 0) {
@@ -5803,13 +5802,10 @@ function App() {
       return change.splits.map(item => {
         const index = editingProject?.chapters.findIndex(chapter => chapter.id === item.targetId) ?? -1;
         const source = index >= 0 ? editingProject?.chapters[index] : undefined;
-        const paragraphs = (source?.content || '').replace(/\r\n/gu, '\n').split(/\n\s*\n/u).map(entry => entry.trim()).filter(Boolean);
+        const paragraphs = splitParagraphs(source?.content || '');
         const stale = paragraphs.length !== item.paragraphCount;
-        const bounds = [0, ...item.breakAfter, item.paragraphCount];
-        const parts = item.titles.map((title, order) => {
-          const body = paragraphs.slice(bounds[order], bounds[order + 1]).join('\n\n');
-          return `    ${order + 1}. ${title}${stale ? '' : ` · ${countNovelCharacters(body).toLocaleString()} 字`}`;
-        });
+        const bodies = stale ? [] : partsFromBreaks(paragraphs, item.breakAfter);
+        const parts = item.titles.map((title, order) => `    ${order + 1}. ${title}${stale ? '' : ` · ${countNovelCharacters(bodies[order] || '').toLocaleString()} 字`}`);
         const head = `${index >= 0 ? `#${index + 1}` : `id ${item.targetId}`}　${source?.title || `章节 ${item.targetId}`}（原 ${source?.wordCount.toLocaleString() || '?'} 字）拆成 ${item.titles.length} 章`;
         return [head, ...parts, stale ? '    ⚠ 这一章的正文在提案生成后被改过，应用时会跳过它' : ''].filter(Boolean).join('\n');
       }).join('\n\n');

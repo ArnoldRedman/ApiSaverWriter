@@ -480,6 +480,30 @@ describe("project agent", () => {
     expect(JSON.stringify(result.changes[0]).length).toBeLessThan(400);
     expect(result.toolEvents.some(event => event.tool === "chapter.split" && event.message.includes("5 章"))).toBe(true);
   });
+
+  it("作者直接说拆成几章时，章数跟着意图一起交给拆章智能体", async () => {
+    const chat = vi.fn().mockResolvedValue({
+      content: JSON.stringify({ action: "finish", message: "拆成 6 章。", changes: [
+        { type: "chapter.split", summary: "两章拆成 6 章", targetIds: [1, 2], targetWords: 2000, targetParts: 6 },
+      ] }),
+      model: "test",
+    });
+    const chapterSplit = vi.fn().mockResolvedValue({
+      type: "chapter.parts",
+      summary: "两章拆成 6 章（2 章拆成 6 章）",
+      splits: [
+        { targetId: 1, paragraphCount: 12, breakAfter: [6], titles: ["第 1 章 入城", "雨里的门牌"] },
+        { targetId: 2, paragraphCount: 16, breakAfter: [4, 8, 12], titles: ["第 2 章 夜雨", "窗外", "灯下", "天亮"] },
+      ],
+    });
+
+    const result = await runProjectAgent({
+      mode: "execute", instruction: "150、151 两章字数到了 6000，拆成 6 章，每章 2000 字", project,
+    }, { chat } as unknown as ModelApiClient, { ...delegates(), chapterSplit });
+
+    expect(chapterSplit).toHaveBeenCalledWith(expect.objectContaining({ targetParts: 6, targetWords: 2000 }));
+    expect(result.changes[0].type).toBe("chapter.parts");
+  });
   it("委派并发执行但产出顺序不变，一项失败不拖垮其余", async () => {
     const chat = vi.fn().mockResolvedValue({
       content: JSON.stringify({ action: "finish", message: "批量润色。", changes: Array.from({ length: 6 }, (_, index) => ({

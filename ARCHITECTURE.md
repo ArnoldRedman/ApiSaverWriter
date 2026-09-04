@@ -26,7 +26,7 @@ contracts 不依赖 desktop-app、agent-runtime 或 Tauri
 
 ```text
 织章/
-├── packages/contracts/          跨端 RPC DTO、方法表、运行时参数校验
+├── packages/contracts/          跨端 RPC DTO、方法表、运行时参数校验、拆章切点纯函数
 ├── packages/model-protocol/     OpenAI/Anthropic 共享纯协议规则
 ├── desktop-app/
 │   ├── src/App.tsx              当前组合根，逐步收敛为页面组合器
@@ -79,6 +79,7 @@ React 通过 `src/services/agent-client.ts` 调用 Agent RPC，通过 `native-cl
 - `agentRpcSchemas` 在 Runtime 边界校验输入。
 - `AgentProgressEvent`、`RpcError` 和 RPC envelope 统一桌面、移动端和 Runtime 约定。
 - 认证头、Anthropic system/messages 转换、thinking 档位、reasoning effort 和正文块过滤只保留一份共享实现。
+- `chapter-split.ts` 是拆章切点的唯一定义：`chapter.parts` 变更只带段落序号，桌面 Runtime、移动端和前端落地必须用同一套分段与切点规则；两边规则不同，同一个 `breakAfter` 就会切在不同位置，把正文拦腰截断。
 
 前端通过 `agentRpc()` 调用，Runtime 通过 `RpcRegistry` 注册。迁移期间旧 Handler 可以由 registry 委托，但新方法必须先加入共享契约。
 
